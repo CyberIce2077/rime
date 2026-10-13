@@ -10,7 +10,10 @@ npm run dev          # run from source (Node 22.6+)
 npm test
 ```
 
-Set `ANTHROPIC_API_KEY`, or put `{"apiKey": "sk-ant-…"}` in `~/.rime/config`.
-`RIME_NO_ANIMATION=1` skips the snowfall; `NO_COLOR` turns colour off.
+The first start opens `/setup`: your own llama.cpp server over ssh (wake, tunnel,
+start, load, all from inside Rime), a server on this computer, or a hosted
+provider. `rime connect <url>` adds an OpenAI-compatible server from a script.
+Rime writes `~/.rime/config` itself. `RIME_NO_ANIMATION=1` skips the snowfall;
+`NO_COLOR` turns colour off.
 
-Spec: `docs/SPEC.md` · decisions: `docs/DECISIONS.md` · mockups: `reference/`.
+Spec: `docs/SPEC.md` and `docs/providers.md` · decisions: `docs/DECISIONS.md` · mockups: `reference/`.

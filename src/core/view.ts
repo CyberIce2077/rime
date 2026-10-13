@@ -4,7 +4,7 @@
 import { type ColorMode, type RGB, GLACIER, PLACEHOLDER, RESET, SELECTION, sgr } from './theme.ts';
 import { type Line, type Run, fit, lineWidth, serialize, strWidth, wrap } from './term.ts';
 import type { Turn } from '../plugins/token-kit/meter.ts';
-import { fmt$, fmtT } from '../plugins/token-kit/meter.ts';
+import { fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
 
 export type Styles = ReturnType<typeof styles>;
 
@@ -33,7 +33,8 @@ export type Item =
   | { kind: 'reply'; text: string; done: boolean }
   | { kind: 'tool'; verb: string; rest?: string; extra?: Line }
   | { kind: 'cost'; turn: Turn }
-  | { kind: 'note'; text: string; tone: 'warn' | 'dim' };
+  | { kind: 'note'; text: string; tone: 'warn' | 'dim' }
+  | { kind: 'lines'; lines: Line[] }; // already styled, e.g. "● gpubox is ready" 
 
 // Messages are capped at 76ch like the prototype's .msg.
 const MSG = 76;
@@ -89,11 +90,17 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
       return all([[run('● ', st.accent), run(item.verb, st.titleB), ...(item.rest ? [run(' ' + item.rest, st.dim)] : []), ...(item.extra || [])]]);
     case 'cost': {
       const c = item.turn;
-      return all([[
-        run(`  ↳ ${fmtT(c.in)} in · ${fmtT(c.cached)} cached · ${fmtT(c.out)} out · ${fmt$(c.spent)} · `, st.dim),
-        run(`saved ${fmt$(c.saved)}`, st.ok),
-      ]]);
+      const head = `  ↳ ${fmtT(c.in)} in · ${fmtT(c.cached)} cached · ${fmtT(c.out)} out · `;
+      if (c.local) {
+        // Local: no dollars; prompt time and what the cache saved instead.
+        const prompt = c.promptMs !== undefined ? `${fmtS(c.promptMs)} prompt` : '';
+        return all([[run(head + 'local' + (prompt ? ` · ${prompt}` : ''), st.dim), ...(c.savedMs && c.savedMs >= 500 ? [run(' (cache saved ', st.dim), run(`~${fmtS(c.savedMs)}`, st.ok), run(')', st.dim)] : [])]]);
+      }
+      if (c.spent === undefined) return all([[run(head + 'price unknown', st.dim)]]);
+      return all([[run(head + `${fmt$(c.spent)} · `, st.dim), run(`saved ${fmt$(c.saved)}`, st.ok)]]);
     }
+    case 'lines':
+      return item.lines.map((l) => str(l, st));
     case 'note': {
       const w = Math.min(MSG, width - 2);
       const lines = item.text.split('\n').flatMap((p, i) =>
@@ -109,9 +116,10 @@ export type BoxRow = { line: Line; bg?: string; rule?: 'inner' | 'full'; hit?: s
 
 // A rounded frame with a legend in the top border, like the prototype's
 // .cmds / .usage boxes. Rows get one cell of padding on each side.
-export function box(legend: string, rows: BoxRow[], width: number, st: Styles, color = st.accent): { lines: string[]; hits: (string | undefined)[] } {
+export function box(legend: string | Line, rows: BoxRow[], width: number, st: Styles, color = st.accent): { lines: string[]; hits: (string | undefined)[] } {
   const inner = width - 2;
-  const top = [run('╭─', color), run(` ${legend} `, color), run('─'.repeat(Math.max(0, inner - strWidth(legend) - 3)) + '╮', color)];
+  const lg: Line = typeof legend === 'string' ? [run(legend, color)] : legend;
+  const top = [run('╭─ ', color), ...lg, run(' ' + '─'.repeat(Math.max(0, inner - lineWidth(lg) - 3)) + '╮', color)];
   const lines: string[] = [str(fit(top, width, false), st)];
   const hits: (string | undefined)[] = [undefined];
   for (const r of rows) {
@@ -129,13 +137,30 @@ export function box(legend: string, rows: BoxRow[], width: number, st: Styles, c
   return { lines, hits };
 }
 
-// A name/help list row: `.n` is 13ch wide including its "› " marker, then 2ch gap.
-export function listRow(name: string, help: string, selected: boolean, st: Styles, hit?: string): BoxRow {
-  const n = fit([run(selected ? '› ' : '  ', selected ? st.accent : st.title), run(name, selected ? st.accent : st.title)], 13, false);
-  return { line: [...n, run('  '), run(help, st.dim)], bg: selected ? st.panelBg : undefined, hit };
+// A name/help list row: `.n` is 13ch wide (22ch in /setup) including its "› "
+// marker, then a 2ch gap.
+export function listRow(name: string, help: string | Line, selected: boolean, st: Styles, hit?: string, nameWidth = 13): BoxRow {
+  const n = fit([run(selected ? '› ' : '  ', selected ? st.accent : st.title), run(name, selected ? st.accent : st.title)], nameWidth, false);
+  return { line: [...n, run('  '), ...(typeof help === 'string' ? [run(help, st.dim)] : help)], bg: selected ? st.panelBg : undefined, hit };
 }
 
-export const footRows = (text: string, st: Styles): BoxRow[] => [{ line: [], rule: 'full' }, { line: [run(text, st.dim)] }];
+// A setting: dim label (26ch), then ‹ value › with the value centred in 17ch.
+export function settingRow(label: string, value: string, selected: boolean, st: Styles, hit?: string): BoxRow {
+  const pad = Math.max(0, 17 - strWidth(value));
+  const v = ' '.repeat(Math.floor(pad / 2)) + value + ' '.repeat(Math.ceil(pad / 2));
+  return {
+    line: [...fit([run(label, st.dim)], 26, false), run('  '), run('‹', st.accent), run(v, st.title), run('›', st.accent)],
+    bg: selected ? st.panelBg : undefined,
+    hit,
+  };
+}
+
+// The box foot: a rule, then dim text where `keys` (bold accent) and plain parts
+// alternate, e.g. ['↑ ↓', ' choose · ', 'enter', ' next'].
+export function footRows(text: string | string[], st: Styles): BoxRow[] {
+  const parts = typeof text === 'string' ? [text] : text;
+  return [{ line: [], rule: 'full' }, { line: parts.map((t, i) => run(t, parts.length > 1 && i % 2 === 0 ? st.accentB : st.dim)) }];
+}
 
 // ---- Prompt ----
 
@@ -166,9 +191,10 @@ export function caretOf(rows: { start: number; text: string }[], cursor: number)
   return { row: r, col: strWidth(rows[r].text.slice(0, cursor - rows[r].start)) };
 }
 
-export function prompt(buf: string, cursor: number, width: number, maxRows: number, st: Styles): PromptView {
+export function prompt(buf: string, cursor: number, width: number, maxRows: number, st: Styles, placeholder = PLACEHOLDER_TEXT, masked = false): PromptView {
   const inner = width - 4, tw = Math.max(1, inner - 2);
   const border = st.dim; // .prompt:focus-within, and the prompt always has focus
+  if (masked) buf = '•'.repeat([...buf].length), cursor = buf.length;
   const rows = layoutInput(buf, tw);
   const caret = caretOf(rows, cursor);
   // Keep the caret's row in view when the input is taller than allowed.
@@ -177,7 +203,7 @@ export function prompt(buf: string, cursor: number, width: number, maxRows: numb
   const lines = [str([run('╭' + '─'.repeat(width - 2) + '╮', border)], st)];
   shown.forEach((r, i) => {
     const lead = first + i === 0 ? run('› ', st.accentB) : run('  ');
-    const text = buf ? run(r.text, st.title) : run(PLACEHOLDER_TEXT, st.placeholder);
+    const text = buf ? run(r.text, st.title) : run(placeholder, st.placeholder);
     lines.push(str([run('│ ', border), ...fit([lead, text], inner, !buf), run(' │', border)], st));
   });
   lines.push(str([run('╰' + '─'.repeat(width - 2) + '╯', border)], st));

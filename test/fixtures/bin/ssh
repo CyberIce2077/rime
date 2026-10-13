@@ -1,0 +1,65 @@
+#!/usr/bin/env node
+// A fake ssh for the step runner tests. Env: FAKE_SSHD_PORT (the "machine"),
+// MOCK_LLAMA_PORT (llama-server behind the tunnel), FAKE_SSH_LOG (call log).
+import fs from 'node:fs';
+import net from 'node:net';
+
+const args = process.argv.slice(2);
+if (process.env.FAKE_SSH_LOG) fs.appendFileSync(process.env.FAKE_SSH_LOG, JSON.stringify(args) + '\n');
+const mock = Number(process.env.MOCK_LLAMA_PORT);
+
+if (args[0] === '-G') {
+  console.log(`hostname 127.0.0.1\nuser me\nport ${process.env.FAKE_SSHD_PORT ?? 22}`);
+  process.exit(0);
+}
+const l = args.indexOf('-L');
+if (args.includes('-N') && l >= 0) {
+  // A real local forward to the mock llama-server.
+  const lport = Number(args[l + 1].split(':')[0]);
+  net.createServer((c) => {
+    const s = net.connect(mock, '127.0.0.1');
+    c.pipe(s).pipe(c);
+    s.on('error', () => c.destroy());
+    c.on('error', () => s.destroy());
+  }).listen(lport, '127.0.0.1');
+} else {
+  const cmd = args.at(-1) ?? '';
+  if (cmd.includes('###MAC')) {
+    console.log(`###MAC
+00:11:22:33:44:55
+###UNIT
+# /etc/systemd/system/llama-server.service
+[Service]
+ExecStart=/home/me/llama.cpp/build/bin/llama-server \\
+  --models-preset /home/me/models/presets.ini --no-models-autoload --models-max 1 \\
+  --host 127.0.0.1 --port ${process.env.FAKE_REMOTE_PORT ?? 8080}
+###ACTIVE
+inactive
+###GPU
+Example GPU 32GB, 32768, 4, 41, 25.10, 250.00
+###END`);
+  } else if (cmd.includes('###VERSION')) {
+    console.log(`###VERSION
+version: 11514 (1a2b3c4)
+built with cc for x86_64-linux-gnu
+###PRESETS
+[qwen3.8-27b]
+model = /home/me/models/Qwen3.8-27B-UD-Q6_K.gguf
+ctx-size = 262144
+cache-type-k = q8_0
+###END`);
+  } else if (cmd.includes('###UPTIME')) {
+    console.log(`###UPTIME
+   8040
+###GPU
+Example GPU 32GB, 32768, 30925, 71, 246.31, 250.00
+###TEMP
+    GPU Max Operating Temp            : 83 C
+###END`);
+  } else if (cmd.includes('systemctl start')) {
+    await fetch(`http://127.0.0.1:${mock}/__start`, { method: 'POST' });
+  } else if (cmd.includes('journalctl')) {
+    console.log('llama-server[1]: main: server is listening on 127.0.0.1:8080');
+  }
+  process.exit(0);
+}

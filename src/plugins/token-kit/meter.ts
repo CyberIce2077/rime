@@ -1,16 +1,19 @@
 // Live cost meter: tokens, dollars, and what Rime saved versus a naive loop
-// (SPEC §4.4). Counts come from the API's usage block on each response.
+// (SPEC §4.4). Usage arrives normalized across providers (docs/providers.md §2.1).
+// Local models cost $0, so for them the meter counts the time the cache saved.
 
-import type { Price } from '../../core/models.ts';
+import type { Price, Usage } from '../../providers/types.ts';
 
-export type Usage = {
-  input_tokens?: number;
-  cache_read_input_tokens?: number;
-  cache_creation_input_tokens?: number;
-  output_tokens?: number;
+export type Turn = {
+  in: number;
+  cached: number;
+  out: number;
+  spent?: number; // undefined when the price is unknown
+  saved: number;
+  local?: boolean;
+  promptMs?: number;
+  savedMs?: number; // local: time the cache saved
 };
-
-export type Turn = { in: number; cached: number; out: number; spent: number; saved: number };
 
 const usd = (tokens: number, perM: number) => (tokens * perM) / 1e6;
 
@@ -19,27 +22,39 @@ export const fmt$ = (d: number): string => {
   if (d < 0) return '-' + fmt$(-d);
   return d < 0.01 && d >= 0.0005 ? '$' + d.toFixed(3) : '$' + d.toFixed(2);
 };
+export const fmtS = (ms: number) => (ms < 10000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 1000)}s`);
 
 export function createMeter() {
   const t = { uncached: 0, read: 0, write: 0, out: 0 };
   const cost = { uncached: 0, read: 0, write: 0, out: 0 };
-  const saved = { cache: 0 };
+  const saved = { cache: 0, ms: 0 };
+  let unpriced = false;
 
   return {
     tokens: t,
     cost,
     saved,
-    // Records one API response and returns its cost line.
-    charge(u: Usage, p: Price): Turn {
-      const unc = u.input_tokens || 0, read = u.cache_read_input_tokens || 0;
-      const write = u.cache_creation_input_tokens || 0, out = u.output_tokens || 0;
-      t.uncached += unc; t.read += read; t.write += write; t.out += out;
-      const c = { uncached: usd(unc, p.in), read: usd(read, p.read), write: usd(write, p.write), out: usd(out, p.out) };
+    unpriced: () => unpriced,
+    // Records one response and returns its cost line.
+    charge(u: Usage, p: Price | undefined, local = false): Turn {
+      t.uncached += u.input; t.read += u.cached; t.write += u.written; t.out += u.output;
+      const turn: Turn = { in: u.input + u.cached + u.written, cached: u.cached, out: u.output, saved: 0, local, promptMs: u.promptMs };
+      if (local && u.promptMs && u.input > 0) {
+        // The cached part would have taken as long per token as the part that ran.
+        turn.savedMs = u.cached * (u.promptMs / u.input);
+        saved.ms += turn.savedMs;
+      }
+      if (!p) {
+        unpriced = true;
+        return turn;
+      }
+      const c = { uncached: usd(u.input, p.in), read: usd(u.cached, p.read), write: usd(u.written, p.write), out: usd(u.output, p.out) };
       cost.uncached += c.uncached; cost.read += c.read; cost.write += c.write; cost.out += c.out;
       // Caching saves the difference on reads and pays a premium on writes.
-      const sv = usd(read, p.in - p.read) - usd(write, p.write - p.in);
-      saved.cache += sv;
-      return { in: unc + read + write, cached: read, out, spent: c.uncached + c.read + c.write + c.out, saved: sv };
+      turn.saved = usd(u.cached, p.in - p.read) - usd(u.written, p.write - p.in);
+      saved.cache += turn.saved;
+      turn.spent = c.uncached + c.read + c.write + c.out;
+      return turn;
     },
     totalTokens: () => t.uncached + t.read + t.write + t.out,
     spent: () => cost.uncached + cost.read + cost.write + cost.out,

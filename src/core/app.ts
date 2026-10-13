@@ -2,19 +2,30 @@
 //
 // Full screen on the alternate screen: the transcript scrolls in the top part
 // (wheel, PgUp/PgDn), the boxes, prompt and status line are pinned to the bottom.
+// Models come from connected providers (docs/providers.md); /setup connects them.
 
-import { type Message, ApiError, createAccumulator, streamMessages } from './api.ts';
-import type { Config } from './config.ts';
 import { copy } from './clipboard.ts';
+import { type Config, saveConfig } from './config.ts';
 import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader } from './header.ts';
-import { MODELS, type Model, findModel } from './models.ts';
 import { type InputEvent, type Line, createParser, fit, lineWidth, sliceCols, strWidth, truncAnsi, wrap } from './term.ts';
 import { colorMode } from './theme.ts';
 import { type BoxRow, type Hit, type Item, box, caretOf, footRows, layoutInput, listRow, prompt, renderItem, spaced, status, styles } from './view.ts';
-import { createMeter, fmt$, fmtT } from '../plugins/token-kit/meter.ts';
+import { createMeter, fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
+import * as llama from '../providers/llamacpp.ts';
+import { PRESETS } from '../providers/presets.ts';
+import { connOf, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
+import { ApiError, type Block, type Conn, type Controls, type Effort, type Message, type Model, type Usage } from '../providers/types.ts';
+import { bar } from '../setup/loader.ts';
+import { createModelPicker, createServer } from '../setup/panels.ts';
+import { ssh } from '../setup/ssh.ts';
+import { NAMES, type Run, runSteps } from '../setup/steps.ts';
+import { type Host, type Panel, type Tunnel, createSetup } from '../setup/ui.ts';
 
 const CMDS: [string, string][] = [
-  ['/model', 'choose a model'],
+  ['/model', 'pick a model, effort and reasoning'],
+  ['/setup', 'connect your server, this computer, or a provider'],
+  ['/server', 'status and controls for your server'],
+  ['/connect', 'add a provider or URL: /connect <url>'],
   ['/clear', 'start a new conversation'],
   ['/usage', 'token, cost and savings breakdown'],
   ['/exit', 'quit Rime'],
@@ -40,6 +51,9 @@ const fmtP = (n: number) => (Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`)
 const MODES_ON = '\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[>4;1m\x1b]12;#7FD4F5\x07';
 const MODES_OFF = '\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b]112\x07\x1b[?25h\x1b[?1049l';
 
+// What the compact loader says in header line 2 while a server comes up.
+const PHASE: Record<string, string> = { wake: 'waking', connect: 'connecting', tunnel: 'opening the tunnel', start: 'starting', load: 'loading', warm: 'warming the cache', test: 'testing' };
+
 export async function runApp(cfg: Config, version: string) {
   const out = process.stdout, inp = process.stdin;
   const st = styles(colorMode(out));
@@ -49,14 +63,24 @@ export async function runApp(cfg: Config, version: string) {
   const SYSTEM = system(cwd);
 
   // ---- state ----
-  let model: Model | undefined = cfg.model;
+  let model: Model | undefined;
+  let conn: Conn | undefined; // set once the model's provider answers
+  let controls: Controls = { reasoning: cfg.reasoning !== false, effort: cfg.effort };
+  // A task keeps one model; controls that would break its cache stay fixed for it.
+  let task: { controls: Controls; sentEffort?: Effort; lastPrompt: number; lastControls?: Controls } | null = null;
+  const unsafe = new Set<string>(); // models where changing controls was measured to reset the cache
   let messages: Message[] = [];
   const history: string[] = [];
   let buf = '', cur = 0, sel = 0;
-  let boxKind: 'keys' | 'model' | 'usage' | null = null;
-  let modelSel = 0;
-  let busy: AbortController | null = null;
+  let boxKind: 'keys' | 'usage' | null = null;
+  let panel: Panel | null = null;
+  let busy: { abort(): void; esc(): void } | null = null;
   let quitArmed: NodeJS.Timeout | null = null;
+  let quitting: string | null = null;
+  const tunnels: Record<string, Tunnel> = {};
+  let bg: { name: string; run: Run } | null = null; // an own server coming up in the background
+  let waiting: string | null = null; // a message held until the model is ready
+  let promptRate: number | undefined; // local prompt tokens/s, from the last reply
 
   // ---- screen ----
   let scrollOff = 0; // transcript lines scrolled up from the bottom
@@ -73,10 +97,9 @@ export async function runApp(cfg: Config, version: string) {
   let copied: NodeJS.Timeout | null = null;
   let rows: string[] = [];
 
-  const details = () => (model ? `${model.context} context` : '');
   let header!: Header;
   const headerOpts: HeaderOpts & { ready: (h: Header) => void } = {
-    version, model: model?.label, details: details(), cwd, mode: st.mode, interactive: false,
+    version, cwd, mode: st.mode, interactive: false,
     onFrame: () => schedule(),
     ready: (h) => (header = h),
   };
@@ -85,9 +108,28 @@ export async function runApp(cfg: Config, version: string) {
 
   const W = () => out.columns || 80;
   const H = () => out.rows || 24;
+  const connected = () => Object.keys(cfg.providers).length > 0;
+  const tunnel = (name: string) => (tunnels[name] ??= { child: null, port: 0 });
+
+  // Header line 2: the model and what was actually sent, or the compact loader.
+  function headerInfo() {
+    if (!model) return { model: undefined, details: connected() ? 'no model selected' : 'no model connected' };
+    const p = model.provider;
+    if (bg && bg.name === p && !bg.run.state.done) {
+      const s = bg.run.state;
+      const step = s.steps.find((v) => v.status === 'run' || v.status === 'fail');
+      if (step?.status === 'fail') return { model: model.label, details: `${p} · couldn't start: /server` };
+      const b = bar(s.overall, 6);
+      return { model: model.label, details: `${p} · ${PHASE[step?.id ?? 'connect']} ${b.fill}${b.empty} ${b.pct.trim()}` };
+    }
+    const ctx = model.context ? `${model.context >= 1000 ? Math.round(model.context / 1000) + 'k' : model.context} context` : '';
+    const c = sentControls();
+    const eff = !c.reasoning ? 'reasoning off' : c.effort ? `${conn?.llamacpp ? llama.effortsFor(model)[c.effort] : c.effort} effort` : '';
+    return { model: model.label, details: [p, ctx, eff].filter(Boolean).join(' · ') };
+  }
 
   function render(it: Item, width: number) {
-    const done = it.kind === 'user' || it.kind === 'cost' || it.kind === 'note' || (it.kind === 'reply' && it.done);
+    const done = it.kind === 'user' || it.kind === 'cost' || it.kind === 'note' || it.kind === 'lines' || (it.kind === 'reply' && it.done);
     const hit = cache.get(it);
     if (done && hit && hit.width === width) return hit.lines;
     const lines = renderItem(it, width, st);
@@ -114,7 +156,7 @@ export async function runApp(cfg: Config, version: string) {
     const pre = CMDS.filter(([n]) => n.slice(1).startsWith(q));
     return [...pre, ...CMDS.filter((c) => !pre.includes(c) && (c[0] + ' ' + c[1]).toLowerCase().includes(q))];
   };
-  const cmdsOpen = () => boxKind !== 'keys' && buf.startsWith('/') && !/\s/.test(buf);
+  const cmdsOpen = () => !panel && boxKind !== 'keys' && buf.startsWith('/') && !/\s/.test(buf);
 
   function usageRows(width: number): BoxRow[] {
     const t = meter.tokens, c = meter.cost, p = model?.price;
@@ -133,10 +175,14 @@ export async function runApp(cfg: Config, version: string) {
     const row = (label: Line, tok: string, cost: string, s: string): BoxRow => ({
       line: [...fit(label, inner - tw - cw - 2, true), { t: ' ' + tok.padStart(tw) + ' ' + cost.padStart(cw), s }],
     });
-    const why = p ? `context re-read at ${fmtP(p.read)} instead of ${fmtP(p.in)}` : 'context re-read at the cache price';
-    const prices = p ? `Prices per million tokens: ${fmtP(p.in)} input, ${fmtP(p.read)} cache read, ${fmtP(p.write)} cache write, ${fmtP(p.out)} output. ` : '';
+    const why = p && p.in ? `context re-read at ${fmtP(p.read)} instead of ${fmtP(p.in)}` : 'context re-read at the cache price';
+    const prices = p && p.in ? `Prices per million tokens: ${fmtP(p.in)} input, ${fmtP(p.read)} cache read, ${fmtP(p.write)} cache write, ${fmtP(p.out)} output. ` : '';
+    const notes = [
+      meter.unpriced() ? 'Some replies came from a model with an unknown price, so their dollars aren\'t counted. ' : '',
+      meter.saved.ms >= 1000 ? `Local prompt caching saved about ${fmtS(meter.saved.ms)} of prompt processing. ` : '',
+    ].join('');
     const foot = wrap([
-      { t: `Without Rime this session would have cost ${fmt$(sp + sv)}. ${prices}`, s: st.dim },
+      { t: `Without Rime this session would have cost ${fmt$(sp + sv)}. ${prices}${notes}`, s: st.dim },
       { t: '/usage', s: st.accent },
       { t: ' or a click on the meter closes this.', s: st.dim },
     ], inner);
@@ -156,6 +202,10 @@ export async function runApp(cfg: Config, version: string) {
   }
 
   function currentBox(width: number) {
+    if (panel) {
+      const v = panel.view(width);
+      return box(v.legend, [...v.rows, ...footRows(v.foot, st)], width, st);
+    }
     if (cmdsOpen()) {
       const m = matches();
       sel = Math.min(sel, Math.max(0, m.length - 1));
@@ -167,14 +217,19 @@ export async function runApp(cfg: Config, version: string) {
     if (boxKind === 'keys') {
       return box('shortcuts', [...KEYS.map(([k, h]) => listRow(k, h, false, st)), ...footRows('any key to close', st)], width, st);
     }
-    if (boxKind === 'model') {
-      const rows = MODELS.length
-        ? MODELS.map((m, i) => listRow(m.label, `${m.context} context · ${fmtP(m.price.in)} / ${fmtP(m.price.out)} per M tokens`, i === modelSel, st, `model:${i}`))
-        : [{ line: [{ t: '  no models yet', s: st.dim }] }];
-      return box('model', [...rows, ...footRows('↑↓ choose · ↵ select · esc close', st)], width, st);
-    }
     if (boxKind === 'usage') return box(`usage · this session${model ? ` · ${model.label}` : ''}`, usageRows(width), width, st);
     return null;
+  }
+
+  function meterLine(): Line {
+    if (!connected()) return [{ t: 'no model', s: st.dim }];
+    const tokens = `${fmtT(meter.totalTokens())} tokens`;
+    if (conn?.local || (!conn && model && cfg.providers[model.provider]?.ssh)) {
+      const ms = meter.saved.ms;
+      return [{ t: `${tokens} · ${fmt$(meter.spent())} · local`, s: st.dim }, ...(ms >= 1000 ? [{ t: ` · saved ~${fmtS(ms)}`, s: st.ok }] : [])];
+    }
+    if (meter.unpriced() && !meter.spent()) return [{ t: tokens, s: st.dim }];
+    return [{ t: `${tokens} · ${fmt$(meter.spent())} · `, s: st.dim }, { t: `saved ${fmt$(meter.savedTotal())} (${meter.pct()}%)`, s: st.ok }];
   }
 
   function ui(width: number, height: number) {
@@ -185,14 +240,17 @@ export async function runApp(cfg: Config, version: string) {
       lines.push(...b.lines);
       b.hits.forEach((id) => rowHits.push(id ? [{ x0: 1, x1: width, id }] : []));
     }
-    const p = prompt(buf, cur, width, Math.max(1, Math.min(10, height - lines.length - 3)), st);
+    const p = prompt(buf, cur, width, Math.max(1, Math.min(10, height - lines.length - 3)), st, panel?.placeholder?.() ?? undefined, panel?.masked?.() ?? false);
     const promptAt = lines.length;
     lines.push(...p.lines);
     p.lines.forEach(() => rowHits.push([]));
 
     let left: Line, leftHits: Hit[] = [];
-    if (quitArmed) left = [{ t: 'press ctrl+c again to quit', s: st.dim }];
+    const ps = panel?.status?.();
+    if (quitting) left = [{ t: quitting, s: st.dim }];
+    else if (quitArmed) left = [{ t: 'press ctrl+c again to quit', s: st.dim }];
     else if (copied) left = [{ t: '✓', s: st.ok }, { t: ' copied to clipboard', s: st.dim }];
+    else if (ps) left = ps;
     else if (scrollOff > 0) {
       left = [{ t: '↓', s: st.accentB }, { t: ` ${scrollOff} lines below · pgdn`, s: st.dim }];
       leftHits = [{ x0: 1, x1: lineWidth(left), id: 'bottom' }];
@@ -204,12 +262,7 @@ export async function runApp(cfg: Config, version: string) {
       ];
       leftHits = [{ x0: 1, x1: 14, id: '/' }, { x0: 18, x1: 32, id: '?' }];
     }
-    const sv = meter.savedTotal();
-    const m: Line = [
-      { t: `${fmtT(meter.totalTokens())} tokens · ${fmt$(meter.spent())} · `, s: st.dim },
-      { t: `saved ${fmt$(sv)} (${meter.pct()}%)`, s: st.ok },
-    ];
-    const s = status(left, m, width, st, leftHits);
+    const s = status(left, meterLine(), width, st, leftHits);
     lines.push(s.line);
     rowHits.push(s.hits);
     return { lines, rowHits, cursor: { row: promptAt + p.cursor.row, col: p.cursor.col } };
@@ -221,6 +274,7 @@ export async function runApp(cfg: Config, version: string) {
   // prompt and status line sit at the bottom. Every frame repaints every row.
   function frame() {
     scheduled = false;
+    Object.assign(headerOpts, headerInfo());
     const width = W(), height = H();
     const lines = transcript(width);
     const u = ui(width, height);
@@ -282,6 +336,107 @@ export async function runApp(cfg: Config, version: string) {
     }
   };
 
+  const note = (text: string, tone: 'warn' | 'dim' = 'warn') => {
+    items.push({ kind: 'note', tone, text });
+    schedule();
+  };
+
+  // ---- models and servers ----
+
+  // Brings an own server up (wake, tunnel, start, load, warm) with the compact
+  // loader in the header; the prompt stays usable meanwhile.
+  function ensure(name: string, quiet = false) {
+    const p = cfg.providers[name];
+    if (!p?.ssh) return Promise.resolve();
+    if (bg?.name === name && !bg.run.state.done && !bg.run.state.error) return bg.run.promise.then(() => {});
+    const run = runSteps(
+      { name, host: p.ssh, remote: p.tunnel?.remote ?? '127.0.0.1:8080', mac: p.wake?.mac, broadcast: p.wake?.broadcast, model: p.model, router: !!p.model },
+      {
+        edited: p.steps,
+        skip: [...(p.skip ?? []), 'test'], // the test reply belongs to /setup
+        system: SYSTEM,
+        model: model?.provider === name ? model : undefined,
+        controls,
+        tunnel: tunnel(name),
+        onUpdate: schedule,
+      },
+    );
+    bg = { name, run };
+    schedule();
+    return run.promise.then(
+      (r) => {
+        if (model?.provider === name) {
+          conn = connOf(name, p, r.base);
+          llama.props(llama.rootOf(r.base)).then((pr) => {
+            const ctx = pr?.json?.default_generation_settings?.n_ctx;
+            if (model && ctx && !model.context) model.context = ctx;
+            schedule();
+          }).catch(() => {});
+        }
+        const worked = run.state.steps.filter((v) => ['wake', 'start', 'load'].includes(v.id) && v.status === 'done' && !['on', 'running', 'loaded'].includes(v.result));
+        if (!quiet && worked.length) {
+          items.push({ kind: 'lines', lines: [[{ t: '● ', s: st.ok }, { t: `${name} is ready · `, s: st.fg }, { t: model?.label ?? p.model ?? '', s: st.titleB }, { t: ` · ${worked.map((v) => `${NAMES[v.id]} ${v.result}`).join(' · ')}`, s: st.dim }]] });
+        }
+        if (bg?.run === run) bg = null;
+        schedule();
+        if (waiting) {
+          const t = waiting;
+          waiting = null;
+          send(t, true);
+        }
+      },
+      (e) => {
+        note(`${name}: ${(e as Error).message}. /server shows what's going on, /setup changes the steps.`);
+        waiting = null;
+        schedule();
+      },
+    );
+  }
+
+  // Makes `m` the model for new tasks; switching models starts a new task.
+  async function useModel(m: Model, quiet = false) {
+    const p = cfg.providers[m.provider];
+    if (!p) return;
+    model = m;
+    conn = undefined;
+    task = null;
+    if (!quiet) items.push({ kind: 'tool', verb: 'Model', rest: `${m.label} · ${m.provider}` });
+    schedule();
+    if (p.ssh) {
+      const t = tunnel(m.provider);
+      const up = t.port ? await llama.health(`http://127.0.0.1:${t.port}`).catch(() => null) : null;
+      if (up && (up.status === 200 || up.status === 503)) conn = connOf(m.provider, p, `http://127.0.0.1:${t.port}/v1`);
+      else ensure(m.provider, quiet);
+      return;
+    }
+    const urls = [p.url ?? PRESETS[p.preset]?.url ?? ''].flat();
+    const base = urls.length > 1 ? await pickUrl(urls) : urls[0];
+    if (!base) return note(`${m.provider} isn't answering at ${urls.join(' or ')}.`);
+    conn = connOf(m.provider, p, base);
+    schedule();
+  }
+
+  function useRef(ref: string, quiet = false) {
+    const [name, ...rest] = ref.split('/');
+    const p = cfg.providers[name];
+    if (!p || !rest.length) return;
+    useModel(modelOf(cfg, connOf(name, p, ''), rest.join('/')), quiet);
+  }
+
+  // The controls this message is sent with: ones that would reset the model's
+  // cache stay at the task's values (docs/providers.md §5).
+  function cacheSafe() {
+    if (!model || unsafe.has(model.ref)) return { effort: false, reasoning: false };
+    const pr = cfg.providers[model.provider]?.probe;
+    if (conn?.llamacpp) return { effort: pr?.effortSafe !== false, reasoning: pr?.reasoningSafe !== false };
+    return { effort: true, reasoning: true };
+  }
+  function sentControls(): Controls {
+    if (!task) return controls;
+    const safe = cacheSafe();
+    return { reasoning: safe.reasoning ? controls.reasoning : task.controls.reasoning, effort: safe.effort ? controls.effort : task.controls.effort };
+  }
+
   // ---- chat ----
 
   const drop = (it: Item) => {
@@ -289,18 +444,32 @@ export async function runApp(cfg: Config, version: string) {
     if (i >= 0) items.splice(i, 1);
   };
 
-  async function send(text: string) {
-    items.push({ kind: 'user', text });
-    history.push(text);
-    if (!model) {
-      items.push({ kind: 'note', tone: 'warn', text: MODELS.length ? 'No model selected. Pick one with /model.' : 'No model selected. No models are set up yet.' });
-      return schedule();
+  async function send(text: string, held = false) {
+    if (!held) {
+      items.push({ kind: 'user', text });
+      history.push(text);
     }
-    if (!cfg.apiKey) {
-      items.push({ kind: 'note', tone: 'warn', text: 'No API key. Set ANTHROPIC_API_KEY, or put {"apiKey": "sk-ant-…"} in ~/.rime/config.' });
-      return schedule();
+    if (!connected()) return note('No model is connected yet. /setup connects your server, this computer, or a provider.');
+    if (!model) return note('No model selected. Pick one with /model.');
+    if (!conn) {
+      // An own server that isn't up yet: the message goes once it is.
+      waiting = text;
+      if (!held) note(`sends once ${model.provider} is ready`, 'dim');
+      ensure(model.provider);
+      return;
     }
-    const betas = ['server-side-fallback-2026-07-01'];
+    if (!conn.key && conn.wire === 'anthropic') return note(`No API key for ${conn.name}. /setup adds one, or set ${PRESETS.anthropic.keyEnv}.`);
+    const root = llama.rootOf(conn.base);
+    if (conn.llamacpp && (await llama.busy(root))) return note(`${conn.name} is busy: another client is using its slot. Try again in a moment.`);
+
+    task ??= { controls: { ...controls }, lastPrompt: 0 };
+    const c = sentControls();
+    // Anthropic keeps top-level effort fixed per task and takes changes as an
+    // effort-only system message, so the cache survives.
+    if (conn.wire === 'anthropic' && c.effort !== (task.sentEffort ?? task.controls.effort) && messages.length) {
+      messages.push({ role: 'system', content: [], output_config: { effort: c.effort ?? 'high' } });
+      task.sentEffort = c.effort;
+    }
     messages.push({ role: 'user', content: text });
 
     const thinking: Item = { kind: 'tool', verb: 'Thinking' };
@@ -311,54 +480,70 @@ export async function runApp(cfg: Config, version: string) {
       schedule();
     }, 200);
     const ac = new AbortController();
-    busy = ac;
+    let completionId = '';
+    let thinkingNow = true, ended = false;
+    const me = {
+      abort: () => ac.abort(),
+      // esc while a local model is thinking ends the thinking instead of the reply.
+      esc: () => {
+        if (conn?.llamacpp && thinkingNow && completionId && !ended) {
+          ended = true;
+          llama.endReasoning(root, completionId);
+          if (thinking.kind === 'tool') thinking.rest = '· wrapping up (esc again stops)';
+        } else ac.abort();
+      },
+    };
+    busy = me;
     schedule();
 
-    const acc = createAccumulator();
     let reply: Extract<Item, { kind: 'reply' }> | null = null;
-    let used: Model = model;
+    let blocks: Block[] = [];
+    let usage: Usage | null = null;
+    let stop = '';
+    const m = model, cn = conn;
     const charge = () => {
-      if (acc.usage.input_tokens !== undefined) items.push({ kind: 'cost', turn: meter.charge(acc.usage, used.price) });
+      if (!usage) return;
+      items.push({ kind: 'cost', turn: meter.charge(usage, m.price, cn.local) });
+      if (cn.local && usage.promptMs && usage.input > 500) promptRate = usage.input / (usage.promptMs / 1000);
+      // Measured, not assumed: a control change that collapses the cached prefix
+      // marks that knob unsafe for this model.
+      const prompt = usage.input + usage.cached + usage.written;
+      const changed = task?.lastControls && (task.lastControls.effort !== c.effort || task.lastControls.reasoning !== c.reasoning);
+      if (task && changed && task.lastPrompt > 2000 && usage.cached < task.lastPrompt * 0.5) {
+        unsafe.add(m.ref);
+        task.controls = { ...task.lastControls! };
+        note(`Changing effort reset ${m.provider}'s cache, so effort and reasoning stay fixed until /clear.`, 'dim');
+      }
+      if (task) Object.assign(task, { lastPrompt: prompt, lastControls: c });
     };
     const forget = () => {
       if (messages.at(-1)?.role === 'user') messages.pop();
     };
     try {
-      for await (const ev of streamMessages({
-        apiKey: cfg.apiKey,
-        baseUrl: cfg.baseUrl,
-        betas,
-        signal: ac.signal,
-        body: {
-          model: model.id,
-          max_tokens: 64000,
-          system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
-          messages,
-          cache_control: { type: 'ephemeral' },
-          fallbacks: 'default',
-        },
-      })) {
-        if (ev.type === 'message_start' && ev.message?.model) used = findModel(ev.message.model) ?? used;
-        const delta = acc.add(ev);
-        if (!delta) continue;
-        if (!reply) {
-          clearInterval(spin);
-          drop(thinking);
-          reply = { kind: 'reply', text: '', done: false };
-          items.push(reply);
+      for await (const ev of streamFor(cn)({ conn: cn, model: m, system: SYSTEM, messages, controls: cn.wire === 'anthropic' ? task.controls : c, signal: ac.signal, slot: cn.llamacpp ? 0 : undefined })) {
+        if (ev.type === 'id') completionId = ev.id;
+        else if (ev.type === 'blocks') blocks = ev.blocks;
+        else if (ev.type === 'usage') usage = ev.usage;
+        else if (ev.type === 'stop') stop = ev.reason;
+        else if (ev.type === 'text') {
+          thinkingNow = false;
+          if (!reply) {
+            clearInterval(spin);
+            drop(thinking);
+            reply = { kind: 'reply', text: '', done: false };
+            items.push(reply);
+          }
+          reply.text += ev.text;
+          schedule();
         }
-        reply.text += delta;
-        schedule();
       }
-      const blocks = acc.blocks.filter(Boolean).map(({ _json, ...b }) => b);
       if (reply) reply.done = true;
       if (blocks.length) messages.push({ role: 'assistant', content: blocks });
       else forget();
       drop(thinking);
       charge();
-      const why = acc.stopReason();
-      if (why === 'refusal') items.push({ kind: 'note', tone: 'warn', text: 'The model declined this request. Rephrase it, or /clear to start over.' });
-      else if (why === 'max_tokens') items.push({ kind: 'note', tone: 'warn', text: 'The reply hit the output limit and was cut off.' });
+      if (stop === 'refusal') note('The model declined this request. Rephrase it, or /clear to start over.');
+      else if (stop === 'max_tokens') note('The reply hit the output limit and was cut off.');
     } catch (e) {
       drop(thinking);
       if (reply) reply.done = true;
@@ -366,34 +551,85 @@ export async function runApp(cfg: Config, version: string) {
         if (reply?.text.trim()) messages.push({ role: 'assistant', content: [{ type: 'text', text: reply.text.trimEnd() }] });
         else forget();
         charge();
-        items.push({ kind: 'note', tone: 'dim', text: 'stopped' });
+        note('stopped', 'dim');
       } else {
         if (messages.at(-1)?.role === 'assistant') messages.pop();
         forget();
         const err = e as Error;
-        const text = err instanceof ApiError && err.status === 401
-          ? 'Invalid API key. Check ANTHROPIC_API_KEY or ~/.rime/config.'
-          : err instanceof ApiError ? err.message
-          : `Couldn't reach ${new URL(cfg.baseUrl).host}. ${err.message}`;
-        items.push({ kind: 'note', tone: 'warn', text });
+        note(
+          err instanceof ApiError && (err.status === 401 || err.status === 403)
+            ? `${cn.name} refused the API key. /setup can replace it.`
+            : err instanceof ApiError ? `${cn.name}: ${err.message}`
+            : `Couldn't reach ${cn.name} (${new URL(cn.base).host}). ${err.message}`,
+        );
+        if (cfg.providers[cn.name]?.ssh) conn = undefined; // bring it up again next time
       }
     } finally {
       clearInterval(spin);
-      if (busy === ac) busy = null;
+      if (busy === me) busy = null;
       schedule();
     }
   }
 
-  // ---- commands ----
+  // ---- panels ----
 
-  function applyModel() {
-    model = MODELS[modelSel] ?? model;
-    headerOpts.model = model?.label;
-    headerOpts.details = details();
-    header.redraw();
-    items.push({ kind: 'tool', verb: 'Model', rest: model?.label ?? 'none' });
-    boxKind = null;
-  }
+  const host: Host & Parameters<typeof createServer>[0] & Parameters<typeof createModelPicker>[0] = {
+    st,
+    cfg,
+    system: SYSTEM,
+    redraw: () => schedule(),
+    close: () => {
+      panel = null;
+      buf = '';
+      cur = 0;
+      schedule();
+    },
+    setBuffer: (s) => {
+      buf = s;
+      cur = s.length;
+    },
+    say: (it) => {
+      items.push(it);
+      schedule();
+    },
+    save: () => saveConfig(cfg),
+    activate: (m, base) => {
+      controls = { reasoning: cfg.reasoning !== false, effort: cfg.effort };
+      model = m;
+      conn = connOf(m.provider, cfg.providers[m.provider], base);
+      task = null;
+      schedule();
+    },
+    tunnel,
+    background: (name, run, done) => {
+      bg = { name, run };
+      done.finally(() => {
+        if (bg?.run === run) bg = null;
+        schedule();
+      });
+    },
+    openSteps: (name) => {
+      panel = createSetup(host, 'steps', name);
+      schedule();
+    },
+    ensure: (name) => void ensure(name),
+    promptRate: () => promptRate,
+    current: () => model,
+    controls: () => controls,
+    setControls: (c) => {
+      controls = c;
+      cfg.effort = c.effort;
+      cfg.reasoning = c.reasoning;
+      saveConfig(cfg);
+    },
+    choose: (m) => {
+      cfg.model = m.ref;
+      saveConfig(cfg);
+      useModel(m);
+    },
+  };
+
+  // ---- commands ----
 
   function submit() {
     const v = buf.trim();
@@ -406,18 +642,22 @@ export async function runApp(cfg: Config, version: string) {
       scrollOff = 0;
       return void send(v);
     }
-    const c = v.split(/\s+/)[0];
-    if (c === '/model') {
-      boxKind = 'model';
-      modelSel = model ? MODELS.indexOf(model) : 0;
+    const [c, ...args] = v.split(/\s+/);
+    boxKind = null;
+    if (c === '/model') panel = createModelPicker(host);
+    else if (c === '/setup') panel = createSetup(host);
+    else if (c === '/connect') panel = args[0] ? createSetup(host, 'connect', args[1], args[0]) : createSetup(host);
+    else if (c === '/server') {
+      const name = model && cfg.providers[model.provider]?.ssh ? model.provider : Object.keys(cfg.providers).find((n) => cfg.providers[n].ssh);
+      if (name) panel = createServer(host, name);
+      else note('No own server is set up. /setup connects one.', 'dim');
     } else if (c === '/clear') {
       busy?.abort();
       messages = [];
+      task = null;
       items = [headerItem];
-      boxKind = null;
       scrollOff = 0;
-      return;
-    } else if (c === '/usage') boxKind = boxKind === 'usage' ? null : 'usage';
+    } else if (c === '/usage') boxKind = 'usage';
     else if (c === '/exit') quit();
     else {
       items.push({ kind: 'user', text: v });
@@ -465,11 +705,11 @@ export async function runApp(cfg: Config, version: string) {
   }
 
   function act(id: string) {
+    if (panel && (id.startsWith('pick:') || id.startsWith('step:'))) return panel.click?.(id);
     if (id.startsWith('cmd:')) {
       buf = matches()[+id.slice(4)][0];
       submit();
-    } else if (id.startsWith('model:')) modelSel = +id.slice(6);
-    else if (id === '/') {
+    } else if (id === '/') {
       buf = '/';
       cur = 1;
       sel = 0;
@@ -506,6 +746,14 @@ export async function runApp(cfg: Config, version: string) {
       quitArmed = null;
     }
 
+    // An open panel gets the keys first; text goes to the prompt only where the
+    // panel takes typing (host names, keys, filters, step edits).
+    if (panel) {
+      if (panel.key(k, buf)) return;
+      if (k.name === 'enter' && !k.shift && !k.alt) return panel.submit?.(buf);
+      if (!panel.typing?.()) return;
+    }
+
     if (cmdsOpen()) {
       const m = matches();
       if (k.name === 'up' || k.name === 'down') {
@@ -526,15 +774,9 @@ export async function runApp(cfg: Config, version: string) {
         return;
       }
     }
-    if (boxKind === 'model') {
-      if ((k.name === 'up' || k.name === 'down') && MODELS.length) modelSel = (modelSel + (k.name === 'down' ? 1 : -1) + MODELS.length) % MODELS.length;
-      else if (k.name === 'enter') applyModel();
-      else if (k.name === 'escape') boxKind = null;
-      return;
-    }
     if (k.name === 'escape') {
       if (boxKind) boxKind = null;
-      else busy?.abort();
+      else busy?.esc();
       return;
     }
 
@@ -553,7 +795,7 @@ export async function runApp(cfg: Config, version: string) {
       case 'char':
         if (k.alt && k.ch === 'b') cur = wordLeft(cur);
         else if (k.alt && k.ch === 'f') cur = wordRight(cur);
-        else if (k.ch === '?' && !buf && !k.alt) boxKind = 'keys';
+        else if (k.ch === '?' && !buf && !k.alt && !panel) boxKind = 'keys';
         else if (!k.alt && k.ch) insert(k.ch);
         return;
       case 'space':
@@ -617,6 +859,7 @@ export async function runApp(cfg: Config, version: string) {
   }
 
   function onEvent(ev: InputEvent) {
+    const before = buf;
     if (ev.type === 'mouse') {
       const at = { x: ev.x, y: ev.y };
       if (ev.button === 64 || ev.button === 65) {
@@ -637,26 +880,41 @@ export async function runApp(cfg: Config, version: string) {
         press = null;
       }
     } else if (ev.type === 'paste') {
-      if (boxKind === 'keys' || boxKind === 'model') boxKind = null;
-      insert(ev.text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, ''));
+      if (boxKind === 'keys') boxKind = null;
+      if (!panel || panel.typing?.()) insert(ev.text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, ''));
     } else if (ev.type === 'key') {
       selection = null;
       if (ev.name === 'pageup' || ev.name === 'pagedown') scrollOff += (ev.name === 'pageup' ? 1 : -1) * Math.max(1, viewH - 2);
       else onKey(ev);
     }
+    if (panel && buf !== before) panel.changed?.(buf);
     schedule();
   }
 
   // ---- lifecycle ----
 
+  const killTunnels = () => {
+    for (const t of Object.values(tunnels)) t.child?.kill();
+  };
   const restore = () => {
+    killTunnels();
     write(MODES_OFF);
     if (inp.isTTY) inp.setRawMode(false);
   };
 
-  function quit(): never {
+  // Quitting runs each own server's onQuit (docs/providers.md §4.3): keep it
+  // running (default), stop the service, or power the machine off.
+  async function quit() {
+    if (quitting) return;
     busy?.abort();
     header?.close();
+    for (const [name, p] of Object.entries(cfg.providers)) {
+      if (!p.ssh || !p.onQuit || p.onQuit === 'keep' || !tunnels[name]?.port) continue;
+      // ponytail: saving the slot before stopping arrives with token-kit.
+      quitting = p.onQuit === 'stop' ? `stopping llama-server on ${p.ssh}…` : `powering off ${p.ssh}…`;
+      schedule();
+      await ssh(p.ssh, p.onQuit === 'stop' ? 'sudo systemctl stop llama-server' : 'sudo poweroff', 8000);
+    }
     restore();
     process.exit(0);
   }
@@ -668,11 +926,14 @@ export async function runApp(cfg: Config, version: string) {
     for (const ev of parse(d.toString('utf8'))) onEvent(ev);
   });
   process.on('exit', restore);
-  process.on('SIGTERM', quit);
-  process.on('SIGHUP', quit);
+  process.on('SIGTERM', () => void quit());
+  process.on('SIGHUP', () => void quit());
   out.on('resize', schedule);
 
   write(MODES_ON);
   playHeader(headerOpts);
+  // First run: nothing connected, so setup opens by itself.
+  if (!connected()) panel = createSetup(host);
+  else if (cfg.model) useRef(cfg.model, true);
   frame();
 }

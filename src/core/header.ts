@@ -6,7 +6,7 @@ import os from 'node:os';
 import { type ColorMode, type RGB, BOLD, RESET, blend, colorMode, sgr } from './theme.ts';
 
 // Mascot palette, taken from Mascot v10 (clean head).
-const PALETTE: Record<string, RGB> = {
+export const PALETTE: Record<string, RGB> = {
   A: [0xa8, 0xd8, 0xec], // ice body
   C: [0xc9, 0xea, 0xf6], // lit left edge
   S: [0x94, 0xcb, 0xe3], // shaded right edge
@@ -15,7 +15,7 @@ const PALETTE: Record<string, RGB> = {
 };
 
 // Compact mascot, 8 x 5 pixels. Ground snow covers his bottom row.
-const SPRITE = ['.AAAAAA.', 'CWAAAAAS', 'CADAADAS', 'CADAADAS', 'CAAAAAAS'];
+export const SPRITE = ['.AAAAAA.', 'CWAAAAAS', 'CADAADAS', 'CADAADAS', 'CAAAAAAS'];
 
 // Scene: 12 x 6 pixels = 3 terminal lines. Row 0 is open sky where his snow cap
 // settles; the mascot sits at column 2, row 1.
@@ -161,23 +161,28 @@ const same = (a: RGB | null, b: RGB | null) => (a && b ? a.join() === b.join() :
 // under every lower pixel. An underline is drawn on exactly that last row in the
 // text colour, so ▄ + underline fills the bottom of the cell solidly. Every cell is
 // therefore a solid background (the top pixel) with a solid lower part on top.
-function pixelLines(g: (RGB | null)[][], mode: ColorMode) {
-  const out: string[] = [];
+// One styled cell per column: `s` is its SGR prefix, `t` the character.
+export function pixelCells(g: (RGB | null)[][], mode: ColorMode): { t: string; s: string }[][] {
+  const out: { t: string; s: string }[][] = [];
   for (let y = 0; y < g.length; y += 2) {
-    let line = '';
+    const line: { t: string; s: string }[] = [];
     for (let x = 0; x < g[y].length; x++) {
-      const top = g[y][x], bot = g[y + 1][x];
+      const top = g[y][x], bot = g[y + 1]?.[x] ?? null;
       if (mode === 'none') {
         // Monochrome: everything solid except the eyes and empty sky.
         const on = (p: RGB | null) => p && p !== PALETTE.D;
-        line += on(top) && on(bot) ? '█' : on(top) ? '▀' : on(bot) ? '▄' : ' ';
-      } else if (same(top, bot)) line += RESET(mode) + (top ? sgr(top, true, mode) : '') + ' ';
-      else if (!bot) line += RESET(mode) + sgr(top!, false, mode) + '▀'; // only while snow falls
-      else line += RESET(mode) + (top ? sgr(top, true, mode) : '') + sgr(bot, false, mode) + '\x1b[4m▄';
+        line.push({ t: on(top) && on(bot) ? '█' : on(top) ? '▀' : on(bot) ? '▄' : ' ', s: '' });
+      } else if (same(top, bot)) line.push({ t: ' ', s: top ? sgr(top, true, mode) : '' });
+      else if (!bot) line.push({ t: '▀', s: sgr(top!, false, mode) }); // only while snow falls
+      else line.push({ t: '▄', s: (top ? sgr(top, true, mode) : '') + sgr(bot, false, mode) + '\x1b[4m' });
     }
-    out.push(line + RESET(mode));
+    out.push(line);
   }
   return out;
+}
+
+function pixelLines(g: (RGB | null)[][], mode: ColorMode) {
+  return pixelCells(g, mode).map((line) => line.map((c) => RESET(mode) + c.s + c.t).join('') + RESET(mode));
 }
 
 export function tildify(dir: string) {
@@ -208,7 +213,8 @@ function infoLines(opts: HeaderOpts, mode: ColorMode) {
   const R = RESET(mode);
   return [
     `${BOLD(mode)}${c(TEXT.title)}Rime${R} ${c(TEXT.dim)}v${version}${R}`,
-    model ? `${c(TEXT.accent)}${model}${R}${details ? ` ${c(TEXT.dim)}· ${details}${R}` : ''}` : `${c(TEXT.dim)}no model selected${R}`,
+    // Without a model, `details` says why ("no model connected").
+    model ? `${c(TEXT.accent)}${model}${R}${details ? ` ${c(TEXT.dim)}· ${details}${R}` : ''}` : `${c(TEXT.dim)}${details || 'no model selected'}${R}`,
     `${c(TEXT.dim)}${tildify(cwd)}${R}`,
   ];
 }
