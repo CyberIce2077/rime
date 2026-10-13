@@ -5,7 +5,7 @@
 // are pinned to the bottom.
 // Models come from connected providers (docs/providers.md); /setup connects them.
 
-import { type Chip, type Kind, LONG_PASTE, blocksFor, chipChar, chipFor, clipboardImage, fuzzy, isChip, label, listFiles, pastedPaths, textChip } from './attach.ts';
+import { type Chip, type Kind, LONG_PASTE, blocksFor, chipChar, fromBlocks, chipFor, clipboardImage, fuzzy, isChip, label, listFiles, pastedPaths, textChip } from './attach.ts';
 import { copy } from './clipboard.ts';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -16,6 +16,7 @@ import { type Conversation, type Db, type Stored, openDb, projectOf } from './db
 import { type Decision, MODE_HELP, MODES, type Mode, decide, projectRules, removeProjectRule, ruleList } from './permissions.ts';
 import { type ToolResult, TOOLS, bash as bashTool, diffOf, edit as editTool, planEdit, read as readTool, rel, write as writeTool } from './tools.ts';
 import { WHEN, createSettings, phrase } from './settings.ts';
+import { type Did, example as exampleFor, nextStep as nextFor } from './suggest.ts';
 import { type Config, saveConfig } from './config.ts';
 import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } from './header.ts';
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
@@ -58,6 +59,7 @@ const KEYS: [string, string][] = [
   ['ctrl+v', 'paste an image from the clipboard (or drag in a file)'],
   ['@', 'mention a file or folder'],
   ['ctrl+r', 'search your earlier prompts'],
+  ['ctrl+o', "show or hide the model's thinking"],
   ['tab  →', 'take the suggestion shown in dim text'],
   ['shift+tab', 'permission mode: ask · auto-edit · plan'],
   ['←', 'your conversations (on an empty prompt)'],
@@ -69,7 +71,7 @@ const KEYS: [string, string][] = [
 // A clicked footer key acts like pressing it (`key:esc`, `key:b`, …).
 const CLICK_KEYS: Record<string, Key> = {
   esc: { name: 'escape' }, enter: { name: 'enter' }, tab: { name: 'tab' }, space: { name: 'space' }, backspace: { name: 'backspace' },
-  'ctrl+c': { name: 'c', ctrl: true }, 'ctrl+j': { name: 'j', ctrl: true }, 'ctrl+v': { name: 'v', ctrl: true },
+  'ctrl+c': { name: 'c', ctrl: true }, 'ctrl+j': { name: 'j', ctrl: true }, 'ctrl+v': { name: 'v', ctrl: true }, 'ctrl+o': { name: 'o', ctrl: true },
 };
 
 // Frozen for the whole session: any byte change here would break the prompt cache.
@@ -109,7 +111,6 @@ export async function runApp(cfg: Config, version: string) {
   const out = process.stdout, inp = process.stdin;
   const st = styles(colorMode(out));
   const write = (s: string) => out.write(s);
-  const meter = createMeter();
   // Settings apply live (SPEC §15): effort and reasoning from the next message.
   const settings = createSettings(cfg);
   settings.watch();
@@ -121,20 +122,14 @@ export async function runApp(cfg: Config, version: string) {
   // Permissions (SPEC §17): the mode for this session, the open question, and
   // the last decisions for /permissions.
   let mode: Mode = 'ask';
-  let approval: { use: Block; decision: Decision; sel: number; done(a: 'yes' | 'always' | 'no' | 'stop'): void; diff?: ToolResult['diff'] } | null = null;
-  let declining: ((words: string | null) => void) | null = null; // "No, tell Rime instead": the next prompt is the reason
   const decisions: { at: number; tool: string; what: string; verdict: string; why: string }[] = [];
-  let nextStep = ''; // suggested after a reply (tab takes it)
   let example = ''; // `Try "…"` on an empty prompt, from this project
-  let lastUserSeq = 0; // the stored row of the last user message, while it has no reply
   // "Don't ask again" rules belong to this conversation and are saved with it.
-  let convRules: { allow?: string[]; ask?: string[]; deny?: string[] } = {};
-  const addConvRule = (kind: 'allow' | 'ask' | 'deny', pattern: string) => {
-    convRules = { ...convRules, [kind]: [...new Set([...(convRules[kind] ?? []), pattern])] };
-    save((d) => d.setRules(conversation()!, convRules));
-  };
+  const addConvRule = (kind: 'allow' | 'ask' | 'deny', pattern: string) => bound(S).addConvRule(kind, pattern);
   // ↑ / ↓ through earlier prompts, like a shell: `draft` is what you were typing.
-  let browsing: { list: string[]; i: number; draft: string } | null = null;
+  // ↑ history: `draft` is what you were typing; `edited` once you change the
+  // recalled text (esc still brings the draft back, ↑ ↓ then move in the text).
+  let browsing: { list: string[]; i: number; draft: string; edited?: boolean } | null = null;
   let navigated = false;
   const cwd = process.cwd();
   let SYSTEM = system(cwd, agentsMd(projectOf(cwd)));
@@ -144,9 +139,7 @@ export async function runApp(cfg: Config, version: string) {
   let conn: Conn | undefined; // set once the model's provider answers
   let controls: Controls = { reasoning: cfg.reasoning !== false, effort: cfg.effort };
   // A task keeps one model; controls that would break its cache stay fixed for it.
-  let task: { controls: Controls; sentEffort?: Effort; lastPrompt: number; lastControls?: Controls } | null = null;
   const unsafe = new Set<string>(); // models where changing controls was measured to reset the cache
-  let messages: Message[] = [];
   const history: string[] = [];
   let buf = '', cur = 0, sel = 0;
   let anchor: number | null = null; // the other end of a selection in the prompt
@@ -167,21 +160,15 @@ export async function runApp(cfg: Config, version: string) {
   const usedFiles: string[] = []; // attached with @ in this session, shown first
   let boxKind: 'keys' | 'usage' | null = null;
   let panel: Panel | null = null;
-  let busy: { abort(): void; esc(): void } | null = null;
   let quitArmed: NodeJS.Timeout | null = null;
   let quitting: string | null = null;
   const tunnels: Record<string, Tunnel> = {};
   let bg: { name: string; run: Run; panel?: Panel; stopping?: boolean } | null = null; // an own server coming up in the background
-  let waiting: { text: string; content: string | Block[] } | null = null; // a message held until the model is ready
   let promptRate: number | undefined; // local prompt tokens/s, from the last reply
 
   // ---- saving (SPEC §16): every message is written the moment it exists ----
   const project = projectOf(cwd);
   const db: Db | null = await openDb().catch(() => null);
-  let convId: number | null = null; // created with the first message
-  let continuing: { title: string; at: number } | null = null; // reopened, nothing sent yet
-  let resumeOk = false; // the last reply was cut off by quitting: enter continues it
-  let live: { seq: number; text: () => string } | null = null; // the reply being streamed
   let saveFailed = false;
   const save = <T>(fn: (d: Db) => T): T | undefined => {
     if (!db) return;
@@ -191,9 +178,32 @@ export async function runApp(cfg: Config, version: string) {
       if (!saveFailed) (saveFailed = true), note(`Rime couldn't save this conversation: ${(e as Error).message}`, 'dim');
     }
   };
-  const conversation = () => (convId ??= save((d) => d.create(project, SYSTEM, model?.ref, TOOLS_HASH)) ?? null);
-  // An Anthropic effort-only system message is kept as one output_config block.
-  const store = (m: Message) => save((d) => d.append(conversation()!, m.role, m.role === 'system' ? [{ type: 'output_config', ...(m.output_config as object) }] : m.content)) ?? 0;
+  // Helpers bound to one conversation. Work that's running uses its own set, so it
+  // keeps writing to its conversation after you switch to another one.
+  function bound(x: Session) {
+    const conversation = () => (x.convId ??= save((d) => d.create(project, SYSTEM, model?.ref, TOOLS_HASH)) ?? null);
+    return {
+      conversation,
+      // An Anthropic effort-only system message is kept as one output_config block.
+      store: (m: Message) => save((d) => d.append(conversation()!, m.role, m.role === 'system' ? [{ type: 'output_config', ...(m.output_config as object) }] : m.content)) ?? 0,
+      note: (text: string, tone: 'warn' | 'dim' = 'warn') => {
+        x.items.push({ kind: 'note', tone, text });
+        schedule();
+      },
+      drop: (it: Item) => {
+        const i = x.items.indexOf(it);
+        if (i >= 0) x.items.splice(i, 1);
+      },
+      addConvRule: (kind: 'allow' | 'ask' | 'deny', pattern: string) => {
+        x.convRules = { ...x.convRules, [kind]: [...new Set([...(x.convRules[kind] ?? []), pattern])] };
+        save((d) => d.setRules(conversation()!, x.convRules));
+      },
+      detail: (lines: Line[]) => x.items.push({ kind: 'lines', hug: true, lines: lines.map((l) => [{ t: '  ⎿ ', s: st.dim }, ...l]).map((l, i) => (i ? [{ t: '    ', s: '' }, ...l.slice(1)] : l)) }),
+    };
+  }
+  // The same helpers for the conversation on screen.
+  const conversation = () => bound(S).conversation();
+  const store = (m: Message) => bound(S).store(m);
   const prompts = () => [...history.slice().reverse(), ...(save((d) => d.prompts(project)) ?? [])].filter((p, i, a) => p.trim() && a.indexOf(p) === i);
 
   // ---- screen ----
@@ -203,6 +213,9 @@ export async function runApp(cfg: Config, version: string) {
   let headerRow = 0; // screen row of the header's first line (can be off screen)
   let hits: { row: number; x0: number; x1: number; id: string }[] = [];
   let scheduled = false;
+  let lastFrame = 0;
+  let showThinking = false; // ctrl+o: thinking opened under every "Thought for" line
+  let drawn: string[] = []; // what each screen row holds now, so a frame only rewrites what changed
   const cache = new WeakMap<Item, { width: number; lines: string[] }>();
 
   // Mouse selection, in screen cells. `rows` is what the last frame drew.
@@ -224,7 +237,37 @@ export async function runApp(cfg: Config, version: string) {
     ready: (h) => (header = h),
   };
   const headerItem: Item = { kind: 'header', lines: () => header.lines() };
-  let items: Item[] = [headerItem];
+
+  // ---- conversations in this window ----
+  // Each open conversation keeps its own state, so one can keep working (a reply,
+  // tool calls, a question waiting for you) while you look at another. `S` is
+  // the one on screen; work that's running holds on to its own.
+  type Session = {
+    convId: number | null; // created with the first message
+    messages: Message[];
+    items: Item[];
+    // A task keeps one model; controls that would break its cache stay fixed for it.
+    task: { controls: Controls; sentEffort?: Effort; lastPrompt: number; lastControls?: Controls } | null;
+    busy: { abort(): void; esc(): void } | null;
+    waiting: { text: string; content: string | Block[] } | null; // a message held until the model is ready
+    live: { seq: number; text: () => string } | null; // the reply being streamed
+    lastUserSeq: number; // the stored row of the last user message, while it has no reply
+    continuing: { title: string; at: number } | null; // reopened, nothing sent yet
+    resumeOk: boolean; // the last reply was cut off by quitting: enter continues it
+    approval: { use: Block; decision: Decision; sel: number; done(a: 'yes' | 'always' | 'no' | 'stop'): void; diff?: ToolResult['diff'] } | null;
+    declining: ((words: string | null) => void) | null; // "No, tell Rime instead": the next prompt is the reason
+    convRules: { allow?: string[]; ask?: string[]; deny?: string[] }; // "don't ask again", saved with it
+    meter: ReturnType<typeof createMeter>; // its tokens, cost and savings
+    nextStep: string; // suggested after a reply (tab takes it)
+    title: string;
+  };
+  const newSession = (): Session => ({
+    convId: null, messages: [], items: [headerItem], task: null, busy: null, waiting: null, live: null, lastUserSeq: 0,
+    continuing: null, resumeOk: false, approval: null, declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '',
+  });
+  let S = newSession();
+  const sessions: Session[] = [S]; // open in this window; the ones not on screen keep working
+  const needsYou = (x: Session) => !!(x.approval || x.declining);
 
   const W = () => out.columns || 80;
   const H = () => out.rows || 24;
@@ -237,7 +280,7 @@ export async function runApp(cfg: Config, version: string) {
     return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : s < 86400 ? `${Math.floor(s / 3600)} h ago` : `${Math.floor(s / 86400)} days ago`;
   };
   function headerInfo() {
-    const cont = continuing ? `continuing "${continuing.title}" · ${ago(continuing.at)}` : '';
+    const cont = S.continuing ? `continuing "${S.continuing.title}" · ${ago(S.continuing.at)}` : '';
     if (!model) return { model: undefined, details: cont || (connected() ? 'no model selected' : 'no model connected') };
     if (cont && !bg) return { model: model.label, details: `${model.provider} · ${cont}` };
     const p = model.provider;
@@ -269,7 +312,7 @@ export async function runApp(cfg: Config, version: string) {
     const lines: string[] = [];
     const gears: { at: number; i: number }[] = [];
     let prev: Item | undefined;
-    items.forEach((it, i) => {
+    S.items.forEach((it, i) => {
       if (spaced(prev, it)) lines.push('');
       if (it.kind === 'gear' && !it.note && !it.change.undone) gears.push({ at: lines.length, i });
       lines.push(...render(it, width));
@@ -288,16 +331,36 @@ export async function runApp(cfg: Config, version: string) {
   };
   const cmdsOpen = () => !panel && boxKind !== 'keys' && buf.startsWith('/') && !/\s/.test(buf);
 
+  // /usage for a local model: tokens and the prompt-processing time the cache
+  // saved, no dollar columns.
+  function localUsageRows(width: number): BoxRow[] {
+    const t = S.meter.tokens, inner = width - 4;
+    const row = (label: string, value: string, s: string): BoxRow => ({ line: [...fit([{ t: label, s }], inner - 12, true), { t: value.padStart(12), s }] });
+    return [
+      row('tokens', '', st.dim),
+      row('processed (not cached)', fmtT(t.uncached + t.write), st.fg),
+      row('read from the cache', fmtT(t.read), st.fg),
+      row('written by the model', fmtT(t.out), st.fg),
+      { line: [], rule: 'inner' },
+      row('total', fmtT(S.meter.totalTokens()), st.title),
+      { line: [] },
+      row('prompt caching saved', S.meter.saved.ms >= 100 ? `~${fmtS(S.meter.saved.ms)}` : '—', st.ok),
+      { line: [], rule: 'inner' },
+      ...wrap([{ t: `Local tokens cost nothing. Cached tokens skip prompt processing on ${model?.provider ?? 'the server'}${promptRate ? ` (about ${Math.round(promptRate)} tokens/s)` : ''}, which is the time shown. `, s: st.dim }, { t: '/usage', s: st.accent }, { t: ' or a click on the meter closes this.', s: st.dim }], inner).map((line) => ({ line })),
+    ];
+  }
+
   function usageRows(width: number): BoxRow[] {
-    const t = meter.tokens, c = meter.cost, p = model?.price;
-    const sp = meter.spent(), sv = meter.savedTotal();
-    const savedCell = `${fmt$(sv)} (${meter.pct()}%)`;
+    if (conn?.local || (!conn && model && cfg.providers[model.provider]?.ssh)) return localUsageRows(width);
+    const t = S.meter.tokens, c = S.meter.cost, p = model?.price;
+    const sp = S.meter.spent(), sv = S.meter.savedTotal();
+    const savedCell = `${fmt$(sv)} (${S.meter.pct()}%)`;
     const data: [string, string, string][] = [
       ['input', fmtT(t.uncached), fmt$(c.uncached)],
       ['cache reads', fmtT(t.read), fmt$(c.read)],
       ['cache writes', fmtT(t.write), fmt$(c.write)],
       ['output', fmtT(t.out), fmt$(c.out)],
-      ['total spent', fmtT(meter.totalTokens()), fmt$(sp)],
+      ['total spent', fmtT(S.meter.totalTokens()), fmt$(sp)],
     ];
     const inner = width - 4;
     const tw = Math.max(6, ...data.map((d) => d[1].length));
@@ -308,11 +371,11 @@ export async function runApp(cfg: Config, version: string) {
     const why = p && p.in ? `context re-read at ${fmtP(p.read)} instead of ${fmtP(p.in)}` : 'context re-read at the cache price';
     const prices = p && p.in ? `Prices per million tokens: ${fmtP(p.in)} input, ${fmtP(p.read)} cache read, ${fmtP(p.write)} cache write, ${fmtP(p.out)} output. ` : '';
     const notes = [
-      meter.unpriced() ? 'Some replies came from a model with an unknown price, so their dollars aren\'t counted. ' : '',
-      meter.saved.ms >= 1000 ? `Local prompt caching saved about ${fmtS(meter.saved.ms)} of prompt processing. ` : '',
+      S.meter.unpriced() ? 'Some replies came from a model with an unknown price, so their dollars aren\'t counted. ' : '',
+      S.meter.saved.ms >= 1000 ? `Local prompt caching saved about ${fmtS(S.meter.saved.ms)} of prompt processing. ` : '',
     ].join('');
     const foot = wrap([
-      { t: `Without Rime this session would have cost ${fmt$(sp + sv)}. ${prices}${notes}`, s: st.dim },
+      { t: `Without Rime this conversation would have cost ${fmt$(sp + sv)}. ${prices}${notes}`, s: st.dim },
       { t: '/usage', s: st.accent },
       { t: ' or a click on the meter closes this.', s: st.dim },
     ], inner);
@@ -324,7 +387,7 @@ export async function runApp(cfg: Config, version: string) {
       { line: [] },
       { line: [], rule: 'inner' },
       row([{ t: 'Rime saved', s: st.ok }], '', savedCell, st.ok),
-      row([{ t: '  prompt caching', s: st.fg }], '', fmt$(meter.saved.cache), st.fg),
+      row([{ t: '  prompt caching', s: st.fg }], '', fmt$(S.meter.saved.cache), st.fg),
       { line: [{ t: '  ' + why, s: st.dim }] },
       { line: [], rule: 'inner' },
       ...foot.map((line) => ({ line })),
@@ -347,20 +410,25 @@ export async function runApp(cfg: Config, version: string) {
     if (boxKind === 'keys') {
       return box('shortcuts', [...KEYS.map(([k, h]) => listRow(k, h, false, st, undefined, 16)), ...footRows('any key to close', st)], width, st, st.accent, 'key:esc');
     }
-    if (boxKind === 'usage') return box(`usage · this session${model ? ` · ${model.label}` : ''}`, usageRows(width), width, st, st.accent, 'key:esc');
+    if (boxKind === 'usage') return box(`usage · this conversation${model ? ` · ${model.label}` : ''}`, usageRows(width), width, st, st.accent, 'key:esc');
     return null;
   }
 
   function meterLine(): Line {
     if (!connected()) return [{ t: 'no model', s: st.dim }];
-    const tokens = `${fmtT(meter.totalTokens())} tokens`;
+    const tokens = `${fmtT(S.meter.totalTokens())} tokens`;
     if (conn?.local || (!conn && model && cfg.providers[model.provider]?.ssh)) {
-      const ms = meter.saved.ms;
-      return [{ t: `${tokens} · ${fmt$(meter.spent())} · local`, s: st.dim }, ...(ms >= 1000 ? [{ t: ` · saved ~${fmtS(ms)}`, s: st.ok }] : [])];
+      const ms = S.meter.saved.ms;
+      // Local tokens cost nothing, so no dollars here: the time the cache saved instead.
+      return [{ t: `${tokens} · local`, s: st.dim }, ...(ms >= 1000 ? [{ t: ` · saved ~${fmtS(ms)}`, s: st.ok }] : [])];
     }
-    if (meter.unpriced() && !meter.spent()) return [{ t: tokens, s: st.dim }];
-    return [{ t: `${tokens} · ${fmt$(meter.spent())} · `, s: st.dim }, { t: `saved ${fmt$(meter.savedTotal())} (${meter.pct()}%)`, s: st.ok }];
+    if (S.meter.unpriced() && !S.meter.spent()) return [{ t: tokens, s: st.dim }];
+    return [{ t: `${tokens} · ${fmt$(S.meter.spent())} · `, s: st.dim }, { t: `saved ${fmt$(S.meter.savedTotal())} (${S.meter.pct()}%)`, s: st.ok }];
   }
+
+  // The right end of the status line: the meter, then "esc to stop" while working.
+  const stoppable = () => !!(S.busy || S.declining);
+  const rightLine = (): Line => (stoppable() ? [...meterLine(), { t: ' · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' to stop', s: st.dim }] : meterLine());
 
   // ---- chips ----
 
@@ -508,9 +576,9 @@ export async function runApp(cfg: Config, version: string) {
     // The prompt grows to 10 rows (at most a third of the screen), then scrolls.
     const maxRows = Math.max(1, Math.min(10, Math.floor(height / 3), height - lines.length - 3 - (sent.length ? 1 : 0)));
     const p = prompt(buf, cur, width, maxRows, st, {
-      placeholder: panel?.placeholder?.() ?? (declining ? 'tell Rime what to do instead' : resumeOk ? 'enter continues the interrupted reply, or ask something new' : nextStep ? nextStep : example ? `Try "${example}"` : undefined),
+      placeholder: panel?.placeholder?.() ?? (S.declining ? 'tell Rime what to do instead' : S.resumeOk ? 'enter continues the interrupted reply, or ask something new' : S.nextStep ? S.nextStep : example && !S.messages.length ? `Try "${example}"` : undefined),
       // A suggestion shows the key that takes it.
-      tabHint: !panel && !declining && !resumeOk && (buf ? !!ghost() : !!(nextStep || example)),
+      tabHint: !panel && !S.declining && !S.resumeOk && (buf ? !!ghost() : !!(S.nextStep || (example && !S.messages.length))),
       masked: panel?.masked?.() ?? false,
       sel: range() ?? undefined,
       chip: chipView,
@@ -545,32 +613,46 @@ export async function runApp(cfg: Config, version: string) {
         { t: 'esc', s: st.accentB }, { t: ' to the end', s: st.dim },
       ];
       leftHits = [{ x0: 1, x1: lineWidth(left), id: 'bottom' }];
-    } else if (declining) left = [{ t: 'type what Rime should do instead · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' to stop', s: st.dim }];
-    else if (busy) left = [{ t: 'esc', s: st.accentB }, { t: ' to stop', s: st.dim }];
-    else if (browsing) {
+    } else if (browsing && !browsing.edited) {
       left = [{ t: '↑', s: st.accentB }, { t: ' older · ', s: st.dim }, { t: '↓', s: st.accentB }, { t: ' newer · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' back to your text', s: st.dim }];
       leftHits = [{ x0: 19, x1: 21, id: 'key:esc' }];
     } else if (range()) {
       left = [{ t: 'backspace', s: st.accentB }, { t: ' delete selection · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' clear selection', s: st.dim }];
       leftHits = [{ x0: 1, x1: 9, id: 'key:backspace' }, { x0: 30, x1: 32, id: 'key:esc' }];
-    } else if (mode !== 'ask') {
-      // Like Claude Code: the mode shows while it isn't the default; a click cycles it.
-      const [icon, name, s] =
-        mode === 'auto-edit' ? ['⏵⏵', 'auto-edit on', st.accentB]
-        : mode === 'plan' ? ['⏸', 'plan mode on', st.accentB]
-        : mode === 'god' ? ['⏵⏵⏵⏵', 'god mode on · nothing asks', st.del]
-        : ['⏵⏵⏵', 'auto on · risky commands still ask', st.warn];
-      left = [{ t: `${icon} ${name}`, s }, { t: ' (shift+tab to cycle)', s: st.dim }];
-      leftHits = [{ x0: 1, x1: lineWidth(left), id: 'mode' }];
     } else {
-      left = [
-        { t: '/', s: st.accentB }, { t: ' for commands', s: st.dim }, { t: ' · ', s: st.dim },
-        { t: '?', s: st.accentB }, { t: ' for shortcuts', s: st.dim }, { t: ' · ', s: st.dim },
-        { t: '←', s: st.accentB }, { t: ' conversations', s: st.dim },
-      ];
-      leftHits = [{ x0: 1, x1: 14, id: '/' }, { x0: 18, x1: 32, id: '?' }, { x0: 36, x1: 50, id: 'conversations' }];
+      // One line of parts, most important first: other conversations, the permission
+      // mode, then the keys. What doesn't fit drops from the end. Stopping sits at
+      // the far right, after the meter.
+      const dim = (t: string) => ({ t, s: st.dim });
+      const key = (t: string) => ({ t, s: st.accentB });
+      const parts: { line: Line; id?: string }[] = [];
+      if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
+      if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
+      const asking = sessions.filter((x) => x !== S && needsYou(x)).length;
+      const working = sessions.filter((x) => x !== S && (x.busy || x.waiting) && !needsYou(x)).length;
+      if (asking) parts.push({ line: [{ t: '● ', s: st.warn }, { t: `${asking} needs you`, s: st.fg }], id: 'conversations' });
+      if (working) parts.push({ line: [{ t: '● ', s: st.accent }, { t: `${working} working`, s: st.fg }], id: 'conversations' });
+      // The permission mode always shows, like Claude Code's; a click cycles it.
+      const [icon, name, ms] =
+        mode === 'ask' ? ['⏵', 'ask', st.accent]
+        : mode === 'auto-edit' ? ['⏵⏵', 'auto-edit', st.accentB]
+        : mode === 'plan' ? ['⏸', 'plan', st.accentB]
+        : mode === 'god' ? ['⏵⏵⏵⏵', 'god mode', st.del]
+        : ['⏵⏵⏵', 'auto', st.warn];
+      parts.push({ line: [{ t: `${icon} ${name}`, s: ms }, dim(' shift+tab')], id: 'mode' });
+      parts.push({ line: [key('←'), dim(' conversations')], id: 'conversations' });
+      parts.push({ line: [key('/'), dim(' commands')], id: '/' });
+      parts.push({ line: [key('?'), dim(' shortcuts')], id: '?' });
+      const room = width - lineWidth(rightLine()) - 2;
+      left = [];
+      for (const p of parts) {
+        const sep = left.length ? [dim(' · ')] : [];
+        if (lineWidth(left) + lineWidth([...sep, ...p.line]) > room) break;
+        left.push(...sep, ...p.line);
+        if (p.id) leftHits.push({ x0: lineWidth(left) - lineWidth(p.line) + 1, x1: lineWidth(left), id: p.id });
+      }
     }
-    const s = status(left, meterLine(), width, st, leftHits);
+    const s = status(left, rightLine(), width, st, leftHits, stoppable() ? [{ x0: 1, x1: lineWidth(meterLine()), id: 'meter' }, { x0: lineWidth(meterLine()) + 4, x1: lineWidth(rightLine()), id: 'key:esc' }] : undefined);
     lines.push(s.line);
     rowHits.push(s.hits);
     return { lines, rowHits, cursor: { row: top + p.cursor.row, col: p.cursor.col }, prompt: { rel: top + 1, first: p.first, shown: p.lines.length - 2, rows: p.rows } };
@@ -584,6 +666,13 @@ export async function runApp(cfg: Config, version: string) {
     scheduled = false;
     Object.assign(headerOpts, headerInfo());
     const width = W(), height = H();
+    // The conversations window fills the screen.
+    if (list) {
+      const v = frameList(width, height);
+      hits = v.rowHits;
+      rows = v.lines.map((l) => truncAnsi(l, width));
+      return paint(rows.map((l) => [l, '']), width, '');
+    }
     const { lines, gears } = transcript(width);
     const u = ui(width, height);
     viewH = Math.max(0, height - u.lines.length);
@@ -601,10 +690,16 @@ export async function runApp(cfg: Config, version: string) {
     }
     const view = lines.slice(start, start + viewH);
     const screen = [...view, ...new Array(viewH - view.length).fill(''), ...u.lines];
-    headerRow = items[0] === headerItem ? 2 - start : -99;
+    headerRow = S.items[0] === headerItem ? 2 - start : -99;
     hits = u.rowHits.flatMap((hs, i) => hs.map((h) => ({ ...h, row: viewH + 1 + i })));
     promptAt = { row: viewH + 1 + u.prompt.rel, first: u.prompt.first, shown: u.prompt.shown, rows: u.prompt.rows };
     rows = screen.map((l) => truncAnsi(l, width));
+    // "ctrl+o to show / hide" under thinking is a key too.
+    rows.slice(0, viewH).forEach((r, i) => {
+      const text = stripAnsi(r);
+      const x = text.indexOf('· ctrl+o to ');
+      if (x >= 0 && text.trimStart().startsWith('✻')) hits.push({ row: i + 1, x0: strWidth(text.slice(0, x)) + 3, x1: strWidth(text.slice(0, x)) + 16, id: 'key:ctrl+o' });
+    });
     for (const g of gears) {
       const row = g.at - start + 1;
       const text = row >= 1 && row <= viewH ? stripAnsi(rows[row - 1]) : '';
@@ -616,13 +711,23 @@ export async function runApp(cfg: Config, version: string) {
     const l2 = r2 >= 1 && r2 <= viewH ? stripAnsi(rows[r2 - 1]) : '';
     const at = l2.indexOf('✕ stop');
     if (at >= 0) hits.push({ row: r2, x0: strWidth(l2.slice(0, at)) + 1, x1: strWidth(l2.slice(0, at)) + 6, id: 'stop' });
-    write(
-      '\x1b[?2026h\x1b[?25l' +
-      // Clear first: erasing after a full-width line would eat its last cell.
-      rows.map((l, i) => `\x1b[${i + 1};1H\x1b[2K${l}${st.reset}`).join('') +
-      selectionSpans(width).map(({ y, x0, x1 }) => `\x1b[${y};${x0}H${st.selection}${sliceCols(rows[y - 1], x0, x1).padEnd(x1 - x0 + 1)}${st.reset}`).join('') +
-      `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h\x1b[?2026l`,
-    );
+    const marks = rows.map(() => '');
+    for (const { y, x0, x1 } of selectionSpans(width)) marks[y - 1] += `\x1b[${y};${x0}H${st.selection}${sliceCols(rows[y - 1], x0, x1).padEnd(x1 - x0 + 1)}${st.reset}`;
+    paint(rows.map((l, i) => [l, marks[i]]), width, `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h`);
+  }
+
+  // Writes only the rows that changed since the last frame, each overwritten in
+  // place and padded to the width instead of cleared first: a row is never blank
+  // on screen, so terminals without synchronized output (2026) don't flicker.
+  function paint(screen: [string, string][], width: number, cursor: string) {
+    let out = '';
+    screen.forEach(([l, mark], i) => {
+      const row = `${l}${st.reset}${' '.repeat(Math.max(0, width - strWidth(stripAnsi(l))))}${mark}`;
+      if (drawn[i] !== row) out += `\x1b[${i + 1};1H${row}`;
+      drawn[i] = row;
+    });
+    drawn.length = screen.length;
+    write('\x1b[?2026h\x1b[?25l' + out + cursor + '\x1b[?2026l');
   }
 
   // The selected cells per line, from the anchor to the pointer in reading
@@ -634,7 +739,7 @@ export async function runApp(cfg: Config, version: string) {
     if (!selection) return [];
     let { a, b } = selection;
     if (b.y < a.y || (b.y === a.y && b.x < a.x)) [a, b] = [b, a];
-    const hasHeader = items[0] === headerItem;
+    const hasHeader = S.items[0] === headerItem;
     const textOf = (y: number) => (selection!.log ? logLines[y] : rows[y - 1]) ?? '';
     const spans: { y: number; x0: number; x1: number; text: string }[] = [];
     for (let y = a.y; y <= b.y; y++) {
@@ -680,17 +785,20 @@ export async function runApp(cfg: Config, version: string) {
     }, 50);
   }
 
+  // At most ~60 frames a second: a fast stream asks for one per token.
   const schedule = () => {
-    if (!scheduled) {
-      scheduled = true;
-      setImmediate(frame);
-    }
+    if (scheduled) return;
+    scheduled = true;
+    const wait = lastFrame + 16 - Date.now();
+    const go = () => {
+      lastFrame = Date.now();
+      frame();
+    };
+    if (wait > 0) setTimeout(go, wait);
+    else setImmediate(go);
   };
 
-  const note = (text: string, tone: 'warn' | 'dim' = 'warn') => {
-    items.push({ kind: 'note', tone, text });
-    schedule();
-  };
+  const note = (text: string, tone: 'warn' | 'dim' = 'warn') => bound(S).note(text, tone);
 
   // ---- models and servers ----
 
@@ -722,21 +830,25 @@ export async function runApp(cfg: Config, version: string) {
         }
         const worked = run.state.steps.filter((v) => ['wake', 'start', 'load'].includes(v.id) && v.status === 'done' && !['on', 'running', 'loaded'].includes(v.result));
         if (!quiet && worked.length) {
-          items.push({ kind: 'lines', lines: [[{ t: '● ', s: st.ok }, { t: `${name} is ready · `, s: st.fg }, { t: model?.label ?? p.model ?? '', s: st.titleB }, { t: ` · ${worked.map((v) => `${NAMES[v.id]} ${v.result}`).join(' · ')}`, s: st.dim }]] });
+          S.items.push({ kind: 'lines', lines: [[{ t: '● ', s: st.ok }, { t: `${name} is ready · `, s: st.fg }, { t: model?.label ?? p.model ?? '', s: st.titleB }, { t: ` · ${worked.map((v) => `${NAMES[v.id]} ${v.result}`).join(' · ')}`, s: st.dim }]] });
         }
         if (bg?.run === run) bg = null;
         schedule();
-        if (waiting) {
-          const t = waiting;
-          waiting = null;
-          send(t.text, true, t.content);
+        // Messages held in any conversation go now.
+        for (const x of sessions) {
+          if (!x.waiting) continue;
+          const t = x.waiting;
+          x.waiting = null;
+          send(t.text, true, t.content, x);
         }
       },
       (e) => {
         if (bg?.run === run) bg = null;
         if (e instanceof Cancelled) {
-          if (waiting) note('Your message wasn\'t sent; it\'s still in ↑.', 'dim');
-          waiting = null;
+          for (const x of sessions) {
+            if (x.waiting) bound(x).note('Your message wasn\'t sent; it\'s still in ↑.', 'dim');
+            x.waiting = null;
+          }
           panel = createStopped(host, { name, host: p.ssh!, model: p.model, state: run.state, startup: true, after: 'Rime starts it again when you send a message.' }, () => {
             host.close();
             ensure(name);
@@ -744,7 +856,7 @@ export async function runApp(cfg: Config, version: string) {
           return schedule();
         }
         note(`${name}: ${(e as Error).message}. /server shows what's going on, /setup changes the steps.`);
-        waiting = null;
+        for (const x of sessions) x.waiting = null;
         schedule();
       },
     );
@@ -780,8 +892,8 @@ export async function runApp(cfg: Config, version: string) {
     if (!p) return;
     model = m;
     conn = undefined;
-    task = null;
-    if (!quiet) items.push({ kind: 'tool', verb: 'Model', rest: `${m.label} · ${m.provider}` });
+    S.task = null;
+    if (!quiet) S.items.push({ kind: 'tool', verb: 'Model', rest: `${m.label} · ${m.provider}` });
     schedule();
     if (p.ssh) {
       const t = tunnel(m.provider);
@@ -819,39 +931,38 @@ export async function runApp(cfg: Config, version: string) {
     return { effort: true, reasoning: true };
   }
   function sentControls(): Controls {
-    if (!task) return controls;
+    if (!S.task) return controls;
     const safe = cacheSafe();
-    return { reasoning: safe.reasoning ? controls.reasoning : task.controls.reasoning, effort: safe.effort ? controls.effort : task.controls.effort };
+    return { reasoning: safe.reasoning ? controls.reasoning : S.task.controls.reasoning, effort: safe.effort ? controls.effort : S.task.controls.effort };
   }
 
   // ---- chat ----
 
-  const drop = (it: Item) => {
-    const i = items.indexOf(it);
-    if (i >= 0) items.splice(i, 1);
-  };
+  const drop = (it: Item) => bound(S).drop(it);
 
   // The user's message joins the history; when the last message is already the
   // user's (a reply that never came, or tool results), the new words join it, so
   // the turns keep alternating.
-  function pushUser(content: string | Block[]) {
-    const last = messages.at(-1);
-    if (last?.role === 'user' && lastUserSeq) {
+  function pushUser(content: string | Block[], C: Session) {
+    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
+    const last = C.messages.at(-1);
+    if (last?.role === 'user' && C.lastUserSeq) {
       const blocks = (c: string | Block[]): Block[] => (typeof c === 'string' ? [{ type: 'text', text: c }] : c);
       last.content = [...blocks(last.content), ...blocks(content)];
-      save((d) => d.update(convId!, lastUserSeq, last.content, false));
-      return lastUserSeq;
+      save((d) => d.update(C.convId!, C.lastUserSeq, last.content, false));
+      return C.lastUserSeq;
     }
-    messages.push({ role: 'user', content });
-    return (lastUserSeq = store(messages.at(-1)!));
+    C.messages.push({ role: 'user', content });
+    return (C.lastUserSeq = store(C.messages.at(-1)!));
   }
 
   // `text` is the prompt as typed (chips included); `content` is what goes to the
   // model: the text, or content blocks with the attachments.
-  async function send(text: string, held = false, content: string | Block[] | Promise<Block[]> = text) {
+  async function send(text: string, held = false, content: string | Block[] | Promise<Block[]> = text, C: Session = S) {
+    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
     if (!held) {
       const labels = Object.fromEntries([...new Set([...text].filter(isChip))].flatMap((ch) => (chips.get(ch) ? [[ch, label(chips.get(ch)!)]] : [])));
-      items.push({ kind: 'user', text, ...(Object.keys(labels).length ? { chips: labels } : {}) });
+      C.items.push({ kind: 'user', text, ...(Object.keys(labels).length ? { chips: labels } : {}) });
       history.push(text);
       schedule();
     }
@@ -864,70 +975,86 @@ export async function runApp(cfg: Config, version: string) {
     if (!model) return note('No model selected. Pick one with /model.');
     if (!conn) {
       // An own server that isn't up yet: the message goes once it is.
-      waiting = { text, content };
+      C.waiting = { text, content };
       if (!held) note(`sends once ${model.provider} is ready`, 'dim');
       ensure(model.provider);
       return;
     }
     if (!conn.key && conn.wire === 'anthropic') return note(`No API key for ${conn.name}. /setup adds one, or set ${PRESETS.anthropic.keyEnv}.`);
     const root = llama.rootOf(conn.base);
-    if (conn.llamacpp && (await llama.busy(root))) return note(`${conn.name} is busy: another client is using its slot. Try again in a moment.`);
+    // Another of your conversations on the same server: the server queues this one.
+    // ponytail: they share slot 0, so each evicts the other's cache; per-conversation slots when total_slots > 1.
+    const mine = sessions.some((x) => x !== C && x.busy && conn && x.convId !== null);
+    if (conn.llamacpp && !mine && (await llama.busy(root))) return note(`${conn.name} is busy: another client is using its slot. Try again in a moment.`);
+    if (conn.llamacpp && mine) note(`waits for ${conn.name}: another conversation is using it`, 'dim');
 
-    task ??= { controls: { ...controls }, lastPrompt: 0 };
+    C.task ??= { controls: { ...controls }, lastPrompt: 0 };
     const c = sentControls();
     // Anthropic keeps top-level effort fixed per task and takes changes as an
     // effort-only system message, so the cache survives.
-    if (conn.wire === 'anthropic' && c.effort !== (task.sentEffort ?? task.controls.effort) && messages.length && messages.at(-1)?.role !== 'user') {
-      messages.push({ role: 'system', content: [], output_config: { effort: c.effort ?? 'high' } });
-      store(messages.at(-1)!);
-      task.sentEffort = c.effort;
+    if (conn.wire === 'anthropic' && c.effort !== (C.task.sentEffort ?? C.task.controls.effort) && C.messages.length && C.messages.at(-1)?.role !== 'user') {
+      C.messages.push({ role: 'system', content: [], output_config: { effort: c.effort ?? 'high' } });
+      store(C.messages.at(-1)!);
+      C.task.sentEffort = c.effort;
     }
-    const userSeq = pushUser(content);
-    continuing = null;
-    resumeOk = false;
-    nextStep = '';
+    const userSeq = pushUser(content, C);
+    C.continuing = null;
+    C.resumeOk = false;
+    C.nextStep = '';
 
     const ac = new AbortController();
     const m = model, cn = conn;
-    const did: Did = { wrote: [], ran: [] };
+    // Files you attached: `[file a.ts] src/a.ts (40 lines)` heads in the message.
+    const attached = (Array.isArray(content) ? content : []).flatMap((b) => (b.type === 'text' ? [...String(b.text).matchAll(/^\[file [^\]]+\] (.+?) \(\d+ lines\)\n/g)].map((x) => x[1]) : []));
+    const did: Did = { wrote: [], ran: [], about: attached };
+    let said = ''; // the last reply's text, for the next-step suggestion
     let esc = () => ac.abort();
     const me = { abort: () => ac.abort(), esc: () => esc() };
-    busy = me;
+    C.busy = me;
     schedule();
     try {
       // The loop: a reply, its tool calls (asked about first), their results back
       // to the model, until it answers without tools or you stop it.
       for (let step = 0; step < 200; step++) {
-        const r = await streamOnce(m, cn, c, ac, step === 0 ? userSeq : 0, (f) => (esc = f));
+        const r = await streamOnce(m, cn, c, ac, step === 0 ? userSeq : 0, (f) => (esc = f), C);
         if (!r.ok) break;
+        said = r.blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
         const uses = r.blocks.filter((b) => b.type === 'tool_use');
         if (!uses.length) break;
         esc = () => ac.abort();
-        const results = await runTools(uses, ac.signal, did);
-        messages.push({ role: 'user', content: results });
-        lastUserSeq = store(messages.at(-1)!);
+        const results = await runTools(uses, ac.signal, did, C);
+        C.messages.push({ role: 'user', content: results });
+        C.lastUserSeq = store(C.messages.at(-1)!);
         if (ac.signal.aborted) {
           note('stopped', 'dim');
           break;
         }
       }
     } finally {
-      if (busy === me) busy = null;
-      nextStep = suggestNext(did);
+      if (C.busy === me) C.busy = null;
+      C.nextStep = nextFor(said, did, project);
+      example = exampleFor(project);
       schedule();
     }
   }
 
   // One streamed reply. Returns its blocks, or ok: false when it was stopped or failed.
-  async function streamOnce(m: Model, cn: Conn, c: Controls, ac: AbortController, userSeq: number, setEsc: (f: () => void) => void): Promise<{ ok: boolean; blocks: Block[] }> {
+  async function streamOnce(m: Model, cn: Conn, c: Controls, ac: AbortController, userSeq: number, setEsc: (f: () => void) => void, C: Session): Promise<{ ok: boolean; blocks: Block[] }> {
+    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
     const root = llama.rootOf(cn.base);
-    const thinking: Item = { kind: 'tool', verb: 'Thinking' };
-    items.push(thinking);
-    let dots = 0;
-    const spin = setInterval(() => {
-      if (thinking.kind === 'tool') thinking.verb = 'Thinking' + '.'.repeat(++dots % 4);
+    const thinking: Extract<Item, { kind: 'think' }> = { kind: 'think', text: '', start: Date.now(), open: showThinking };
+    C.items.push(thinking);
+    const spin = setInterval(schedule, 250);
+    // Thinking ends when the answer starts (or the stream does): it stays as one
+    // "Thought for 6s" line, or goes when the model didn't think out loud.
+    const settle = () => {
+      clearInterval(spin);
+      if (thinking.ms !== undefined) return;
+      thinking.ms = Date.now() - thinking.start;
+      thinking.note = undefined;
+      if (!thinking.text.trim()) drop(thinking);
       schedule();
-    }, 200);
+    };
     let completionId = '';
     let thinkingNow = true, ended = false;
     // esc while a local model is thinking ends the thinking instead of the reply.
@@ -935,7 +1062,7 @@ export async function runApp(cfg: Config, version: string) {
       if (cn.llamacpp && thinkingNow && completionId && !ended) {
         ended = true;
         llama.endReasoning(root, completionId);
-        if (thinking.kind === 'tool') thinking.rest = '· wrapping up (esc again stops)';
+        thinking.note = 'wrapping up (esc again stops)';
       } else ac.abort();
     });
     schedule();
@@ -945,52 +1072,55 @@ export async function runApp(cfg: Config, version: string) {
     let usage: Usage | null = null;
     let stop = '';
     let flush: NodeJS.Timeout | null = null;
+    let replySeq = 0; // the stored reply, which keeps what it cost
     const charge = () => {
       if (!usage) return;
-      const turn = meter.charge(usage, m.price, cn.local);
-      items.push({ kind: 'cost', turn });
-      save((d) => d.usage(convId!, turn.in + turn.out, turn.spent ?? 0, m.ref));
+      const turn = C.meter.charge(usage, m.price, cn.local);
+      C.items.push({ kind: 'cost', turn });
+      if (replySeq) save((d) => d.setUsage(C.convId!, replySeq, { usage: usage!, ...(m.price ? { price: m.price } : {}), ...(cn.local ? { local: true } : {}) }));
+      save((d) => d.usage(C.convId!, turn.in + turn.out, turn.spent ?? 0, m.ref));
       if (cn.local && usage.promptMs && usage.input > 500) promptRate = usage.input / (usage.promptMs / 1000);
       // Measured, not assumed: a control change that collapses the cached prefix
       // marks that knob unsafe for this model.
       const prompt = usage.input + usage.cached + usage.written;
-      const changed = task?.lastControls && (task.lastControls.effort !== c.effort || task.lastControls.reasoning !== c.reasoning);
-      if (task && changed && task.lastPrompt > 2000 && usage.cached < task.lastPrompt * 0.5) {
+      const changed = C.task?.lastControls && (C.task.lastControls.effort !== c.effort || C.task.lastControls.reasoning !== c.reasoning);
+      if (C.task && changed && C.task.lastPrompt > 2000 && usage.cached < C.task.lastPrompt * 0.5) {
         unsafe.add(m.ref);
-        task.controls = { ...task.lastControls! };
+        C.task.controls = { ...S.task!.lastControls! };
         note(`Changing effort reset ${m.provider}'s cache, so effort and reasoning stay fixed until /clear.`, 'dim');
       }
-      if (task) Object.assign(task, { lastPrompt: prompt, lastControls: c });
+      if (C.task) Object.assign(C.task, { lastPrompt: prompt, lastControls: c });
     };
     // Only the user's own message is taken back when nothing came of it; tool
     // results stay, so every tool call keeps its answer.
     const forget = () => {
       if (!userSeq) return;
-      if (messages.at(-1)?.role === 'user') messages.pop();
-      if (live) save((d) => d.remove(convId!, live!.seq));
-      save((d) => d.remove(convId!, userSeq));
-      lastUserSeq = 0;
+      if (C.messages.at(-1)?.role === 'user') C.messages.pop();
+      if (C.live) save((d) => d.remove(C.convId!, C.live!.seq));
+      save((d) => d.remove(C.convId!, userSeq));
+      C.lastUserSeq = 0;
     };
     try {
-      for await (const ev of streamFor(cn)({ conn: cn, model: m, system: SYSTEM, tools: TOOLS, messages, controls: cn.wire === 'anthropic' ? task!.controls : c, signal: ac.signal, slot: cn.llamacpp ? 0 : undefined })) {
+      for await (const ev of streamFor(cn)({ conn: cn, model: m, system: SYSTEM, tools: TOOLS, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal: ac.signal, slot: cn.llamacpp ? 0 : undefined })) {
         if (ev.type === 'id') completionId = ev.id;
         else if (ev.type === 'blocks') blocks = ev.blocks;
         else if (ev.type === 'usage') usage = ev.usage;
         else if (ev.type === 'stop') stop = ev.reason;
-        else if (ev.type === 'text') {
+        else if (ev.type === 'thinking') {
+          if (thinking.ms === undefined) thinking.text += ev.text;
+        } else if (ev.type === 'text') {
           thinkingNow = false;
           if (!reply) {
-            clearInterval(spin);
-            drop(thinking);
+            settle();
             const r: Extract<Item, { kind: 'reply' }> = { kind: 'reply', text: '', done: false };
             reply = r;
-            items.push(reply);
+            C.items.push(reply);
             // The reply is stored while it streams (flushed about once a second), so
             // quitting mid-reply keeps it, marked interrupted.
-            const seq = save((d) => d.append(convId!, 'assistant', [{ type: 'text', text: ev.text }], true));
+            const seq = save((d) => d.append(C.convId!, 'assistant', [{ type: 'text', text: ev.text }], true));
             if (seq) {
-              live = { seq, text: () => r.text };
-              flush = setInterval(() => save((d) => d.update(convId!, seq, [{ type: 'text', text: r.text }], true)), 1000);
+              C.live = { seq, text: () => r.text };
+              flush = setInterval(() => save((d) => d.update(C.convId!, seq, [{ type: 'text', text: r.text }], true)), 1000);
             }
           }
           reply.text += ev.text;
@@ -1002,31 +1132,31 @@ export async function runApp(cfg: Config, version: string) {
         if (!reply.text.trim() || !splitToolCalls(reply.text).text.trim()) drop(reply);
       }
       if (flush) clearInterval(flush);
-      drop(thinking);
+      settle();
       if (blocks.length) {
-        messages.push({ role: 'assistant', content: blocks });
-        lastUserSeq = 0;
-        if (live) save((d) => d.update(convId!, live!.seq, blocks, false));
-        else store(messages.at(-1)!);
+        C.messages.push({ role: 'assistant', content: blocks });
+        C.lastUserSeq = 0;
+        if (C.live) save((d) => d.update(C.convId!, C.live!.seq, blocks, false)), (replySeq = C.live.seq);
+        else replySeq = store(C.messages.at(-1)!);
       } else forget();
       charge();
       if (stop === 'refusal') note('The model declined this request. Rephrase it, or /clear to start over.');
       else if (stop === 'max_tokens') note('The reply hit the output limit and was cut off.');
       return { ok: blocks.length > 0, blocks };
     } catch (e) {
-      drop(thinking);
+      settle();
       if (reply) reply.done = true;
       if (flush) clearInterval(flush);
       if (ac.signal.aborted) {
         if (reply?.text.trim()) {
-          messages.push({ role: 'assistant', content: [{ type: 'text', text: reply.text.trimEnd() }] });
-          lastUserSeq = 0;
-          if (live) save((d) => d.update(convId!, live!.seq, messages.at(-1)!.content, false));
+          C.messages.push({ role: 'assistant', content: [{ type: 'text', text: reply.text.trimEnd() }] });
+          C.lastUserSeq = 0;
+          if (C.live) save((d) => d.update(C.convId!, C.live!.seq, C.messages.at(-1)!.content, false)), (replySeq = C.live.seq);
         } else forget();
         charge();
         note('stopped', 'dim');
       } else {
-        if (live) save((d) => d.remove(convId!, live!.seq));
+        if (C.live) save((d) => d.remove(C.convId!, C.live!.seq));
         forget();
         const err = e as Error;
         note(
@@ -1041,16 +1171,27 @@ export async function runApp(cfg: Config, version: string) {
     } finally {
       clearInterval(spin);
       if (flush) clearInterval(flush);
-      live = null;
+      C.live = null;
       schedule();
     }
   }
 
+  // A saved message as you sent it: attachments as chips, not their contents.
+  const userItem = (blocks: Block[]): Item => {
+    const labels: Record<string, string> = {};
+    const text = fromBlocks(blocks, (c) => {
+      const ch = chipChar(chipSeq++);
+      chips.set(ch, c);
+      labels[ch] = label(c);
+      return ch;
+    });
+    return { kind: 'user', text, ...(Object.keys(labels).length ? { chips: labels } : {}) };
+  };
+
   // ---- tools (Phase 4) and permissions (SPEC §17) ----
 
-  type Did = { wrote: string[]; ran: { cmd: string; ok: boolean }[] };
   const result = (id: unknown, content: string, error = false): Block => ({ type: 'tool_result', tool_use_id: id, content, ...(error ? { is_error: true } : {}) });
-  const permCtx = () => ({ mode, project, rules: ruleList(cfg.permissions, projectRules(project), convRules), granted: (p: string) => [...chips.values()].some((c) => c.path && (p === c.path || p.startsWith(c.path + path.sep))) });
+  const permCtx = () => ({ mode, project, rules: ruleList(cfg.permissions, projectRules(project), S.convRules), granted: (p: string) => [...chips.values()].some((c) => c.path && (p === c.path || p.startsWith(c.path + path.sep))) });
   const describe = (u: Block) => {
     const i = (u.input ?? {}) as Record<string, any>;
     const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime' }[String(u.name)] ?? String(u.name);
@@ -1058,11 +1199,12 @@ export async function runApp(cfg: Config, version: string) {
     return { verb, rest };
   };
   const toolLine = (u: Block): Item => ({ kind: 'tool', ...describe(u) });
-  const detail = (lines: Line[]) => items.push({ kind: 'lines', hug: true, lines: lines.map((l) => [{ t: '  ⎿ ', s: st.dim }, ...l]).map((l, i) => (i ? [{ t: '    ', s: '' }, ...l.slice(1)] : l)) });
+  const detail = (lines: Line[]) => bound(S).detail(lines);
 
   // Runs each tool call in order. Every call gets a result, also when it's
   // refused, declined or stopped, so the history stays valid.
-  async function runTools(uses: Block[], signal: AbortSignal, did: Did): Promise<Block[]> {
+  async function runTools(uses: Block[], signal: AbortSignal, did: Did, C: Session): Promise<Block[]> {
+    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
     const out: Block[] = [];
     let skip = '';
     for (const u of uses) {
@@ -1079,25 +1221,25 @@ export async function runApp(cfg: Config, version: string) {
       decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why });
       decisions.length = Math.min(decisions.length, 50);
       if (d.verdict === 'deny') {
-        items.push({ ...toolLine(u), extra: [{ t: ` · not run: ${d.why}`, s: st.warn }] } as Item);
+        C.items.push({ ...toolLine(u), extra: [{ t: ` · not run: ${d.why}`, s: st.warn }] } as Item);
         out.push(result(u.id, `Not run: ${d.why}.${mode === 'plan' ? ' Rime is in plan mode (read-only): answer with a plan instead. The user switches modes with shift+tab.' : ''}`, true));
         continue;
       }
       if (d.verdict === 'ask') {
-        const answer = await ask(u, d, signal);
+        const answer = await ask(u, d, signal, C);
         if (answer === 'stop') {
           out.push(result(u.id, 'Not run: the user stopped Rime.', true));
           continue;
         }
         if (answer === 'no') {
-          items.push({ kind: 'lines', lines: [[{ t: '✗ ', s: st.del }, { t: 'declined ', s: st.dim }, { t: `${describe(u).verb} ${describe(u).rest}`, s: st.title }, { t: ' · tell Rime what to do instead', s: st.dim }]] });
+          C.items.push({ kind: 'lines', lines: [[{ t: '✗ ', s: st.del }, { t: 'declined ', s: st.dim }, { t: `${describe(u).verb} ${describe(u).rest}`, s: st.title }, { t: ' · tell Rime what to do instead', s: st.dim }]] });
           schedule();
           // Your next words are the reason; esc (or ctrl+c) stops the whole turn instead.
           const words = await new Promise<string | null>((res) => {
-            declining = res;
+            C.declining = res;
             signal.addEventListener('abort', () => res(null), { once: true });
           });
-          declining = null;
+          C.declining = null;
           if (words === null) {
             out.push(result(u.id, 'Not run: the user stopped Rime.', true));
             skip = 'Not run: the user stopped Rime.';
@@ -1111,20 +1253,21 @@ export async function runApp(cfg: Config, version: string) {
           if (u.name === 'write' || u.name === 'edit') setMode('auto-edit');
           else if (d.rule) {
             addConvRule('allow', d.rule);
-            items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${d.label} commands in this conversation · /permissions`, s: st.dim }]] });
+            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${d.label} commands in this conversation · /permissions`, s: st.dim }]] });
           }
         }
       }
-      items.push({ ...toolLine(u), ...(d.verdict === 'allow' && u.name === 'bash' ? { extra: [{ t: ` · ${d.why}`, s: st.dim }] } : {}) } as Item);
+      C.items.push({ ...toolLine(u), ...(d.verdict === 'allow' && u.name === 'bash' ? { extra: [{ t: ` · ${d.why}`, s: st.dim }] } : {}) } as Item);
       schedule();
       let r: ToolResult;
       try {
-        r = await runTool(String(u.name), input, signal);
+        r = await runTool(String(u.name), input, signal, C);
       } catch (e) {
         r = { content: (e as Error).message, error: true, summary: (e as Error).message };
       }
       if (u.name === 'write' || u.name === 'edit') !r.error && did.wrote.push(rel(cwd, path.resolve(cwd, String(input.path))));
       if (u.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error });
+      if (u.name === 'read' && !r.error) (did.about ??= []).push(rel(cwd, path.resolve(cwd, String(input.path))));
       // What it did, short: the diff of an edit, the end of a command's output.
       if (r.diff) detail(r.diff.map((x) => [{ t: x.n ? `${String(x.n).padStart(4)} ` : '     ', s: st.dim }, { t: x.sign === ' ' ? x.text : `${x.sign} ${x.text}`, s: x.sign === '+' ? st.ok : x.sign === '-' ? st.del : st.dim }]));
       else if (r.output?.length) {
@@ -1137,13 +1280,14 @@ export async function runApp(cfg: Config, version: string) {
     return out;
   }
 
-  function runTool(name: string, input: Record<string, any>, signal: AbortSignal): ToolResult | Promise<ToolResult> {
+  function runTool(name: string, input: Record<string, any>, signal: AbortSignal, C: Session): ToolResult | Promise<ToolResult> {
+    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
     if (name === 'read') return readTool(cwd, input as { path: string });
     if (name === 'write') return writeTool(cwd, input as { path: string; content: string });
     if (name === 'edit') return editTool(cwd, input as { path: string; old: string; new: string });
     if (name === 'bash') return bashTool(cwd, input as { command: string }, signal);
     if (name === 'rime') {
-      const text = rimeTool(String(input.action ?? ''), (input.args ?? {}) as Record<string, any>);
+      const text = rimeTool(String(input.action ?? ''), (input.args ?? {}) as Record<string, any>, C);
       return { content: text, summary: text.split('\n')[0] };
     }
     return { content: `Unknown tool ${name}.`, error: true, summary: 'unknown tool' };
@@ -1151,7 +1295,8 @@ export async function runApp(cfg: Config, version: string) {
 
   // The rime tool (SPEC §15): Rime acting on itself. It never reads or writes API
   // keys, and it can't change permission modes or rules (it opens /permissions).
-  function rimeTool(action: string, args: Record<string, any>): string {
+  function rimeTool(action: string, args: Record<string, any>, C: Session = S): string {
+    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
     const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open · tab.close · tab.focus · panel.show · panel.hide · panel.split';
     if (action === 'help') return `Actions: ${ACTIONS}\nSettings: ${settings.list().map((d) => `${d.key} (${d.values.join(' | ')}; applies ${WHEN[d.applies]})`).join(', ')}`;
     if (action === 'settings.list') return settings.list().map((d) => `${d.key} = ${d.get(cfg)} · ${d.help} · applies ${WHEN[d.applies]}`).join('\n');
@@ -1161,7 +1306,7 @@ export async function runApp(cfg: Config, version: string) {
       if (!d) return `No setting ${args.key}. settings.list shows them.`;
       if (!d.values.includes(String(args.value))) return `${args.key} takes ${d.values.join(' | ')}.`;
       const ch = settings.set(d.key, String(args.value));
-      if (ch) items.push({ kind: 'gear', change: ch });
+      if (ch) C.items.push({ kind: 'gear', change: ch });
       return ch ? `Done: ${d.label.toLowerCase()} ${ch.to} (was ${ch.from}), ${WHEN[d.applies]}.` : `${d.label.toLowerCase()} was already ${args.value}.`;
     }
     if (action === 'command') {
@@ -1188,11 +1333,12 @@ export async function runApp(cfg: Config, version: string) {
 
   // Asks before a command or an edit: Yes · Yes, don't ask again · No, tell Rime
   // instead. While Rime waits, the turn is paused.
-  function ask(u: Block, d: Decision, signal: AbortSignal): Promise<'yes' | 'always' | 'no' | 'stop'> {
+  function ask(u: Block, d: Decision, signal: AbortSignal, C: Session): Promise<'yes' | 'always' | 'no' | 'stop'> {
+    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
     return new Promise((resolve) => {
       const done = (a: 'yes' | 'always' | 'no' | 'stop') => {
         signal.removeEventListener('abort', stop);
-        approval = null;
+        C.approval = null;
         schedule();
         resolve(a);
       };
@@ -1204,7 +1350,7 @@ export async function runApp(cfg: Config, version: string) {
         const e = planEdit(cwd, input as { path: string; old: string; new: string });
         if (!('error' in e)) diff = diffOf(e.before, e.at, input.old, input.new, 8);
       } else if (u.name === 'write') diff = String(input.content ?? '').split('\n').slice(0, 8).map((t, i) => ({ sign: '+' as const, n: i + 1, text: t }));
-      approval = { use: u, decision: d, sel: 0, done, diff };
+      C.approval = { use: u, decision: d, sel: 0, done, diff };
       schedule();
     });
   }
@@ -1226,13 +1372,13 @@ export async function runApp(cfg: Config, version: string) {
     type Row = { kind: 'mode' | 'rule' | 'add'; m?: Mode; rule?: ReturnType<typeof ruleList>[number] };
     const rowsOf = (): Row[] => [
       ...PRESETS.map(([m]): Row => ({ kind: 'mode', m })),
-      ...ruleList(cfg.permissions, projectRules(project), convRules).map((rule): Row => ({ kind: 'rule', rule })),
+      ...ruleList(cfg.permissions, projectRules(project), S.convRules).map((rule): Row => ({ kind: 'rule', rule })),
       { kind: 'add' },
     ];
     const remove = (r: ReturnType<typeof ruleList>[number]) => {
       if (r.from === 'conversation') {
-        convRules = { ...convRules, [r.kind]: (convRules[r.kind] ?? []).filter((x) => x !== r.pattern) };
-        save((d) => d.setRules(conversation()!, convRules));
+        S.convRules = { ...S.convRules, [r.kind]: (S.convRules[r.kind] ?? []).filter((x) => x !== r.pattern) };
+        save((d) => d.setRules(conversation()!, S.convRules));
       } else if (r.from === 'project') removeProjectRule(project, r.kind, r.pattern);
       else {
         cfg.permissions = { ...cfg.permissions, [r.kind]: (cfg.permissions?.[r.kind] ?? []).filter((x) => x !== r.pattern) };
@@ -1311,13 +1457,13 @@ export async function runApp(cfg: Config, version: string) {
 
   // Which of the three answers this question offers (0 yes, 1 don't ask again, 2 no).
   function approvalOptions() {
-    const a = approval!;
+    const a = S.approval!;
     const again = a.use.name === 'bash' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/outside/.test(a.decision.why);
     return again ? [0, 1, 2] : [0, 2];
   }
   function answer(n: number) {
-    if (!approval || !approvalOptions().includes(n - 1)) return;
-    approval.done(n === 1 ? 'yes' : n === 2 ? 'always' : 'no');
+    if (!S.approval || !approvalOptions().includes(n - 1)) return;
+    S.approval.done(n === 1 ? 'yes' : n === 2 ? 'always' : 'no');
   }
   function cycleMode() {
     setMode(mode === 'auto' || mode === 'god' ? 'ask' : MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
@@ -1326,8 +1472,8 @@ export async function runApp(cfg: Config, version: string) {
   // The question above the prompt: the exact command (or the change), where it
   // runs, why it asks, and the three answers.
   function approvalBox(width: number) {
-    if (!approval) return null;
-    const { use: u, decision: d, diff } = approval;
+    if (!S.approval) return null;
+    const { use: u, decision: d, diff } = S.approval;
     const i = (u.input ?? {}) as Record<string, any>;
     const dim = (t: string) => ({ t, s: st.dim });
     const rows: BoxRow[] = [];
@@ -1349,7 +1495,7 @@ export async function runApp(cfg: Config, version: string) {
       'No, and tell Rime what to do instead (esc)',
     ];
     for (const n of approvalOptions()) {
-      const on = approval.sel === n;
+      const on = S.approval.sel === n;
       rows.push({ line: [{ t: on ? '› ' : '  ', s: st.accent }, { t: `${n + 1} `, s: st.dim }, { t: labels[n], s: on ? st.accent : st.fg }], bg: on ? st.panelBg : undefined, hit: `dec:${n + 1}` });
     }
     rows.push(...footRows(['↑ ↓', ' choose · ', 'enter', ' or ', approvalOptions().length === 3 ? '1 2 3' : '1 3', ' · ', 'esc', ' no · ', 'shift+tab', ' mode'], st));
@@ -1357,76 +1503,192 @@ export async function runApp(cfg: Config, version: string) {
   }
 
   // Starts a new conversation; the current one stays in the list.
-  function newConversation() {
-    busy?.abort();
-    if (convId) save((d) => d.unlock(convId!));
-    convId = null;
-    continuing = null;
-    resumeOk = false;
-    lastUserSeq = 0;
-    nextStep = '';
-    example = tryExample();
-    convRules = {};
-    messages = [];
-    task = null;
-    items = [headerItem];
+  // Puts another conversation on screen. One that's still working (or waiting
+  // for you) keeps going in the background; an idle one is put away (it's saved).
+  function show(x: Session) {
+    if (x === S) return;
+    if (!S.busy && !needsYou(S) && !S.waiting) {
+      sessions.splice(sessions.indexOf(S), 1);
+      if (S.convId) save((d) => d.unlock(S.convId!));
+    }
+    if (!sessions.includes(x)) sessions.push(x);
+    S = x;
     scrollOff = 0;
+    browsing = null;
+    blindAsk = false;
+    schedule();
   }
 
-  // ← on an empty prompt: this project's conversations, newest first (SPEC §16).
-  // Search, the timeline, rename, fork and delete come in Phase 4b.
-  function createConversations(): Panel {
-    let pick = 0;
-    let filter = '';
-    const all = save((d) => d.list(project)) ?? [];
+  // Starts a new conversation; the one you were in stays in the list (and keeps
+  // working if it was).
+  function newConversation() {
+    show(newSession());
+    example = exampleFor(project);
+  }
+
+  // ---- the conversations window (SPEC §16) ----
+  // ← on an empty prompt (or /conversations, or a click on "← conversations")
+  // fills the screen with your conversations: a dot on the ones working (blue,
+  // pulsing), waiting for you (yellow) or open in another Rime window (dim), and a
+  // preview of the highlighted one. Search, the timeline, rename, pin, fork and
+  // delete come in Phase 4b.
+  type ListRow = { id: number | null; title: string; project: string; updated: number; model: string | null; n: number; other: boolean; session?: Session };
+  // `on`: the highlighted conversation, so the highlight stays on it when the list reorders.
+  let list: { pick: number; on: number | Session | null; filter: string; all: boolean; rows: ListRow[]; at: number } | null = null;
+  const keyOf = (r: ListRow) => r.id ?? r.session ?? null;
+  const previews = new Map<number, { at: number; items: Item[] }>();
+
+  function openList() {
+    list = { pick: 0, on: S.convId ?? S, filter: '', all: false, rows: [], at: 0 };
+    listRows();
+    schedule();
+  }
+
+  function listRows(): ListRow[] {
+    const L = list!;
+    if (Date.now() - L.at > 1000) {
+      const stored = save((d) => d.list(L.all ? null : project)) ?? [];
+      const rows: ListRow[] = stored.filter((c) => c.n > 0).map((c) => ({ id: c.id, title: c.title || 'untitled', project: c.project, updated: c.updated, model: c.model, n: c.n, other: c.other, session: sessions.find((x) => x.convId === c.id) }));
+      // Open here but not saved yet (nothing sent): the new conversation you're in.
+      for (const x of sessions) if (x.convId === null && x === S) rows.unshift({ id: null, title: 'New conversation', project, updated: Date.now(), model: model?.ref ?? null, n: 0, other: false, session: x });
+      L.rows = rows;
+      L.at = Date.now();
+    }
+    const f = L.filter.toLowerCase();
+    const shown = f ? L.rows.filter((r) => `${r.title} ${r.project}`.toLowerCase().includes(f)) : L.rows;
+    const at = shown.findIndex((r) => keyOf(r) === L.on);
+    L.pick = at >= 0 ? at : Math.min(L.pick, Math.max(0, shown.length - 1));
+    L.on = shown[L.pick] ? keyOf(shown[L.pick]) : null;
+    return shown;
+  }
+
+  // The highlighted conversation as it would look: its own transcript when it's
+  // open here (live, also while it works), else rebuilt from what was saved.
+  function previewItems(r: ListRow): Item[] {
+    if (r.session) return r.session.items.filter((it) => it !== headerItem);
+    if (r.id === null) return [];
+    const cached = previews.get(r.id);
+    if (cached && cached.at === r.updated) return cached.items;
+    const items: Item[] = [];
+    for (const m of save((d) => d.messages(r.id!)) ?? []) {
+      const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;
+      const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
+      if (m.role === 'user' && text) items.push(userItem(blocks));
+      else if (m.role === 'assistant') {
+        if (splitToolCalls(text).text.trim()) items.push({ kind: 'reply', text, done: true });
+        for (const u of blocks.filter((b) => b.type === 'tool_use')) items.push(toolLine(u));
+      }
+    }
+    previews.set(r.id, { at: r.updated, items });
+    return items;
+  }
+
+  const dayOf = (t: number) => {
+    const day = 86400000, start = new Date().setHours(0, 0, 0, 0);
+    return t >= start ? 'Today' : t >= start - day ? 'Yesterday' : t >= start - 6 * day ? 'This week' : 'Older';
+  };
+
+  // The dot before a conversation's title.
+  function dotOf(r: ListRow): Line[number] {
+    const x = r.session;
+    if (x && needsYou(x)) return { t: '● ', s: st.warn };
+    if (x?.busy || x?.waiting) return { t: Math.floor(Date.now() / 500) % 2 ? '● ' : '◉ ', s: st.accentB };
+    if (r.other) return { t: '● ', s: st.dim };
+    return { t: '  ', s: '' };
+  }
+
+  function frameList(width: number, height: number) {
+    const L = list!;
+    const rows = listRows();
+    L.pick = Math.max(0, Math.min(L.pick, rows.length - 1));
     const dim = (t: string) => ({ t, s: st.dim });
-    const shown = () => all.filter((c) => c.n > 0 && (!filter || c.title.toLowerCase().includes(filter.toLowerCase())));
-    const group = (t: number) => {
-      const day = 86400000, start = new Date().setHours(0, 0, 0, 0);
-      return t >= start ? 'Today' : t >= start - day ? 'Yesterday' : t >= start - 6 * day ? 'This week' : 'Older';
+    const wide = width >= 100;
+    const lw = wide ? Math.floor(width * 0.48) : width;
+    const pw = width - lw - 3;
+    const top: Line[] = [
+      [{ t: ' conversations', s: st.titleB }, dim(L.all ? ' · all projects' : ` · ${tildify(project)}`)],
+      [{ t: ' › ', s: st.accentB }, L.filter ? { t: L.filter, s: st.title } : { t: 'type to search', s: st.placeholder }],
+      [{ t: '─'.repeat(width), s: st.line }],
+    ];
+    const foot: Line[] = [
+      [{ t: '─'.repeat(width), s: st.line }],
+      [
+        { t: ' ↑ ↓', s: st.accentB }, dim(' choose · '), { t: '→', s: st.accentB }, dim(' or '), { t: 'enter', s: st.accentB }, dim(' open · '),
+        { t: 'n', s: st.accentB }, dim(' new · '), { t: 'a', s: st.accentB }, dim(L.all ? ' this project · ' : ' all projects · '),
+        { t: 'esc', s: st.accentB }, dim(' back · '),
+        { t: '● ', s: st.accentB }, dim('working '), { t: '● ', s: st.warn }, dim('needs you '), { t: '● ', s: st.dim }, dim('another window'),
+      ],
+    ];
+    const bodyH = Math.max(1, height - top.length - foot.length);
+    // The list, grouped by day, scrolled to keep the highlight in view.
+    const left: { line: Line; i?: number }[] = [];
+    let g = '';
+    rows.forEach((r, i) => {
+      if (dayOf(r.updated) !== g) left.push({ line: [dim(` ${(g = dayOf(r.updated))}`)] });
+      const sel = i === L.pick;
+      const meta = [ago(r.updated), r.model?.split('/').pop(), r.n ? `${r.n} messages` : '', L.all && r.project !== project ? tildify(r.project) : ''].filter(Boolean).join(' · ');
+      const tw = Math.max(8, lw - 4 - Math.min(meta.length, Math.floor(lw / 2)) - 2);
+      const title = fit([{ t: r.title, s: sel ? st.accentB : r.session === S ? st.titleB : st.title }], tw);
+      left.push({ line: [{ t: sel ? '›' : ' ', s: st.accent }, dotOf(r), ...title, { t: '  ', s: '' }, ...fit([dim(meta)], lw - 3 - tw - 2)], i });
+    });
+    if (!rows.length) left.push({ line: [dim(L.filter ? ` no conversation matches "${L.filter}"` : ' No conversations yet. n starts one.')] });
+    const selAt = left.findIndex((l) => l.i === L.pick);
+    const from = Math.max(0, Math.min(selAt - Math.floor(bodyH / 2), left.length - bodyH));
+    const shown = left.slice(from, from + bodyH);
+    // The preview: the highlighted conversation's last lines.
+    const r = rows[L.pick];
+    // Ready-made rows for the right column (styled strings).
+    let right: string[] = [];
+    if (wide && r) {
+      const state: Line = r.session && needsYou(r.session) ? [{ t: '● waiting for you', s: st.warn }] : r.session?.busy ? [{ t: '● working', s: st.accentB }] : r.other ? [dim('open in another Rime window')] : [];
+      const head = [str([{ t: r.title, s: st.titleB }], st), str([dim([ago(r.updated), r.model ?? '', tildify(r.project)].filter(Boolean).join(' · ')), ...(state.length ? [dim(' · '), ...state] : [])], st), ''];
+      const body = previewItems(r).flatMap((it, k, all) => [...(spaced(all[k - 1], it) ? [''] : []), ...render(it, pw)]);
+      right = [...head, ...body.slice(-Math.max(0, bodyH - head.length))];
+    }
+    const lines: string[] = [];
+    const rowHits: { row: number; x0: number; x1: number; id: string }[] = [];
+    for (const l of top) lines.push(str(fit(l, width), st));
+    for (let k = 0; k < bodyH; k++) {
+      const l = shown[k];
+      lines.push(str(fit(l?.line ?? [], lw), st) + (wide ? str([{ t: ' │ ', s: st.line }], st) + truncAnsi(right[k] ?? '', pw) : ''));
+      if (l?.i !== undefined) rowHits.push({ row: top.length + k + 1, x0: 1, x1: lw, id: `conv:${l.i}` });
+    }
+    for (const l of foot) lines.push(str(fit(l, width), st));
+    return { lines, rowHits };
+  }
+
+  function listKey(k: Key) {
+    const L = list!;
+    const rows = listRows();
+    if (k.name === 'escape' || (k.ctrl && k.name === 'c')) {
+      if (L.filter && k.name === 'escape') return void (L.filter = '');
+      return void (list = null);
+    }
+    const go = (i: number) => {
+      L.pick = Math.max(0, Math.min(rows.length - 1, i));
+      L.on = rows[L.pick] ? keyOf(rows[L.pick]) : null;
     };
-    const open = (id: number) => {
-      if (id === convId) return host.close();
-      const c = save((d) => d.take(id));
-      if (!c) return void note('That conversation is open in another Rime window.', 'dim');
-      newConversation();
-      reopen(c);
-      host.close();
-    };
-    return {
-      view(width) {
-        const list = shown();
-        pick = Math.min(pick, Math.max(0, list.length - 1));
-        const rows: BoxRow[] = [];
-        let g = '';
-        list.slice(Math.max(0, pick - 12), Math.max(0, pick - 12) + 16).forEach((c) => {
-          const i = list.indexOf(c);
-          if (group(c.updated) !== g) rows.push({ line: [dim((g = group(c.updated)))] });
-          const model = c.model ? c.model.split('/').pop() : '';
-          rows.push(listRow(c.title || 'untitled', [{ t: c.id === convId ? '● ' : '', s: st.ok }, dim([ago(c.updated), model, `${c.n} messages`].filter(Boolean).join(' · '))], i === pick, st, `pick:${i}`, Math.min(48, Math.floor(width / 2))));
-        });
-        if (!list.length) rows.push({ line: [dim(filter ? `no conversation matches ${filter}` : 'No conversations in this project yet.')] });
-        return { legend: [{ t: 'conversations', s: st.accent }, dim(` · ${tildify(project)}`)], rows, foot: ['↑ ↓', ' choose · ', 'enter', ' open · ', 'n', ' new · type to filter · ', 'esc', ' back'] };
-      },
-      placeholder: () => 'Type to filter your conversations',
-      typing: () => true,
-      key(k) {
-        const list = shown();
-        if (k.name === 'escape' || (k.name === 'right' && !filter)) return host.close(), true;
-        if (k.name === 'up') return (pick = (pick + list.length - 1) % Math.max(1, list.length)), true;
-        if (k.name === 'down') return (pick = (pick + 1) % Math.max(1, list.length)), true;
-        if (k.name === 'enter') return list[pick] && open(list[pick].id), true;
-        if (k.name === 'char' && k.ch === 'n' && !filter) return newConversation(), host.close(), true;
-        return false;
-      },
-      changed(v) {
-        filter = v;
-        pick = 0;
-      },
-      click(id) {
-        pick = Number(id.split(':')[1]);
-      },
-    };
+    if (k.name === 'up') return go(L.pick - 1);
+    if (k.name === 'down') return go(L.pick + 1);
+    // ← opened the list; → (or enter) opens the conversation it's on.
+    if (k.name === 'enter' || k.name === 'right') return openRow(rows[L.pick]);
+    if (k.name === 'backspace') return void (L.filter = L.filter.slice(0, -1));
+    if (k.name === 'char' && k.ch === 'n' && !L.filter) return void ((list = null), newConversation());
+    if (k.name === 'char' && k.ch === 'a' && !L.filter) return void ((L.all = !L.all), (L.at = 0));
+    if ((k.name === 'char' && k.ch && !k.ctrl) || k.name === 'space') return void (L.filter += k.ch ?? ' ');
+  }
+
+  function openRow(r?: ListRow) {
+    if (!r) return;
+    if (r.project !== project) return void note(`That conversation belongs to ${tildify(r.project)}. Run rime there to open it.`, 'dim'), (list = null);
+    list = null;
+    if (r.session) return show(r.session); // open here, maybe still working
+    if (r.id === null) return;
+    const c = save((d) => d.take(r.id!));
+    if (!c) return void note('That conversation is open in another Rime window.', 'dim');
+    const x = newSession();
+    show(x);
+    reopen(c, x);
   }
 
   function setMode(m: Mode) {
@@ -1435,42 +1697,7 @@ export async function runApp(cfg: Config, version: string) {
     schedule();
   }
 
-  // After a reply, one suggestion for what to do next, from what just happened
-  // (SPEC §5.4). No AI call.
-  function suggestNext(did: Did): string {
-    const tests = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?test\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+test\b|\bvitest\b|\bjest\b|\bnode\s+--test\b/;
-    const lastTest = [...did.ran].reverse().find((r) => tests.test(r.cmd));
-    if (lastTest && !lastTest.ok) return 'fix the failing tests';
-    const html = did.wrote.find((f) => /\.html?$/i.test(f));
-    if (html) return `open ${html} in the browser`;
-    if (did.wrote.length && !lastTest && hasTests()) return 'run the tests';
-    if ((did.wrote.length || lastTest?.ok) && gitDirty()) return 'commit this';
-    return '';
-  }
-  const hasTests = () => {
-    try {
-      return !!JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).scripts?.test;
-    } catch {
-      return fs.existsSync(path.join(project, 'pytest.ini')) || fs.existsSync(path.join(project, 'go.mod')) || fs.existsSync(path.join(project, 'Cargo.toml'));
-    }
-  };
-  const gitDirty = () => {
-    const r = spawnSync('git', ['-C', project, 'status', '--porcelain'], { encoding: 'utf8' });
-    return r.status === 0 && r.stdout.trim().length > 0;
-  };
 
-  // An example for the empty prompt, from this project (`Try "…"`, like Claude Code).
-  function tryExample() {
-    const files = listFiles(project, 2000).filter((f) => /\.(ts|tsx|js|jsx|py|go|rs|rb|java|c|cpp|swift|kt|php|html|css|md)$/.test(f) && !/(^|\/)(dist|build|vendor)\//.test(f));
-    const pick = <T,>(a: T[]) => a[Math.floor(Math.random() * a.length)];
-    if (!files.length) return pick(['build a small static page that says hello', 'start a new project: a CLI that counts words', 'make a simple todo app in one html file']);
-    const code = files.filter((f) => !/\.(md|html|css)$/.test(f));
-    const f = pick(code.length ? code : files);
-    const ideas = [`explain what ${f} does`, `find bugs in ${f}`, `add tests for ${f}`, `make ${f} easier to read`];
-    if (!files.some((x) => /^readme/i.test(x))) ideas.push('write a README for this project');
-    if (hasTests()) ideas.push('run the tests and fix what fails');
-    return pick(ideas);
-  }
 
   // ---- panels ----
 
@@ -1492,14 +1719,32 @@ export async function runApp(cfg: Config, version: string) {
       cur = s.length;
     },
     say: (it) => {
-      items.push(it);
+      S.items.push(it);
       schedule();
     },
     save: () => settings.save(),
     settings,
     openModel: () => host.open(createModelPicker(host)),
     openConnect: () => host.open(createSetup(host)),
-    inContext: () => (messages.length ? task?.lastPrompt || Math.ceil(JSON.stringify(messages).length / 4) : 0),
+    // Renames a connection (e.g. your server) everywhere Rime uses its name.
+    rename: (from, to) => {
+      if (!/^[\w.-]{1,32}$/.test(to)) return 'Use letters, digits, - _ or . (no spaces or slashes).';
+      if (cfg.providers[to]) return `${to} is already the name of another connection.`;
+      if (!cfg.providers[from]) return `${from} isn't connected.`;
+      const fix = (ref?: string) => (ref?.startsWith(from + '/') ? to + ref.slice(from.length) : ref);
+      cfg.providers[to] = cfg.providers[from];
+      delete cfg.providers[from];
+      cfg.model = fix(cfg.model);
+      for (const k of Object.keys(cfg.models)) if (k.startsWith(from + '/')) (cfg.models[fix(k)!] = cfg.models[k]), delete cfg.models[k];
+      if (tunnels[from]) (tunnels[to] = tunnels[from]), delete tunnels[from];
+      if (bg?.name === from) bg.name = to;
+      if (model?.provider === from) Object.assign(model, { provider: to, ref: fix(model.ref)! });
+      if (conn?.name === from) conn.name = to;
+      settings.save();
+      note(`${from} is now called ${to}.`, 'dim');
+      return null;
+    },
+    inContext: () => (S.messages.length ? S.task?.lastPrompt || Math.ceil(JSON.stringify(S.messages).length / 4) : 0),
     later: (m) => {
       later = m;
       note(`${m.label} from the next /clear`, 'dim');
@@ -1508,7 +1753,7 @@ export async function runApp(cfg: Config, version: string) {
       controls = { reasoning: cfg.reasoning !== false, effort: cfg.effort };
       model = m;
       conn = connOf(m.provider, cfg.providers[m.provider], base);
-      task = null;
+      S.task = null;
       serverInfo();
       schedule();
     },
@@ -1555,27 +1800,28 @@ export async function runApp(cfg: Config, version: string) {
 
   // A short, exact request ("effort high") runs in Rime with no API call.
   function local(text: string, ph: { key: string; value: string }) {
-    items.push({ kind: 'user', text });
+    S.items.push({ kind: 'user', text });
     history.push(text);
     const c = settings.set(ph.key, ph.value);
     const d = settings.list().find((x) => x.key === ph.key)!;
-    items.push(c ? { kind: 'gear', change: c } : { kind: 'gear', change: { key: ph.key, label: d.label.toLowerCase(), from: ph.value, to: ph.value, applies: d.applies, at: Date.now() }, note: `${d.label.toLowerCase()} is already ${ph.value}` });
-    items.push({ kind: 'lines', lines: [[{ t: '  ↳ handled in Rime · no API call', s: st.dim }]] });
+    S.items.push(c ? { kind: 'gear', change: c } : { kind: 'gear', change: { key: ph.key, label: d.label.toLowerCase(), from: ph.value, to: ph.value, applies: d.applies, at: Date.now() }, note: `${d.label.toLowerCase()} is already ${ph.value}` });
+    S.items.push({ kind: 'lines', lines: [[{ t: '  ↳ handled in Rime · no API call', s: st.dim }]] });
   }
 
   function submit() {
     const v = buf.trim();
+    browsing = null;
     // "No, and tell Rime what to do instead": these words go back as the reason.
-    if (declining && !v.startsWith('/')) {
-      if (v) items.push({ kind: 'user', text: v }), history.push(v);
+    if (S.declining && !v.startsWith('/')) {
+      if (v) S.items.push({ kind: 'user', text: v }), history.push(v);
       buf = '';
       cur = 0;
       anchor = null;
-      return declining(v);
+      return S.declining(v);
     }
-    if (!v && resumeOk && !busy) return void send('continue');
+    if (!v && S.resumeOk && !S.busy) return void send('continue');
     if (!v) return;
-    if (busy && !v.startsWith('/')) return; // one reply at a time; esc stops it
+    if (S.busy && !v.startsWith('/')) return; // one reply at a time; esc stops it
     // A model that can't see: ask before sending the text without the images.
     // ponytail: the router (Phase 7) will move the task to a connected model that can see.
     if (!v.startsWith('/') && blind() && hasMedia(v) && !blindAsk) return void (blindAsk = true);
@@ -1612,15 +1858,15 @@ export async function runApp(cfg: Config, version: string) {
       else note('No own server is set up. /setup connects one.', 'dim');
     } else if (c === '/settings') panel = createSettingsPanel(host);
     else if (c === '/permissions') panel = createPermissions();
-    else if (c === '/conversations') panel = createConversations();
+    else if (c === '/conversations') openList();
     else if (c === '/clear') {
       newConversation();
       if (later) host.choose(later);
     } else if (c === '/usage') boxKind = 'usage';
     else if (c === '/exit') quit();
     else {
-      items.push({ kind: 'user', text: v });
-      items.push({ kind: 'reply', text: `Unknown command ${c}. Press / to see the commands.`, done: true });
+      S.items.push({ kind: 'user', text: v });
+      S.items.push({ kind: 'reply', text: `Unknown command ${c}. Press / to see the commands.`, done: true });
     }
   }
 
@@ -1753,10 +1999,11 @@ export async function runApp(cfg: Config, version: string) {
     }
     if (id === 'stop') return stopBg();
     if (id === 'mode') return cycleMode();
-    if (id === 'conversations') return void (panel = createConversations());
-    if (id.startsWith('dec:') && approval) return void answer(+id.slice(4));
+    if (id === 'conversations') return openList();
+    if (id.startsWith('conv:') && list) return openRow(listRows()[+id.slice(5)]);
+    if (id.startsWith('dec:') && S.approval) return void answer(+id.slice(4));
     if (id.startsWith('undo:')) {
-      const it = items[+id.slice(5)];
+      const it = S.items[+id.slice(5)];
       if (it?.kind === 'gear') settings.undo(it.change);
       return;
     }
@@ -1781,26 +2028,28 @@ export async function runApp(cfg: Config, version: string) {
   }
 
   function onKey(k: Extract<InputEvent, { type: 'key' }>) {
+    if (list) return listKey(k);
     if (boxKind === 'keys') {
       boxKind = null; // any key closes the sheet
       return;
     }
     // The permission question takes the keys while it's open.
-    if (approval) {
+    if (S.approval) {
       const opts = approvalOptions();
       if (k.name === 'up' || k.name === 'down') {
-        const i = opts.indexOf(approval.sel);
-        approval.sel = opts[(i + (k.name === 'up' ? opts.length - 1 : 1)) % opts.length];
-      } else if (k.name === 'enter') answer(approval.sel + 1);
+        const i = opts.indexOf(S.approval.sel);
+        S.approval.sel = opts[(i + (k.name === 'up' ? opts.length - 1 : 1)) % opts.length];
+      } else if (k.name === 'enter') answer(S.approval.sel + 1);
       else if (k.name === 'char' && /^[123]$/.test(k.ch ?? '') && opts.includes(+k.ch! - 1)) answer(+k.ch!);
       else if (k.name === 'escape') answer(3);
       else if (k.name === 'tab' && k.shift) cycleMode();
-      else if (k.ctrl && k.name === 'c') busy?.abort();
+      else if (k.ctrl && k.name === 'c') S.busy?.abort();
+      else if (k.name === 'left') openList(); // the question waits here while you look elsewhere
       return;
     }
     if (k.name === 'tab' && k.shift && !panel) return cycleMode();
     // ← on an empty prompt opens your conversations.
-    if (k.name === 'left' && !k.shift && !buf && !panel && !boxKind && !busy && !rsearch) return void (panel = createConversations());
+    if (k.name === 'left' && !k.shift && !buf && !panel && !boxKind && !rsearch) return openList();
     // ctrl+c cancels what's open or running; twice quits, but only when nothing
     // is open or running, so one press never loses work (SPEC §5.2).
     if (k.ctrl && k.name === 'c') {
@@ -1808,7 +2057,7 @@ export async function runApp(cfg: Config, version: string) {
       if (rsearch || atPick) return void (rsearch = atPick = null);
       if (boxKind) return void (boxKind = null);
       if (big || listPinned) return void ((big = null), (listPinned = listOpen = false));
-      if (busy) busy.abort();
+      if (S.busy) S.busy.abort();
       else if (buf) {
         buf = '';
         cur = 0;
@@ -1851,6 +2100,11 @@ export async function runApp(cfg: Config, version: string) {
       return;
     }
     if (!panel && k.ctrl && k.name === 'r') return void ((rsearch = { q: '', i: 0 }), (atPick = null));
+    if (!panel && k.ctrl && k.name === 'o') {
+      showThinking = !showThinking;
+      for (const x of sessions) for (const it of x.items) if (it.kind === 'think') it.open = showThinking;
+      return;
+    }
     // The @ picker takes ↑ ↓, tab/enter and esc while it's open.
     if (!panel && atPick && atQuery() !== null) {
       const m = atMatches();
@@ -1864,7 +2118,7 @@ export async function runApp(cfg: Config, version: string) {
       return void (sel = (sel + (k.name === 'down' ? 1 : n - 1)) % n);
     }
     // On an empty prompt, tab or → takes the suggestion (the next step, or the example).
-    if (!buf && !panel && !declining && (k.name === 'tab' || (k.name === 'right' && !k.shift)) && (nextStep || example)) return insert(nextStep || example);
+    if (!buf && !panel && !S.declining && (k.name === 'tab' || (k.name === 'right' && !k.shift)) && (S.nextStep || (example && !S.messages.length))) return insert(S.nextStep || example);
     // tab, or → at the end, takes the ghost text.
     const g = ghost();
     if (g && (k.name === 'tab' || (k.name === 'right' && !k.shift && !k.ctrl))) return insert(g);
@@ -1903,7 +2157,7 @@ export async function runApp(cfg: Config, version: string) {
       else if (listPinned) listPinned = listOpen = false;
       else if (blindAsk) blindAsk = false;
       else if (boxKind) boxKind = null;
-      else if (busy) busy.esc();
+      else if (S.busy) S.busy.esc();
       else if (scrollOff > 0) scrollOff = 0; // back to the end of the conversation
       return;
     }
@@ -1957,7 +2211,7 @@ export async function runApp(cfg: Config, version: string) {
         const up = k.name === 'up';
         if (k.shift) anchor ??= cur;
         else anchor = null;
-        if (vertical(up ? -1 : 1) || k.shift) break;
+        if (vertical(up ? -1 : 1) || k.shift || browsing?.edited) break;
         // On the first line ↑ goes to older prompts; on the last line ↓ comes back
         // to newer ones and finally to what you were typing.
         if (up) {
@@ -1993,6 +2247,15 @@ export async function runApp(cfg: Config, version: string) {
 
   function onEvent(ev: InputEvent) {
     const before = buf;
+    if (ev.type === 'mouse' && list) {
+      // In the conversations window: the wheel moves the highlight, a click opens.
+      if (ev.button === 64 || ev.button === 65) return listKey({ name: ev.button === 64 ? 'up' : 'down' }), schedule();
+      else if (ev.button === 0 && ev.release) {
+        const h = hits.find((x) => x.row === ev.y && ev.x >= x.x0 && ev.x <= x.x1);
+        if (h) act(h.id);
+      }
+      return schedule();
+    }
     if (ev.type === 'mouse') {
       const at = { x: ev.x, y: ev.y };
       const onPrompt = !panel?.masked?.() && promptOffset(ev.x, ev.y) !== null;
@@ -2078,7 +2341,8 @@ export async function runApp(cfg: Config, version: string) {
     }
     if (buf !== before) {
       blindAsk = false;
-      if (!navigated) browsing = null; // typing keeps the text you brought back
+      // Typing keeps the text you brought back; emptying it ends the browsing.
+      if (!navigated && browsing) buf ? (browsing.edited = true) : (browsing = null);
     }
     navigated = false;
     if (panel && buf !== before) panel.changed?.(buf);
@@ -2103,8 +2367,11 @@ export async function runApp(cfg: Config, version: string) {
   function quit() {
     if (quitting) return;
     quitting = 'bye';
-    if (live && convId) save((d) => d.update(convId!, live!.seq, [{ type: 'text', text: live!.text() }], true));
-    if (convId) save((d) => d.unlock(convId!));
+    // Every open conversation: a reply being streamed is kept as interrupted.
+    for (const x of sessions) {
+      if (x.live && x.convId) save((d) => d.update(x.convId!, x.live!.seq, [{ type: 'text', text: x.live!.text() }], true));
+      if (x.convId) save((d) => d.unlock(x.convId!));
+    }
     header?.close();
     for (const [name, p] of Object.entries(cfg.providers)) {
       if (!p.ssh || !p.onQuit || p.onQuit === 'keep' || !tunnels[name]?.port) continue;
@@ -2120,12 +2387,13 @@ export async function runApp(cfg: Config, version: string) {
 
   // Reopens this project's last conversation (SPEC §16): the exact messages, and
   // the frozen prefix it was sent with when it's recent enough for the cache to hit.
-  function reopen(c: Conversation) {
-    convId = c.id;
+  function reopen(c: Conversation, C: Session = S) {
+    const { store } = bound(C);
+    C.convId = c.id;
     try {
-      convRules = c.rules ? JSON.parse(c.rules) : {};
+      C.convRules = c.rules ? JSON.parse(c.rules) : {};
     } catch {
-      convRules = {};
+      C.convRules = {};
     }
     // The stored prefix is reused when it's recent and was sent with today's tools.
     if (c.prefix && c.prefix_hash === TOOLS_HASH && Date.now() - c.updated < 86400000) SYSTEM = c.prefix;
@@ -2135,30 +2403,44 @@ export async function runApp(cfg: Config, version: string) {
       const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;
       if (m.role === 'system') {
         const { type: _, ...oc } = blocks[0] ?? {};
-        messages.push({ role: 'system', content: [], output_config: oc });
+        C.messages.push({ role: 'system', content: [], output_config: oc });
         continue;
       }
-      messages.push({ role: m.role, content: m.content });
-      const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join(m.role === 'user' ? '\n' : '');
+      C.messages.push({ role: m.role, content: m.content });
+      const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
       if (m.role === 'user') {
-        if (text) items.push({ kind: 'user', text }), history.push(text);
+        if (text) {
+          const it = userItem(blocks);
+          C.items.push(it);
+          if (it.kind === 'user' && !it.chips) history.push(it.text);
+        }
       } else {
-        if (splitToolCalls(text).text.trim()) items.push({ kind: 'reply', text: text + (m.interrupted ? '…' : ''), done: true });
-        for (const u of blocks.filter((b) => b.type === 'tool_use')) items.push(toolLine(u));
+        const thought = blocks.filter((b) => b.type === 'thinking').map((b) => String(b.thinking ?? '')).join('');
+        if (thought.trim()) C.items.push({ kind: 'think', text: thought, start: 0, ms: 0, open: showThinking });
+        if (splitToolCalls(text).text.trim()) C.items.push({ kind: 'reply', text: text + (m.interrupted ? '…' : ''), done: true });
+        // What it cost comes back too: the ↳ line, the meter and /usage.
+        if (m.usage) C.items.push({ kind: 'cost', turn: C.meter.charge(m.usage.usage, m.usage.price, m.usage.local) });
+        for (const u of blocks.filter((b) => b.type === 'tool_use')) C.items.push(toolLine(u));
       }
     }
     if (!stored.length) return;
-    continuing = { title: c.title || 'untitled', at: c.updated };
+    C.continuing = { title: c.title || 'untitled', at: c.updated };
+    // Pick up from the last reply: if it offered something, that's the suggestion.
+    const lastReply = stored.at(-1)!;
+    if (lastReply.role === 'assistant' && !lastReply.interrupted) {
+      const t = typeof lastReply.content === 'string' ? lastReply.content : lastReply.content.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
+      C.nextStep = nextFor(t, { wrote: [], ran: [] }, project);
+    }
     // Tool calls left without results when Rime closed get them now.
-    const last = messages.at(-1);
+    const last = C.messages.at(-1);
     const open = last?.role === 'assistant' && Array.isArray(last.content) ? last.content.filter((b) => b.type === 'tool_use') : [];
     if (open.length) {
-      messages.push({ role: 'user', content: open.map((u) => result(u.id, 'Not run: Rime was closed before this ran.', true)) });
-      lastUserSeq = store(messages.at(-1)!);
-    } else if (stored.at(-1)!.role === 'user') lastUserSeq = stored.at(-1)!.seq;
-    if (stored.at(-1)!.interrupted || messages.at(-1)?.role === 'user') {
-      resumeOk = true;
-      items.push({ kind: 'lines', lines: [[{ t: '  ↻ ', s: st.warn }, { t: 'interrupted when you quit · nothing was lost · ', s: st.dim }, { t: 'enter', s: st.accentB }, { t: ' continue', s: st.dim }]] });
+      C.messages.push({ role: 'user', content: open.map((u) => result(u.id, 'Not run: Rime was closed before this ran.', true)) });
+      C.lastUserSeq = store(C.messages.at(-1)!);
+    } else if (stored.at(-1)!.role === 'user') C.lastUserSeq = stored.at(-1)!.seq;
+    if (stored.at(-1)!.interrupted || C.messages.at(-1)?.role === 'user') {
+      C.resumeOk = true;
+      C.items.push({ kind: 'lines', lines: [[{ t: '  ↻ ', s: st.warn }, { t: 'interrupted when you quit · nothing was lost · ', s: st.dim }, { t: 'enter', s: st.accentB }, { t: ' continue', s: st.dim }]] });
     }
   }
 
@@ -2172,7 +2454,12 @@ export async function runApp(cfg: Config, version: string) {
   process.on('exit', restore);
   process.on('SIGTERM', () => void quit());
   process.on('SIGHUP', () => void quit());
-  out.on('resize', schedule);
+  // The terminal reflows the screen on resize, so the next frame redraws it all.
+  out.on('resize', () => {
+    drawn = [];
+    write('\x1b[2J');
+    schedule();
+  });
 
   write(MODES_ON);
   playHeader(headerOpts);
@@ -2185,7 +2472,7 @@ export async function runApp(cfg: Config, version: string) {
     else if (conv) reopen(conv);
     past = save((d) => d.prompts(project)) ?? [];
   }
-  example = tryExample();
+  example = exampleFor(project);
   if (!connected()) panel = createSetup(host);
   else if (cfg.model) useRef(cfg.model, true);
   frame();

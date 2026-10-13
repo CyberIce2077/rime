@@ -409,6 +409,29 @@ export async function blocksFor(buf: string, chips: Map<string, Chip>, cwd: stri
   return out;
 }
 
+// The other way, to show a saved message: your text, with each attached file,
+// folder or long text back as a chip (with its contents, so it previews) instead
+// of pasted into the message. `mark` gives each chip its character.
+export function fromBlocks(blocks: Block[], mark: (c: Chip) => string): string {
+  const texts = blocks.filter((b) => b.type === 'text').map((b) => String(b.text));
+  let text = texts[0] ?? '';
+  for (const t of texts.slice(1)) {
+    const m = /^\[(text|file|folder) ([^\]]+)\] ?(.*)\n([\s\S]*)$/.exec(t);
+    if (!m || !text.includes(`[${m[1]} ${m[2]}]`)) {
+      text += '\n' + t;
+      continue;
+    }
+    const [, kind, name, head, body] = m;
+    const lines = body.split('\n');
+    const c: Chip =
+      kind === 'text' ? { kind, n: Number(name) || 0, name: `text ${name}`, text: body, lines: lines.length, tok: textTokens(body) }
+      : kind === 'file' ? { kind, n: 0, name, path: head.replace(/ \(\d+ lines\)$/, ''), text: body, lines: Number(/\((\d+) lines\)$/.exec(head)?.[1]) || lines.length, tok: textTokens(body) }
+      : { kind: 'folder', n: 0, name, path: head.replace(/ \(.*$/, ''), tree: lines, files: Number(/\((\d+) files/.exec(head)?.[1]) || lines.length, tok: textTokens(body) + 40 };
+    text = text.split(`[${kind} ${name}]`).join(mark(c));
+  }
+  return text;
+}
+
 // ---- thumbnails for the preview ----
 
 const thumbs = new Map<string, RGB[][] | null | 'busy'>();

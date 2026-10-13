@@ -31,6 +31,8 @@ test('a conversation is saved as it happens and reopens as it was', async () => 
   assert.deepEqual(again.prompts('/elsewhere'), []);
   assert.deepEqual(again.list('/p').map((c) => [c.title, c.n]), [['Fix the signup crash', 2]], 'the ← list');
   assert.equal(again.take(id)?.id, id);
+  again.setUsage(id, seq, { usage: { input: 120, cached: 3000, written: 0, output: 12, promptMs: 180 }, local: true });
+  assert.deepEqual(again.messages(id)[1].usage, { usage: { input: 120, cached: 3000, written: 0, output: 12, promptMs: 180 }, local: true }, 'what a reply cost comes back');
   again.close();
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });

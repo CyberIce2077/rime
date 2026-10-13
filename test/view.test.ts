@@ -20,10 +20,11 @@ test('prompt box is full width with the caret after "› "', () => {
   assert.deepEqual(p.cursor, { row: 1, col: 4 });
 });
 
-test('a reply is indented two cells and wrapped at 76', () => {
+test('a reply is indented two cells and uses the whole width', () => {
   const lines = renderItem({ kind: 'reply', text: 'word '.repeat(30).trim() + '\n- item', done: false }, 120, st);
   assert.ok(lines.every((l) => l.startsWith('  ')));
-  assert.ok(lines.every((l) => strWidth(l) <= 78));
+  assert.ok(lines.every((l) => strWidth(l) <= 120));
+  assert.ok(strWidth(lines[0]) > 100);
   assert.equal(stripAnsi(lines.at(-1)!), '  · item');
 });
 
@@ -37,11 +38,22 @@ test('tool calls written as text are caught until Rime has tools', () => {
   assert.deepEqual(r.map(stripAnsi), ['  Let me look.']);
 });
 
-test('code blocks: no fences, a language label, spacing kept, long lines cut not re-flowed', () => {
+test('code blocks: no fences or background, spacing kept, long lines cut not re-flowed', () => {
   const lines = renderItem({ kind: 'reply', text: 'A cat:\n\n```\n   /\\_/\\\n  ( o.o )\n```\n\n```js\nconst x = 1;\n```', done: true }, 80, st).map(stripAnsi);
-  assert.deepEqual(lines, ['  A cat:', '  ', '      /\\_/\\  ', '     ( o.o ) ', '  ', '  js', '   const x = 1; ']);
+  assert.deepEqual(lines, ['  A cat:', '  ', '     /\\_/\\', '    ( o.o )', '  ', '  const x = 1;']);
   const long = renderItem({ kind: 'reply', text: '```\n' + 'x'.repeat(30) + '\n```', done: true }, 22, st).map(stripAnsi);
-  assert.deepEqual(long, ['   ' + 'x'.repeat(18) + ' ', '   ' + 'x'.repeat(12) + '       ']);
+  assert.deepEqual(long, ['  ' + 'x'.repeat(20), '  ' + 'x'.repeat(10)]);
   const open = renderItem({ kind: 'reply', text: 'Here:\n```py\nprint("hi")', done: false }, 80, st).map(stripAnsi);
-  assert.deepEqual(open, ['  Here:', '  py', '   print("hi") '], 'a block still streaming shows as code');
+  assert.deepEqual(open, ['  Here:', '  print("hi")'], 'a block still streaming shows as code');
+});
+
+test('a "~~~" inside a ``` block (a cat\'s tail) does not end it', () => {
+  const text = 'Cat:\n\n```\n ( o.o )\n   ~~~\n```\n\nAnd a bigger one:\n\n```\n |\\  _,,,\n```\n\nWant me to save it?';
+  const st2 = styles('truecolor');
+  const lines = renderItem({ kind: 'reply', text, done: true }, 80, st2);
+  const at = (t: string) => lines.find((l) => stripAnsi(l).includes(t))!;
+  assert.ok(at('~~~').includes(st2.accent), 'the tail is still code');
+  assert.ok(!at('And a bigger one').includes(st2.accent), 'the prose after it is prose');
+  assert.ok(at('_,,,').includes(st2.accent), 'the second block is code');
+  assert.ok(!at('Want me').includes(st2.accent));
 });

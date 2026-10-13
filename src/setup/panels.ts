@@ -389,8 +389,8 @@ export function createModelPicker(
 
 // ---- /settings ----
 
-type SettingsHost = Host & { settings: Settings; current(): Model | undefined; openModel(): void; openSteps(name: string): void; openConnect(): void };
-type Row = { group: string; label: string; help: string; kind: 'value' | 'action' | 'undo'; key?: string; go?: () => void; change?: Change };
+type SettingsHost = Host & { settings: Settings; current(): Model | undefined; openModel(): void; openSteps(name: string): void; openConnect(): void; rename(from: string, to: string): string | null };
+type Row = { group: string; label: string; help: string; kind: 'value' | 'action' | 'undo'; key?: string; go?: () => void; change?: Change; provider?: string };
 
 // Every setting in one box, grouped, changed in place and applied live (SPEC §15).
 // Typing filters; ← → change a value; recent changes are listed with undo.
@@ -399,6 +399,8 @@ export function createSettingsPanel(h: SettingsHost): Panel {
   const dim = (t: string) => ({ t, s: st.dim });
   let pick = 0;
   let filter = '';
+  let renaming: string | null = null; // the provider being renamed (its new name is typed in the prompt)
+  let error = '';
   const ago = (t: number) => {
     const s = Math.round((Date.now() - t) / 1000);
     return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : `${Math.floor(s / 3600)} h ago`;
@@ -409,7 +411,7 @@ export function createSettingsPanel(h: SettingsHost): Panel {
     const out: Row[] = [
       { group: 'Model', label: 'Model', help: `${h.current()?.label ?? 'none'} · enter picks one`, kind: 'action', go: h.openModel },
       ...defs.filter((d) => d.group === 'Model').map((d): Row => ({ group: 'Model', label: d.label, help: d.help, kind: 'value', key: d.key })),
-      ...Object.entries(cfg.providers).map(([name, p]): Row => ({ group: 'Providers', label: name, help: `${p.ssh ? `own server over ssh (${p.ssh})` : p.url ? String(p.url) : p.preset}`, kind: 'action', go: p.ssh ? () => h.openSteps(name) : h.openConnect })),
+      ...Object.entries(cfg.providers).map(([name, p]): Row => ({ group: 'Providers', label: name, help: `${p.ssh ? `own server over ssh (${p.ssh})` : p.url ? String(p.url) : p.preset} · r renames`, kind: 'action', provider: name, go: p.ssh ? () => h.openSteps(name) : h.openConnect })),
       { group: 'Providers', label: 'Add a provider or URL', help: '/connect', kind: 'action', go: h.openConnect },
       ...defs.filter((d) => d.group === 'Server').map((d): Row => ({ group: 'Server', label: d.label, help: d.help, kind: 'value', key: d.key })),
       ...Object.entries(cfg.providers).filter(([, p]) => p.ssh).map(([name]): Row => ({ group: 'Server', label: `${name}: steps`, help: 'the commands that bring it up', kind: 'action', go: () => h.openSteps(name) })),
@@ -438,14 +440,28 @@ export function createSettingsPanel(h: SettingsHost): Panel {
         } else out.push(listRow(r.label, r.kind === 'undo' && r.change?.undone ? [dim(r.help)] : r.help, i === pick, st, `pick:${i}`, 28));
       });
       if (!list.length) out.push({ line: [dim(`no setting matches ${filter}`)] });
+      if (renaming) out.push({ line: [] }, { line: [{ t: `New name for ${renaming}: type it below and press enter`, s: st.accent }] });
+      if (error) out.push({ line: [{ t: error, s: st.warn }] });
       void width;
-      return { legend: [{ t: 'settings', s: st.accent }, dim(' · applied right away')], rows: out, foot: ['↑ ↓', ' choose · ', '← →', ' change · ', 'enter', ' open or undo · type to filter · ', 'esc', ' close'] };
+      if (renaming) return { legend: [{ t: 'settings', s: st.accent }, dim(' · rename')], rows: out, foot: ['enter', ' rename · ', 'esc', ' keep the name'] };
+      return { legend: [{ t: 'settings', s: st.accent }, dim(' · applied right away')], rows: out, foot: ['↑ ↓', ' choose · ', '← →', ' change · ', 'enter', ' open or undo · ', ...(list[pick]?.provider ? ['r', ' rename · '] : ['', 'type to filter · ']), 'esc', ' close'] };
     },
-    placeholder: () => 'Type to filter settings',
+    placeholder: () => (renaming ? `a new name for ${renaming}` : 'Type to filter settings'),
     typing: () => true,
     key(k) {
+      if (renaming) {
+        if (k.name === 'escape') return (renaming = null), (error = ''), h.setBuffer(''), true;
+        return false; // the name is typed in the prompt; enter goes to submit
+      }
       const list = rows();
       const r = list[pick];
+      // r renames a provider (a letter is a key only while the filter is empty).
+      if (k.name === 'char' && k.ch === 'r' && !filter && r?.provider) {
+        renaming = r.provider;
+        error = '';
+        h.setBuffer(r.provider);
+        return true;
+      }
       if (k.name === 'escape') {
         if (filter) return h.setBuffer(''), (filter = ''), true;
         return h.close(), true;
@@ -470,7 +486,18 @@ export function createSettingsPanel(h: SettingsHost): Panel {
       }
       return false;
     },
+    submit(buf) {
+      if (!renaming) return;
+      const to = buf.trim();
+      if (to === renaming) return void ((renaming = null), h.setBuffer(''));
+      const e = h.rename(renaming, to);
+      if (e) return void (error = e);
+      renaming = null;
+      error = '';
+      h.setBuffer('');
+    },
     changed(buf) {
+      if (renaming) return;
       filter = buf;
       pick = 0;
     },

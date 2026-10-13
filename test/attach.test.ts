@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { blocksFor, chipChar, chipFor, folderTree, fuzzy, imageSize, label, listFiles, parts, pastedPaths, textChip, thumbSize } from '../src/core/attach.ts';
+import { blocksFor, chipChar, fromBlocks, chipFor, folderTree, fuzzy, imageSize, label, listFiles, parts, pastedPaths, textChip, thumbSize } from '../src/core/attach.ts';
 import { offsetAt, prompt, styles } from '../src/core/view.ts';
 import { stripAnsi } from '../src/core/term.ts';
 import { toWire } from '../src/providers/openai.ts';
@@ -166,4 +166,22 @@ test('@ files: fuzzy matching and line ranges', () => {
   const c = chipFor(path.join(dir, 'notes.md'), counter(), dir, () => {}, [30, 32]);
   assert.equal(c.name, 'notes.md:30-32');
   assert.equal(c.text, '   30  line 30\n   31  line 31\n   32  line 32');
+});
+
+test('a saved message shows its attachments as chips again, not their contents', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rime-from-'));
+  fs.writeFileSync(path.join(dir, 'notes.md'), Array.from({ length: 175 }, (_, i) => `line ${i + 1}`).join('\n'));
+  let k = 0;
+  const n = () => ++k;
+  const file = chipFor(path.join(dir, 'notes.md'), n, dir, () => {});
+  const long = textChip(Array.from({ length: 30 }, (_, i) => `pasted ${i}`).join('\n'), n);
+  const chips = new Map([[chipChar(0), file], [chipChar(1), long]]);
+  const blocks = await blocksFor(`check this ${chipChar(0)} and ${chipChar(1)}`, chips, dir);
+  const back: typeof file[] = [];
+  const text = fromBlocks(blocks, (c) => (back.push(c), chipChar(100 + back.length)));
+  assert.equal(text, `check this ${chipChar(101)} and ${chipChar(102)}`);
+  assert.equal(label(back[0]), label(file));
+  assert.equal(label(back[1]), label(long));
+  assert.equal(back[0].text, file.text, 'it previews the same contents');
+  assert.equal(fromBlocks([{ type: 'text', text: 'plain' }], () => 'x'), 'plain');
 });

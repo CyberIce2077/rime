@@ -8,12 +8,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import type { Block } from '../providers/types.ts';
+import type { Block, Price, Usage } from '../providers/types.ts';
 
 export const DB_PATH = path.join(os.homedir(), '.rime', 'rime.db');
 
 export type Conversation = { id: number; project: string; title: string; created: number; updated: number; model: string | null; tokens: number; cost: number; prefix: string | null; prefix_hash: string | null; lock_pid: number | null; rules: string | null };
-export type Stored = { seq: number; role: 'user' | 'assistant' | 'system'; content: string | Block[]; interrupted: boolean };
+// `usage`: what the reply cost (normalized usage, its price, local or not), so the
+// meter and /usage come back when the conversation is reopened.
+export type Stored = { seq: number; role: 'user' | 'assistant' | 'system'; content: string | Block[]; interrupted: boolean; usage?: { usage: Usage; price?: Price; local?: boolean } };
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS conversations (
@@ -79,6 +81,7 @@ export async function openDb(file = DB_PATH) {
   db.exec(SCHEMA);
   // Added after the first version: "don't ask again" rules belong to a conversation.
   if (!(db.prepare('PRAGMA table_info(conversations)').all() as { name: string }[]).some((c) => c.name === 'rules')) db.exec('ALTER TABLE conversations ADD COLUMN rules TEXT');
+  if (!(db.prepare('PRAGMA table_info(messages)').all() as { name: string }[]).some((c) => c.name === 'usage')) db.exec('ALTER TABLE messages ADD COLUMN usage TEXT');
   try {
     fs.chmodSync(file, 0o600);
   } catch {}
@@ -86,6 +89,7 @@ export async function openDb(file = DB_PATH) {
   const q = {
     last: db.prepare('SELECT * FROM conversations WHERE project = ? ORDER BY updated DESC, id DESC LIMIT 1'),
     list: db.prepare('SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation = c.id) AS n FROM conversations c WHERE c.project = ? ORDER BY c.pinned DESC, c.updated DESC, c.id DESC LIMIT ?'),
+    listAll: db.prepare('SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation = c.id) AS n FROM conversations c ORDER BY c.pinned DESC, c.updated DESC, c.id DESC LIMIT ?'),
     create: db.prepare('INSERT INTO conversations (project, title, created, updated, model, prefix, prefix_hash, lock_pid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
     lock: db.prepare('UPDATE conversations SET lock_pid = ? WHERE id = ?'),
     unlock: db.prepare('UPDATE conversations SET lock_pid = NULL WHERE id = ? AND lock_pid = ?'),
@@ -99,7 +103,8 @@ export async function openDb(file = DB_PATH) {
     usage: db.prepare('UPDATE conversations SET tokens = tokens + ?, cost = cost + ?, model = ? WHERE id = ?'),
     prefix: db.prepare('UPDATE conversations SET prefix = ?, prefix_hash = ? WHERE id = ?'),
     rules: db.prepare('UPDATE conversations SET rules = ? WHERE id = ?'),
-    messages: db.prepare('SELECT seq, role, content, interrupted FROM messages WHERE conversation = ? ORDER BY seq'),
+    messages: db.prepare('SELECT seq, role, content, interrupted, usage FROM messages WHERE conversation = ? ORDER BY seq'),
+    setUsage: db.prepare('UPDATE messages SET usage = ? WHERE conversation = ? AND seq = ?'),
     prompts: db.prepare("SELECT m.content FROM messages m JOIN conversations c ON c.id = m.conversation WHERE c.project = ? AND m.role = 'user' ORDER BY c.updated DESC, m.seq DESC LIMIT ?"),
   };
 
@@ -114,9 +119,11 @@ export async function openDb(file = DB_PATH) {
       q.lock.run(process.pid, c.id);
       return { conv: c, busy: false };
     },
-    // This project's conversations, pinned first, then newest (the ← list).
-    list(project: string, limit = 200) {
-      return q.list.all(project, limit) as (Conversation & { n: number })[];
+    // This project's conversations (or every project's), pinned first, then
+    // newest; `other` when another live Rime window has it open.
+    list(project: string | null, limit = 200) {
+      const rows = (project === null ? q.listAll.all(limit) : q.list.all(project, limit)) as (Conversation & { n: number })[];
+      return rows.map((c) => ({ ...c, other: !!c.lock_pid && c.lock_pid !== process.pid && alive(c.lock_pid) }));
     },
     // Opens a conversation from the list, unless another live window has it.
     take(id: number): Conversation | null {
@@ -149,7 +156,14 @@ export async function openDb(file = DB_PATH) {
     setPrefix: (conv: number, prefix: string, hash?: string) => void q.prefix.run(prefix, hash ?? null, conv),
     setRules: (conv: number, rules: object) => void q.rules.run(JSON.stringify(rules), conv),
     messages: (conv: number): Stored[] =>
-      (q.messages.all(conv) as { seq: number; role: Stored['role']; content: string; interrupted: number }[]).map((r) => ({ seq: r.seq, role: r.role, content: JSON.parse(r.content), interrupted: !!r.interrupted })),
+      (q.messages.all(conv) as { seq: number; role: Stored['role']; content: string; interrupted: number; usage: string | null }[]).map((r) => ({
+        seq: r.seq,
+        role: r.role,
+        content: JSON.parse(r.content),
+        interrupted: !!r.interrupted,
+        ...(r.usage ? { usage: JSON.parse(r.usage) } : {}),
+      })),
+    setUsage: (conv: number, seq: number, u: NonNullable<Stored['usage']>) => void q.setUsage.run(JSON.stringify(u), conv, seq),
     // Your earlier prompts in this project, newest first (ghost text and ctrl+r).
     prompts(project: string, limit = 500) {
       const out: string[] = [];

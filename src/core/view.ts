@@ -18,6 +18,7 @@ export function styles(mode: ColorMode) {
     reset: RESET(mode),
     fg: c(G.fg), title: c(G.title), titleB: b + c(G.title), accent: c(G.accent), accentB: b + c(G.accent),
     dim: c(G.dim), ok: c(G.ok), del: c(G.del), warn: c(G.warn), line: c(G.line),
+    think: (mode === 'none' ? '' : '\x1b[3m') + c(G.dim),
     bold: b, placeholder: c(PLACEHOLDER), panelBg: sgr(G.panel, true, mode),
     selection: mode === 'none' ? '\x1b[7m' : sgr(SELECTION, true, mode) + c(G.title),
     // A chip in the prompt or a sent message; `chipOn` when the caret is on it.
@@ -36,13 +37,17 @@ export type Item =
   | { kind: 'header'; lines: () => string[] }
   | { kind: 'user'; text: string; chips?: Record<string, string> } // chip char -> its label
   | { kind: 'reply'; text: string; done: boolean }
+  // The model's thinking: live, its last lines under a timer; done, one line
+  // ("Thought for 6s") that ctrl+o opens.
+  | { kind: 'think'; text: string; start: number; ms?: number; open?: boolean; note?: string }
   | { kind: 'tool'; verb: string; rest?: string; extra?: Line }
   | { kind: 'cost'; turn: Turn }
   | { kind: 'note'; text: string; tone: 'warn' | 'dim' }
   | { kind: 'lines'; lines: Line[]; hug?: boolean } // already styled, e.g. "● gpubox is ready"; hug: no gap above
   | { kind: 'gear'; change: Change; note?: string }; // a setting Rime changed, with undo
 
-// Messages are capped at 76ch like the prototype's .msg.
+// Messages use the whole width of their pane: the full screen, or the left side
+// once the side panel is open. MSG is only markdown()'s default.
 const MSG = 76;
 
 // One blank line between items; tool steps stack, and a cost line hugs its reply.
@@ -99,16 +104,14 @@ export function chunk(line: Line, width: number): Line[] {
   return out;
 }
 
-// A fenced block: the language as a small label, then the code on a tinted
-// panel as wide as its longest line.
+// A fenced block, drawn like Claude Code does: no fences, no background, the
+// code in its own colour at the reply's indent. Without a language (ASCII art,
+// output) it's one colour; with one, light syntax colours.
 function codeBlock(lines: string[], lang: string, width: number, st: Styles): Line[] {
-  const bg = st.mode === 'none' ? '' : st.panelBg;
-  const inner = Math.max(1, width - 2);
-  const pieces = lines.map((l) => chunk(highlight(l.replace(/\t/g, '  '), lang, st), inner)).flat();
-  const w = Math.min(inner, Math.max(lang.length, ...pieces.map(lineWidth)));
-  const out: Line[] = lang ? [[run(lang, st.dim)]] : [];
-  for (const p of pieces) out.push([run(' ', bg), ...p.map((r) => ({ t: r.t, s: bg + r.s })), run(' '.repeat(w - lineWidth(p) + 1), bg)]);
-  return out;
+  return lines.flatMap((l) => {
+    const t = l.replace(/\t/g, '  ');
+    return chunk(lang ? highlight(t, lang, st) : [run(t, st.accent)], Math.max(1, width));
+  });
 }
 
 // ---- Light markdown ----
@@ -117,16 +120,21 @@ function codeBlock(lines: string[], lang: string, width: number, st: Styles): Li
 // to `width` (prose by words; code by characters, keeping its spacing).
 export function markdown(text: string, st: Styles, width = MSG): Line[] {
   const out: Line[] = [];
-  let fence: { lang: string; lines: string[] } | null = null;
+  let fence: { mark: string; lang: string; lines: string[] } | null = null;
   for (const raw of text.split('\n')) {
-    const f = /^\s*(```|~~~)\s*([\w+#.-]*)/.exec(raw);
-    if (f) {
-      if (fence) out.push(...codeBlock(fence.lines, fence.lang, width, st)), (fence = null);
-      else fence = { lang: f[2].toLowerCase(), lines: [] };
+    // A block closes only on the same kind of fence, at least as long, alone on
+    // its line (CommonMark), so a "~~~" inside ASCII art doesn't end it.
+    if (fence) {
+      const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(raw);
+      if (close && close[1][0] === fence.mark[0] && close[1].length >= fence.mark.length) {
+        out.push(...codeBlock(fence.lines, fence.lang, width, st));
+        fence = null;
+      } else fence.lines.push(raw);
       continue;
     }
-    if (fence) {
-      fence.lines.push(raw);
+    const open = /^ {0,3}(`{3,}|~{3,})\s*([\w+#.-]*)[^`]*$/.exec(raw);
+    if (open) {
+      fence = { mark: open[1], lang: open[2].toLowerCase(), lines: [] };
       continue;
     }
     const h = /^#{1,6}\s+(.*)$/.exec(raw);
@@ -187,7 +195,7 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
     case 'header':
       return ['', ...item.lines(), ''];
     case 'user': {
-      const w = Math.min(MSG, width);
+      const w = width;
       // Chips keep their look in the transcript (and their preview on hover).
       const body = (p: string): Line => [...p].map((ch) => (item.chips?.[ch] ? run(`[${item.chips[ch]}]`, st.chip) : run(ch, st.title)));
       const lines = item.text.split('\n').flatMap((p, i) =>
@@ -195,7 +203,20 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
       return all(lines);
     }
     case 'reply':
-      return all(indent(markdown(splitToolCalls(item.text).text, st, Math.min(MSG, width - 2)), 2));
+      return all(indent(markdown(splitToolCalls(item.text).text, st, width - 2), 2));
+    case 'think': {
+      const live = item.ms === undefined && !!item.start;
+      const secs = (ms: number) => `${Math.max(1, Math.round(ms / 1000))}s`;
+      const body = item.text.trim() ? item.text.trim().split('\n').flatMap((p) => wrap([run(p, st.think)], Math.max(10, width - 4))) : [];
+      const gutter = (ls: Line[]) => ls.map((l) => [run('  │ ', st.line), ...l]);
+      if (live) {
+        const spin = '✻✢✶✳'[Math.floor(Date.now() / 250) % 4];
+        const head: Line = [run(spin + ' ', st.accent), run('Thinking…', st.titleB), run(` ${secs(Date.now() - item.start)}${item.note ? ' · ' + item.note : ''}`, st.dim)];
+        return all([head, ...gutter(body.slice(-4))]);
+      }
+      const head: Line = [run('✻ ', st.dim), run(item.ms ? `Thought for ${secs(item.ms)}` : 'Thought', st.dim), run(' · ', st.dim), run(item.open ? 'ctrl+o to hide' : 'ctrl+o to show', st.accent)];
+      return all([head, ...(item.open ? gutter(body) : [])]);
+    }
     case 'tool': // the screen cuts it to width
       return all([[run('● ', st.accent), run(item.verb, st.titleB), ...(item.rest ? [run(' ' + item.rest, st.dim)] : []), ...(item.extra || [])]]);
     case 'cost': {
@@ -218,7 +239,7 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
       return all([[run('⚙ ', st.accent), run(what, st.dim), ...(item.note ? [] : c.undone ? [run(' · undone', st.dim)] : [run(' · ', st.dim), run('undo', st.accent)])]]);
     }
     case 'note': {
-      const w = Math.min(MSG, width - 2);
+      const w = width - 2;
       const lines = item.text.split('\n').flatMap((p, i) =>
         wrap(i === 0 ? [run('! ', item.tone === 'warn' ? st.warn : st.dim), run(p, st.dim)] : [run(p, st.dim)], w));
       return all(indent(lines, 2));
@@ -401,7 +422,8 @@ export function prompt(buf: string, cursor: number, width: number, maxRows: numb
 export type Hit = { x0: number; x1: number; id: string };
 
 // Left: key hints; right: the cost meter. Returns hit ranges (1-based columns).
-export function status(left: Line, meter: Line, width: number, st: Styles, leftHits: Hit[]): { line: string; hits: Hit[] } {
+// `rightHits` are relative to the right part's start; by default all of it is the meter.
+export function status(left: Line, meter: Line, width: number, st: Styles, leftHits: Hit[], rightHits?: Hit[]): { line: string; hits: Hit[] } {
   const mw = lineWidth(meter);
   const room = width - mw - 2;
   const l = room > 0 ? fit(left, room) : [];
@@ -409,6 +431,6 @@ export function status(left: Line, meter: Line, width: number, st: Styles, leftH
   const x0 = width - Math.min(mw, width) + 1;
   return {
     line: str(line, st),
-    hits: [...leftHits.filter((h) => h.x1 <= room), { x0, x1: width, id: 'meter' }],
+    hits: [...leftHits.filter((h) => h.x1 <= room), ...(rightHits ?? [{ x0: 1, x1: mw, id: 'meter' }]).map((h) => ({ ...h, x0: h.x0 + x0 - 1, x1: Math.min(width, h.x1 + x0 - 1) }))],
   };
 }

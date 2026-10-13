@@ -70,8 +70,27 @@ export async function startMock(o: MockOpts = {}) {
         chunk({ content: /declined/.test(last.content) ? 'Okay, I left it.' : 'Created index.html.' });
         return end('stop');
       }
+      // "slow": a reply that takes about three seconds (for switching away while it works).
+      if (/slow/.test(JSON.stringify(last.content))) {
+        for (let k = 0; k < 15; k++) {
+          chunk({ reasoning_content: 'hmm ' });
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        chunk({ content: 'Finished the slow job.' });
+        return end('stop');
+      }
+      // "ponder": several lines of thinking over about two seconds, then a short answer.
+      if (/ponder/.test(JSON.stringify(last.content))) {
+        const lines = ['The user wants a review of the kernel sketch.', 'Register widths are mixed: xmm0 is loaded, then ymm0 appears.', 'psrldq takes an immediate, not a register.', 'After the shift the high nibble needs a mask with 0x0F.', 'So there are three real bugs; list them first.', 'Then the design questions.'];
+        for (const l of lines) {
+          chunk({ reasoning_content: l + '\n' });
+          await new Promise((r) => setTimeout(r, 350));
+        }
+        chunk({ content: 'Three bugs in the kernel sketch, then two design questions.' });
+        return end('stop');
+      }
       if (/ascii cat/.test(JSON.stringify(last.content))) {
-        chunk({ content: 'Here you go:\n\n```\n   /\\_/\\\n  ( o.o )\n   > ^ <\n```\n\nAs code:\n\n```js\nconst cat = "meow"; // says hi\n```' });
+        chunk({ content: "```\n     /\\_/\\\n    ( o.o )\n     > ^ <\n    /|   |\\\n   (_|   |_)\n      ~~~\n```\n\nAnd a bigger one for good measure:\n\n```\n   |\\      _,,,---,,_\n   /  \\. '___\\_ /'_/\\_  _\n  \\     \\  '---\\_ /\\  \\/_,\n   \\    \\_      \\ /_\n```\n\nWant me to save it to a file, or make an animated one (multiple frames cycling in the terminal)?" });
         return end('stop');
       }
       chunk({ reasoning_content: 'Let me ' });
