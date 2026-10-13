@@ -2,6 +2,20 @@
   "name": "rime-cli",
   "version": "0.1.0",
   "description": "A minimal, token-frugal AI coding CLI for the terminal",
+  "keywords": [
+    "cli",
+    "ai",
+    "coding",
+    "llm",
+    "llama.cpp",
+    "terminal"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CyberIce2077/rime.git"
+  },
+  "homepage": "https://github.com/CyberIce2077/rime#readme",
+  "bugs": "https://github.com/CyberIce2077/rime/issues",
   "type": "module",
   "bin": {
     "rime": "dist/rime.js"
