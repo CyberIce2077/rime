@@ -50,15 +50,87 @@ const MSG = 76;
 export const spaced = (prev: Item | undefined, next: Item) =>
   !!prev && prev.kind !== 'header' && next.kind !== 'cost' && !(next.kind === 'lines' && next.hug) && !(prev.kind === 'tool' && next.kind === 'tool');
 
-// Light markdown for replies: headings, bold, `code`, lists, fences.
-export function markdown(text: string, st: Styles): Line[] {
+// ---- Code blocks ----
+
+// Comment markers per language; a block without a language (ASCII art, output)
+// is shown exactly as written, with no colours.
+const HASH = /^(py|python|sh|bash|zsh|shell|console|ruby|rb|yaml|yml|toml|ini|conf|dockerfile|makefile|r|perl|pl|elixir|ex|nim|cmake)$/;
+const DASH = /^(sql|lua|haskell|hs|elm)$/;
+const KEYWORDS = new Set(
+  ('as async await break case catch class const continue def default defer del do elif else enum export extends false final finally fn for from func function ' +
+    'go if impl import in interface is lambda let match mod module new nil none not null of or package pass private protected pub public raise return self ' +
+    'static struct super switch this throw throws true try type typeof undefined use val var void when where while with yield None True False').split(' '),
+);
+
+// Light syntax colours for one line of code: comments, strings, numbers,
+// keywords and HTML tags.
+export function highlight(code: string, lang: string, st: Styles): Line {
+  if (!lang) return [run(code, st.fg)];
+  const comment = HASH.test(lang) ? '#.*$' : DASH.test(lang) ? '--.*$' : /^(css|scss)$/.test(lang) ? '\\/\\*.*?(?:\\*\\/|$)' : '\\/\\/.*$|\\/\\*.*?(?:\\*\\/|$)';
+  const html = /^(html|xml|svg|vue|svelte|jsx|tsx)$/.test(lang);
+  const re = new RegExp(`(${comment}${html ? '|<!--.*?(?:-->|$)' : ''})|("(?:\\\\.|[^"\\\\])*"?|'(?:\\\\.|[^'\\\\])*'?|\`(?:\\\\.|[^\`\\\\])*\`?)|(\\b\\d[\\w.]*\\b)|(${html ? '<\\/?[A-Za-z][\\w-]*|\\/?>|' : ''}[A-Za-z_$][\\w$]*)`, 'g');
+  const out: Line = [];
+  let last = 0;
+  for (const m of code.matchAll(re)) {
+    if (m.index! > last) out.push(run(code.slice(last, m.index), st.fg));
+    const [t, com, str, num, word] = m;
+    out.push(run(t, com ? st.dim : str ? st.ok : num ? st.warn : word && (word.startsWith('<') || word.endsWith('>')) ? st.accent : word && KEYWORDS.has(word) ? st.accent : st.fg));
+    last = m.index! + t.length;
+  }
+  if (last < code.length) out.push(run(code.slice(last), st.fg));
+  return out;
+}
+
+// Cuts a styled line into pieces of `width` cells, keeping every space (code and
+// ASCII art must not be re-flowed like prose).
+export function chunk(line: Line, width: number): Line[] {
+  const out: Line[] = [[]];
+  let w = 0;
+  for (const r of line) {
+    for (const ch of r.t) {
+      const cw = strWidth(ch);
+      if (w + cw > width && w > 0) out.push([]), (w = 0);
+      const cur = out.at(-1)!;
+      if (cur.at(-1)?.s === r.s) cur.at(-1)!.t += ch;
+      else cur.push({ t: ch, s: r.s });
+      w += cw;
+    }
+  }
+  return out;
+}
+
+// A fenced block: the language as a small label, then the code on a tinted
+// panel as wide as its longest line.
+function codeBlock(lines: string[], lang: string, width: number, st: Styles): Line[] {
+  const bg = st.mode === 'none' ? '' : st.panelBg;
+  const inner = Math.max(1, width - 2);
+  const pieces = lines.map((l) => chunk(highlight(l.replace(/\t/g, '  '), lang, st), inner)).flat();
+  const w = Math.min(inner, Math.max(lang.length, ...pieces.map(lineWidth)));
+  const out: Line[] = lang ? [[run(lang, st.dim)]] : [];
+  for (const p of pieces) out.push([run(' ', bg), ...p.map((r) => ({ t: r.t, s: bg + r.s })), run(' '.repeat(w - lineWidth(p) + 1), bg)]);
+  return out;
+}
+
+// ---- Light markdown ----
+
+// Replies: headings, bold, `code`, lists, quotes and fenced code blocks, wrapped
+// to `width` (prose by words; code by characters, keeping its spacing).
+export function markdown(text: string, st: Styles, width = MSG): Line[] {
   const out: Line[] = [];
-  let fence = false;
+  let fence: { lang: string; lines: string[] } | null = null;
   for (const raw of text.split('\n')) {
-    if (/^\s*```/.test(raw)) { fence = !fence; out.push([run(raw, st.dim)]); continue; }
-    if (fence) { out.push([run(raw, st.fg)]); continue; }
+    const f = /^\s*(```|~~~)\s*([\w+#.-]*)/.exec(raw);
+    if (f) {
+      if (fence) out.push(...codeBlock(fence.lines, fence.lang, width, st)), (fence = null);
+      else fence = { lang: f[2].toLowerCase(), lines: [] };
+      continue;
+    }
+    if (fence) {
+      fence.lines.push(raw);
+      continue;
+    }
     const h = /^#{1,6}\s+(.*)$/.exec(raw);
-    if (h) { out.push([run(h[1], st.titleB)]); continue; }
+    if (h) { out.push(...wrap([run(h[1], st.titleB)], width)); continue; }
     const li = /^(\s*)[-*+]\s+(.*)$/.exec(raw);
     const q = /^>\s?(.*)$/.exec(raw);
     const line: Line = [];
@@ -71,8 +143,10 @@ export function markdown(text: string, st: Styles): Line[] {
       else if (part.startsWith('`') && part.endsWith('`') && part.length > 2) line.push(run(part.slice(1, -1), st.title));
       else line.push(run(part, q ? st.dim : st.fg));
     }
-    out.push(line);
+    out.push(...wrap(line, width));
   }
+  // A block still streaming in shows as code already.
+  if (fence) out.push(...codeBlock(fence.lines, fence.lang, width, st));
   return out;
 }
 
@@ -121,7 +195,7 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
       return all(lines);
     }
     case 'reply':
-      return all(indent(markdown(splitToolCalls(item.text).text, st).flatMap((l) => wrap(l, Math.min(MSG, width - 2))), 2));
+      return all(indent(markdown(splitToolCalls(item.text).text, st, Math.min(MSG, width - 2)), 2));
     case 'tool': // the screen cuts it to width
       return all([[run('● ', st.accent), run(item.verb, st.titleB), ...(item.rest ? [run(' ' + item.rest, st.dim)] : []), ...(item.extra || [])]]);
     case 'cost': {

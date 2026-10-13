@@ -70,6 +70,10 @@ export async function startMock(o: MockOpts = {}) {
         chunk({ content: /declined/.test(last.content) ? 'Okay, I left it.' : 'Created index.html.' });
         return end('stop');
       }
+      if (/ascii cat/.test(JSON.stringify(last.content))) {
+        chunk({ content: 'Here you go:\n\n```\n   /\\_/\\\n  ( o.o )\n   > ^ <\n```\n\nAs code:\n\n```js\nconst cat = "meow"; // says hi\n```' });
+        return end('stop');
+      }
       chunk({ reasoning_content: 'Let me ' });
       chunk({ reasoning_content: 'think.' });
       chunk({ content: 'Hello ' });

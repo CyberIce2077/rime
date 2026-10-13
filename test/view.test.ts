@@ -36,3 +36,12 @@ test('tool calls written as text are caught until Rime has tools', () => {
   const r = renderItem({ kind: 'reply', text: qwen, done: true }, 80, st);
   assert.deepEqual(r.map(stripAnsi), ['  Let me look.']);
 });
+
+test('code blocks: no fences, a language label, spacing kept, long lines cut not re-flowed', () => {
+  const lines = renderItem({ kind: 'reply', text: 'A cat:\n\n```\n   /\\_/\\\n  ( o.o )\n```\n\n```js\nconst x = 1;\n```', done: true }, 80, st).map(stripAnsi);
+  assert.deepEqual(lines, ['  A cat:', '  ', '      /\\_/\\  ', '     ( o.o ) ', '  ', '  js', '   const x = 1; ']);
+  const long = renderItem({ kind: 'reply', text: '```\n' + 'x'.repeat(30) + '\n```', done: true }, 22, st).map(stripAnsi);
+  assert.deepEqual(long, ['   ' + 'x'.repeat(18) + ' ', '   ' + 'x'.repeat(12) + '       ']);
+  const open = renderItem({ kind: 'reply', text: 'Here:\n```py\nprint("hi")', done: false }, 80, st).map(stripAnsi);
+  assert.deepEqual(open, ['  Here:', '  py', '   print("hi") '], 'a block still streaming shows as code');
+});
