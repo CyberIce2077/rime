@@ -8,4 +8,5 @@ export default defineConfig({
   bundle: true,
   clean: true,
   banner: { js: '#!/usr/bin/env node' },
+  removeNodeProtocol: false, // node:sqlite only exists with the prefix
 });

@@ -155,28 +155,54 @@ function bytes(cmd: string, args: string[], timeout = 20000): Promise<{ code: nu
   });
 }
 
+// A folder's files, relative to it: through git when it's a repo (so .gitignore
+// holds), otherwise a walk that skips .git and node_modules.
+export function listFiles(dir: string, max = 20000): string[] {
+  const g = spawnSync('git', ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 64 << 20 });
+  if (g.status === 0) return g.stdout.split('\n').filter(Boolean).slice(0, max).sort();
+  // ponytail: outside git, .gitignore isn't read; only .git and node_modules are skipped.
+  const files: string[] = [];
+  const walk = (rel: string) => {
+    if (files.length >= max) return;
+    for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (e.name === '.git' || e.name === 'node_modules' || e.name === '.rime') continue;
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(r);
+      else files.push(r);
+    }
+  };
+  try {
+    walk('');
+  } catch {}
+  return files.sort();
+}
+
+// Fuzzy match for the @ picker: the query's letters in order; runs and word
+// starts score higher. Tries each place the first letter appears and keeps the
+// best. Returns the matched positions, or null.
+export function fuzzy(q: string, s: string): { score: number; marks: number[] } | null {
+  const ql = q.toLowerCase(), sl = s.toLowerCase();
+  let best: { score: number; marks: number[] } | null = null;
+  for (let from = sl.indexOf(ql[0]); from >= 0; from = sl.indexOf(ql[0], from + 1)) {
+    let i = 0, score = 0, last = -2; // -2: the first letter never counts as a run
+    const marks: number[] = [];
+    for (let j = from; j < sl.length && i < ql.length; j++) {
+      if (sl[j] !== ql[i]) continue;
+      score += last === j - 1 ? 3 : 1;
+      if (j === 0 || '/._-'.includes(sl[j - 1])) score += 2;
+      marks.push(j);
+      last = j;
+      i++;
+    }
+    if (i === ql.length && (!best || score > best.score + s.length * 0.01)) best = { score: score - s.length * 0.01, marks };
+  }
+  return best;
+}
+
 // The tree a folder is sent as: names and sizes, .gitignore respected (through
 // git when it's a repo), at most 200 entries.
 export function folderTree(dir: string) {
-  let files: string[] = [];
-  const g = spawnSync('git', ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 16 << 20 });
-  if (g.status === 0) files = g.stdout.split('\n').filter(Boolean);
-  else {
-    // ponytail: outside git, .gitignore isn't read; only .git and node_modules are skipped.
-    const walk = (rel: string) => {
-      if (files.length > 5000) return;
-      for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-        if (e.name === '.git' || e.name === 'node_modules') continue;
-        const r = rel ? `${rel}/${e.name}` : e.name;
-        if (e.isDirectory()) walk(r);
-        else files.push(r);
-      }
-    };
-    try {
-      walk('');
-    } catch {}
-  }
-  files.sort();
+  const files = listFiles(dir, 5000);
   const lines = [`${path.basename(dir)}/`];
   const seen = new Set<string>();
   let more = 0;
@@ -214,8 +240,15 @@ function readLike(text: string) {
 
 // A chip for one existing path. Videos fill in their frames in the background
 // (`onUpdate` redraws).
-export function chipFor(p: string, n: (k: Kind) => number, cwd: string, onUpdate: () => void): Chip {
+export function chipFor(p: string, n: (k: Kind) => number, cwd: string, onUpdate: () => void, lines?: [number, number]): Chip {
   const name = path.basename(p);
+  if (lines) {
+    // @src/signup.ts:30-60: only those lines, with their real numbers.
+    const all = fs.readFileSync(p, 'utf8').split('\n');
+    const [a, b] = [Math.max(1, lines[0]), Math.min(all.length, lines[1])];
+    const body = all.slice(a - 1, b).map((l, i) => `${String(a + i).padStart(5)}  ${l}`).join('\n');
+    return { kind: 'file', n: n('file'), name: `${name}:${a}-${b}`, path: p, lines: b - a + 1, text: body, tok: textTokens(body) };
+  }
   const st = fs.statSync(p);
   if (st.isDirectory()) {
     const t = folderTree(p);

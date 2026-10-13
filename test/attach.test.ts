@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { blocksFor, chipChar, chipFor, folderTree, imageSize, label, parts, pastedPaths, textChip, thumbSize } from '../src/core/attach.ts';
+import { blocksFor, chipChar, chipFor, folderTree, fuzzy, imageSize, label, listFiles, parts, pastedPaths, textChip, thumbSize } from '../src/core/attach.ts';
 import { offsetAt, prompt, styles } from '../src/core/view.ts';
 import { stripAnsi } from '../src/core/term.ts';
 import { toWire } from '../src/providers/openai.ts';
@@ -155,4 +155,15 @@ test('the prompt draws chips, the selection, and the line count in its frame', (
   const w = (c: string) => (c === ch ? 33 : undefined);
   assert.equal(offsetAt(p.rows[0], 10, w), 4);
   assert.equal(offsetAt(p.rows[0], 30, w), 5);
+});
+
+test('@ files: fuzzy matching and line ranges', () => {
+  assert.deepEqual(fuzzy('sig', 'src/signup.ts')!.marks, [4, 5, 6]);
+  assert.ok(fuzzy('sig', 'src/signup.ts')!.score > fuzzy('sig', 'docs/design/big.md')!.score, 'a run at a word start wins');
+  assert.equal(fuzzy('xyz', 'src/signup.ts'), null);
+  const dir = sandbox();
+  assert.deepEqual(listFiles(path.join(dir, 'v32')), ['README.md', 'src/encode.ts']);
+  const c = chipFor(path.join(dir, 'notes.md'), counter(), dir, () => {}, [30, 32]);
+  assert.equal(c.name, 'notes.md:30-32');
+  assert.equal(c.text, '   30  line 30\n   31  line 31\n   32  line 32');
 });

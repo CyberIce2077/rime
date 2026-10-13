@@ -267,6 +267,7 @@ export type PromptOpts = {
   sel?: [number, number]; // selected buffer range
   chip?: (ch: string) => { label: string; warn?: boolean } | undefined;
   near?: string; // the chip the caret is on
+  ghost?: string; // a suggestion shown dim after the text (tab or → takes it)
 };
 
 export type PromptView = { lines: string[]; cursor: { row: number; col: number }; rows: { start: number; text: string }[]; first: number; hits: Hit[] };
@@ -295,7 +296,8 @@ export function prompt(buf: string, cursor: number, width: number, maxRows: numb
       else text.push(run(ch, selected ? st.selection : st.title));
       at += ch.length;
     }
-    lines.push(str([run('│ ', border), ...fit([lead, ...text], inner, !buf), run(' │', border)], st));
+    if (o.ghost && buf && first + i === rows.length - 1) text.push(run(o.ghost, st.placeholder));
+    lines.push(str([run('│ ', border), ...fit([lead, ...text], inner, !buf || !!o.ghost), run(' │', border)], st));
   });
   // With more than one line the frame shows the count and the keys (clickable).
   const hits: Hit[] = [];

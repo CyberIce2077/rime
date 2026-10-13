@@ -4,8 +4,13 @@
 // (wheel, PgUp/PgDn), the boxes, prompt and status line are pinned to the bottom.
 // Models come from connected providers (docs/providers.md); /setup connects them.
 
-import { type Chip, type Kind, LONG_PASTE, blocksFor, chipChar, chipFor, clipboardImage, isChip, label, pastedPaths, textChip } from './attach.ts';
+import { type Chip, type Kind, LONG_PASTE, blocksFor, chipChar, chipFor, clipboardImage, fuzzy, isChip, label, listFiles, pastedPaths, textChip } from './attach.ts';
 import { copy } from './clipboard.ts';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
 import { createSettings, phrase } from './settings.ts';
 import { type Config, saveConfig } from './config.ts';
 import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader } from './header.ts';
@@ -20,7 +25,7 @@ import { connOf, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
 import { ApiError, type Block, type Conn, type Controls, type Effort, type Message, type Model, type Usage } from '../providers/types.ts';
 import { bar } from '../setup/loader.ts';
 import { createModelPicker, createServer, createSettingsPanel } from '../setup/panels.ts';
-import { ssh } from '../setup/ssh.ts';
+import { SSH_OPTS } from '../setup/ssh.ts';
 import { Cancelled, NAMES, type Run, runSteps } from '../setup/steps.ts';
 import { type Host, type Panel, type Tunnel, createSetup, createStopped } from '../setup/ui.ts';
 
@@ -45,6 +50,9 @@ const KEYS: [string, string][] = [
   ['↑', 'edit your last message'],
   ['tab', 'complete a command'],
   ['ctrl+v', 'paste an image from the clipboard (or drag in a file)'],
+  ['@', 'mention a file or folder'],
+  ['ctrl+r', 'search your earlier prompts'],
+  ['tab  →', 'take the suggestion shown in dim text'],
   ['ctrl+u ctrl+d', 'scroll the conversation up / down when the prompt is empty (also the mouse wheel)'],
   ['/', 'commands'],
   ['?', 'this list'],
@@ -88,7 +96,7 @@ export async function runApp(cfg: Config, version: string) {
   });
   let later: Model | null = null; // a model switch waiting for the next /clear
   const cwd = process.cwd();
-  const SYSTEM = system(cwd);
+  let SYSTEM = system(cwd);
 
   // ---- state ----
   let model: Model | undefined;
@@ -111,6 +119,11 @@ export async function runApp(cfg: Config, version: string) {
   let flash: { text: string; t: NodeJS.Timeout } | null = null;
   let lastClick = { t: 0, x: 0, y: 0 };
   let promptAt = { row: 0, first: 0, shown: 0, rows: [] as { start: number; text: string }[] }; // where the prompt's text is on screen
+  // Suggestions (SPEC §5.4), all from code: @ files, ctrl+r, ghost text.
+  let atPick: { start: number; sel: number } | null = null;
+  let rsearch: { q: string; i: number } | null = null;
+  let files: { list: string[]; recent: string[]; at: number } | null = null;
+  const usedFiles: string[] = []; // attached with @ in this session, shown first
   let boxKind: 'keys' | 'usage' | null = null;
   let panel: Panel | null = null;
   let busy: { abort(): void; esc(): void } | null = null;
@@ -120,6 +133,27 @@ export async function runApp(cfg: Config, version: string) {
   let bg: { name: string; run: Run; panel?: Panel; stopping?: boolean } | null = null; // an own server coming up in the background
   let waiting: { text: string; content: string | Block[] } | null = null; // a message held until the model is ready
   let promptRate: number | undefined; // local prompt tokens/s, from the last reply
+
+  // ---- saving (SPEC §16): every message is written the moment it exists ----
+  const project = projectOf(cwd);
+  const db: Db | null = await openDb().catch(() => null);
+  let convId: number | null = null; // created with the first message
+  let continuing: { title: string; at: number } | null = null; // reopened, nothing sent yet
+  let resumeOk = false; // the last reply was cut off by quitting: enter continues it
+  let live: { seq: number; text: () => string } | null = null; // the reply being streamed
+  let saveFailed = false;
+  const save = <T>(fn: (d: Db) => T): T | undefined => {
+    if (!db) return;
+    try {
+      return fn(db);
+    } catch (e) {
+      if (!saveFailed) (saveFailed = true), note(`Rime couldn't save this conversation: ${(e as Error).message}`, 'dim');
+    }
+  };
+  const conversation = () => (convId ??= save((d) => d.create(project, SYSTEM, model?.ref)) ?? null);
+  // An Anthropic effort-only system message is kept as one output_config block.
+  const store = (m: Message) => save((d) => d.append(conversation()!, m.role, m.role === 'system' ? [{ type: 'output_config', ...(m.output_config as object) }] : m.content)) ?? 0;
+  const prompts = () => [...history.slice().reverse(), ...(save((d) => d.prompts(project)) ?? [])].filter((p, i, a) => p.trim() && a.indexOf(p) === i);
 
   // ---- screen ----
   let scrollOff = 0; // transcript lines scrolled up from the bottom
@@ -151,8 +185,14 @@ export async function runApp(cfg: Config, version: string) {
   const tunnel = (name: string) => (tunnels[name] ??= { child: null, port: 0 });
 
   // Header line 2: the model and what was actually sent, or the compact loader.
+  const ago = (t: number) => {
+    const s = (Date.now() - t) / 1000;
+    return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : s < 86400 ? `${Math.floor(s / 3600)} h ago` : `${Math.floor(s / 86400)} days ago`;
+  };
   function headerInfo() {
-    if (!model) return { model: undefined, details: connected() ? 'no model selected' : 'no model connected' };
+    const cont = continuing ? `continuing "${continuing.title}" · ${ago(continuing.at)}` : '';
+    if (!model) return { model: undefined, details: cont || (connected() ? 'no model selected' : 'no model connected') };
+    if (cont && !bg) return { model: model.label, details: `${model.provider} · ${cont}` };
     const p = model.provider;
     if (bg && bg.name === p && !bg.run.state.done) {
       const s = bg.run.state;
@@ -287,10 +327,114 @@ export async function runApp(cfg: Config, version: string) {
   const blindNote = () => `${model?.label} can't see images${conn?.llamacpp ? ' (no mmproj loaded)' : ''}`;
   const hasMedia = (s: string) => [...s].some((ch) => media(chips.get(ch)));
 
+  // ---- suggestions (SPEC §5.4) ----
+
+  // Your earlier prompts, newest first: this session, then this project's saved ones.
+  let past: string[] = [];
+  const earlier = () => [...history].reverse().concat(past).filter((p, i, a) => !/[\ue000-\uf8ff]/.test(p) && a.indexOf(p) === i);
+  // Dim ghost text completing the line from an earlier prompt.
+  function ghost() {
+    if (panel || atPick || rsearch || boxKind || range() || cur !== buf.length || buf.length < 3 || buf.startsWith('/') || [...buf].some(isChip)) return '';
+    const low = buf.toLowerCase();
+    const h = earlier().find((p) => p.length > buf.length && p.toLowerCase().startsWith(low));
+    return h ? h.slice(buf.length) : '';
+  }
+  const rmatches = () => earlier().filter((p) => p.toLowerCase().includes(rsearch!.q.toLowerCase()));
+
+  // The project's files and folders for @, recently edited first; re-read every 30 s.
+  function projectFiles() {
+    if (files && Date.now() - files.at < 30000) return files;
+    const list = listFiles(project);
+    const dirs = [...new Set(list.flatMap((f) => f.split('/').slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join('/') + '/')))];
+    const mtime = (f: string) => {
+      try {
+        return fs.statSync(path.join(project, f)).mtimeMs;
+      } catch {
+        return 0;
+      }
+    };
+    const recent = list.length <= 20000 ? list.map((f) => [f, mtime(f)] as const).sort((a, b) => b[1] - a[1]).slice(0, 50).map(([f]) => f) : list.slice(0, 50);
+    files = { list: [...list, ...dirs].sort(), recent, at: Date.now() };
+    return files;
+  }
+  function atQuery() {
+    if (!atPick) return null;
+    const q = buf.slice(atPick.start + 1, cur);
+    if (buf[atPick.start] !== '@' || cur <= atPick.start || /\s/.test(q) || [...q].some(isChip)) return (atPick = null), null;
+    return q;
+  }
+  function atMatches(): { f: string; marks: number[] }[] {
+    const q = atQuery();
+    if (q === null) return [];
+    const name = q.split(':')[0];
+    const pf = projectFiles();
+    if (!name) return [...new Set([...usedFiles, ...pf.recent])].slice(0, 8).map((f) => ({ f, marks: [] }));
+    return pf.list
+      .map((f) => ({ f, m: fuzzy(name, f) }))
+      .filter((x) => x.m)
+      .sort((a, b) => b.m!.score + (usedFiles.includes(b.f) ? 2 : 0) - a.m!.score - (usedFiles.includes(a.f) ? 2 : 0))
+      .slice(0, 8)
+      .map((x) => ({ f: x.f, marks: x.m!.marks }));
+  }
+  // Attaches the picked file or folder as a chip; `@file:30-60` keeps those lines.
+  function takeAt(f: string) {
+    const q = atQuery() ?? '';
+    const lines = /:(\d+)(?:-(\d+))?$/.exec(q);
+    cut(atPick!.start, cur);
+    atPick = null;
+    try {
+      addChip(chipFor(path.join(project, f), nextN, cwd, schedule, lines && !f.endsWith('/') ? [+lines[1], +(lines[2] ?? lines[1])] : undefined));
+      usedFiles.splice(0, usedFiles.length, f, ...usedFiles.filter((x) => x !== f));
+    } catch (e) {
+      say(`can't read ${f}: ${(e as Error).message}`);
+    }
+  }
+
+  function suggestBox(width: number) {
+    const dim = (t: string) => ({ t, s: st.dim });
+    if (rsearch) {
+      const m = rmatches();
+      const at = m.length ? rsearch.i % m.length : 0;
+      const from = Math.max(0, Math.min(at - 2, m.length - 6));
+      return box([{ t: 'history search', s: st.accent }, dim(' · this project')], [
+        { line: [dim('search: '), { t: rsearch.q, s: st.title }, { t: '▏', s: st.accent }] },
+        ...(m.length ? m.slice(from, from + 6).map((p, i): BoxRow => listRow(p.replace(/\n/g, ' ⏎ '), '', from + i === at, st, undefined, width - 6)) : [{ line: [dim('no earlier prompt matches')] }]),
+        ...footRows(['', 'type to filter · ', 'ctrl+r', ' older · ', 'enter', ' use it · ', 'esc', ' cancel'], st),
+      ], width, st, st.accent, 'key:esc');
+    }
+    if (atPick && atQuery() !== null) {
+      const m = atMatches(), q = atQuery()!;
+      const rows: BoxRow[] = m.map((x, i) => {
+        const sel = i === atPick!.sel % m.length;
+        const name: Line = [...x.f].map((ch, j) => ({ t: ch, s: x.marks.includes(j) ? st.warn : sel ? st.accent : st.fg }));
+        return { line: [{ t: sel ? '› ' : '  ', s: st.accent }, ...name], bg: sel ? st.panelBg : undefined, hit: `at:${i}` };
+      });
+      return box([{ t: '@ files', s: st.accent }, dim(q ? ` · matching "${q}"` : ' · recent first')], [
+        ...(rows.length ? rows : [{ line: [dim('no file matches')] }]),
+        ...footRows(['↑ ↓', ' choose · ', 'tab', ' or ', 'enter', ' attach · ', 'esc', ' keep typing'], st),
+      ], width, st, st.accent, 'key:esc');
+    }
+    // A command's argument, once it's chosen: `/model ` lists the models Rime knows.
+    const arg = /^\/model\s+(\S*)$/.exec(buf);
+    if (arg) {
+      const refs = knownModels().filter((r) => r.toLowerCase().includes(arg[1].toLowerCase()));
+      sel = Math.min(sel, Math.max(0, refs.length - 1));
+      return box([{ t: '/model', s: st.accent }, dim(' · pick one, or enter with nothing opens the list')], [
+        ...(refs.length ? refs.map((r, i) => listRow(r, r === model?.ref ? [{ t: '● in use', s: st.ok }] : '', i === sel, st, `arg:${i}`, 40)) : [{ line: [dim('no model matches')] }]),
+        ...footRows(['↑ ↓', ' choose · ', 'enter', ' use it · ', 'esc', ' close'], st),
+      ], width, st, st.accent, 'key:esc');
+    }
+    if (/^\/connect\s+$/.test(buf)) return box('/connect', [{ line: [{ t: '<url> [name]', s: st.title }, dim('  a llama.cpp, Ollama, LM Studio or OpenAI-compatible server')] }], width, st);
+    return null;
+  }
+  const knownModels = () => [...new Set([model?.ref, cfg.model, ...Object.entries(cfg.providers).map(([n, p]) => (p.model ? `${n}/${p.model}` : undefined)), ...Object.keys(cfg.models)].filter((x): x is string => !!x))];
+
   // The preview above the prompt: a chip full size, under the mouse or at the
   // caret, else the "what gets sent" list when it's open.
   function chipBox(width: number) {
     if (panel || cmdsOpen() || boxKind) return null;
+    const sb = suggestBox(width);
+    if (sb) return sb;
     const id = big ?? hover ?? nearChip();
     const c = id ? chips.get(id) : undefined;
     if (c && id) {
@@ -317,11 +461,12 @@ export async function runApp(cfg: Config, version: string) {
     // The prompt grows to 10 rows (at most a third of the screen), then scrolls.
     const maxRows = Math.max(1, Math.min(10, Math.floor(height / 3), height - lines.length - 3 - (sent.length ? 1 : 0)));
     const p = prompt(buf, cur, width, maxRows, st, {
-      placeholder: panel?.placeholder?.() ?? undefined,
+      placeholder: panel?.placeholder?.() ?? (resumeOk ? 'enter continues the interrupted reply, or ask something new' : undefined),
       masked: panel?.masked?.() ?? false,
       sel: range() ?? undefined,
       chip: chipView,
       near: nearChip() ?? undefined,
+      ghost: ghost() || undefined,
     });
     const top = lines.length;
     lines.push(...p.lines);
@@ -620,9 +765,18 @@ export async function runApp(cfg: Config, version: string) {
     // effort-only system message, so the cache survives.
     if (conn.wire === 'anthropic' && c.effort !== (task.sentEffort ?? task.controls.effort) && messages.length) {
       messages.push({ role: 'system', content: [], output_config: { effort: c.effort ?? 'high' } });
+      store(messages.at(-1)!);
       task.sentEffort = c.effort;
     }
     messages.push({ role: 'user', content });
+    const userSeq = store(messages.at(-1)!);
+    continuing = null;
+    resumeOk = false;
+    let flush: NodeJS.Timeout | null = null;
+    const unsave = () => {
+      if (live) save((d) => d.remove(convId!, live!.seq));
+      save((d) => d.remove(convId!, userSeq));
+    };
 
     const thinking: Item = { kind: 'tool', verb: 'Thinking' };
     items.push(thinking);
@@ -655,7 +809,9 @@ export async function runApp(cfg: Config, version: string) {
     const m = model, cn = conn;
     const charge = () => {
       if (!usage) return;
-      items.push({ kind: 'cost', turn: meter.charge(usage, m.price, cn.local) });
+      const turn = meter.charge(usage, m.price, cn.local);
+      items.push({ kind: 'cost', turn });
+      save((d) => d.usage(convId!, turn.in + turn.out, turn.spent ?? 0, m.ref));
       if (cn.local && usage.promptMs && usage.input > 500) promptRate = usage.input / (usage.promptMs / 1000);
       // Measured, not assumed: a control change that collapses the cached prefix
       // marks that knob unsafe for this model.
@@ -682,16 +838,28 @@ export async function runApp(cfg: Config, version: string) {
           if (!reply) {
             clearInterval(spin);
             drop(thinking);
-            reply = { kind: 'reply', text: '', done: false };
+            const r: Extract<Item, { kind: 'reply' }> = { kind: 'reply', text: '', done: false };
+            reply = r;
             items.push(reply);
+            // The reply is stored while it streams (flushed about once a second), so
+            // quitting mid-reply keeps it, marked interrupted.
+            const seq = save((d) => d.append(convId!, 'assistant', [{ type: 'text', text: ev.text }], true));
+            if (seq) {
+              live = { seq, text: () => r.text };
+              flush = setInterval(() => save((d) => d.update(convId!, seq, [{ type: 'text', text: r.text }], true)), 1000);
+            }
           }
           reply.text += ev.text;
           schedule();
         }
       }
       if (reply) reply.done = true;
-      if (blocks.length) messages.push({ role: 'assistant', content: blocks });
-      else forget();
+      if (flush) clearInterval(flush);
+      if (blocks.length) {
+        messages.push({ role: 'assistant', content: blocks });
+        if (live) save((d) => d.update(convId!, live!.seq, blocks, false));
+        else store(messages.at(-1)!);
+      } else forget(), unsave();
       drop(thinking);
       const tc = reply ? splitToolCalls(reply.text).calls : [];
       if (tc.length) note(`${m.label.split(/[\s\d.]/)[0] || m.label} wanted to run ${tc.join(' and ')}. Rime can't run tools until Phase 4.`, 'dim');
@@ -701,14 +869,18 @@ export async function runApp(cfg: Config, version: string) {
     } catch (e) {
       drop(thinking);
       if (reply) reply.done = true;
+      if (flush) clearInterval(flush);
       if (ac.signal.aborted) {
-        if (reply?.text.trim()) messages.push({ role: 'assistant', content: [{ type: 'text', text: reply.text.trimEnd() }] });
-        else forget();
+        if (reply?.text.trim()) {
+          messages.push({ role: 'assistant', content: [{ type: 'text', text: reply.text.trimEnd() }] });
+          if (live) save((d) => d.update(convId!, live!.seq, messages.at(-1)!.content, false));
+        } else forget(), unsave();
         charge();
         note('stopped', 'dim');
       } else {
         if (messages.at(-1)?.role === 'assistant') messages.pop();
         forget();
+        unsave();
         const err = e as Error;
         note(
           err instanceof ApiError && (err.status === 401 || err.status === 403)
@@ -720,6 +892,8 @@ export async function runApp(cfg: Config, version: string) {
       }
     } finally {
       clearInterval(spin);
+      if (flush) clearInterval(flush);
+      live = null;
       if (busy === me) busy = null;
       schedule();
     }
@@ -730,7 +904,9 @@ export async function runApp(cfg: Config, version: string) {
   const host: Host & Parameters<typeof createServer>[0] & Parameters<typeof createModelPicker>[0] & Parameters<typeof createSettingsPanel>[0] = {
     st,
     cfg,
-    system: SYSTEM,
+    get system() {
+      return SYSTEM;
+    },
     redraw: () => schedule(),
     close: () => {
       panel = null;
@@ -816,6 +992,7 @@ export async function runApp(cfg: Config, version: string) {
 
   function submit() {
     const v = buf.trim();
+    if (!v && resumeOk && !busy) return void send('continue');
     if (!v) return;
     if (busy && !v.startsWith('/')) return; // one reply at a time; esc stops it
     // A model that can't see: ask before sending the text without the images.
@@ -837,7 +1014,15 @@ export async function runApp(cfg: Config, version: string) {
     }
     const [c, ...args] = v.split(/\s+/);
     boxKind = null;
-    if (c === '/model') panel = createModelPicker(host);
+    if (c === '/model' && args[0]) {
+      const refs = knownModels().filter((r) => r.toLowerCase().includes(args[0].toLowerCase()));
+      const ref = refs.includes(args[0]) ? args[0] : refs[Math.min(sel, refs.length - 1)];
+      if (ref) {
+        cfg.model = ref;
+        settings.save();
+        useRef(ref);
+      } else note(`No model matches ${args[0]}. /model lists them.`, 'dim');
+    } else if (c === '/model') panel = createModelPicker(host);
     else if (c === '/setup') panel = bg?.panel && !bg.run.state.done ? bg.panel : createSetup(host);
     else if (c === '/connect') panel = args[0] ? createSetup(host, 'connect', args[1], args[0]) : createSetup(host);
     else if (c === '/server') {
@@ -847,6 +1032,10 @@ export async function runApp(cfg: Config, version: string) {
     } else if (c === '/settings') panel = createSettingsPanel(host);
     else if (c === '/clear') {
       busy?.abort();
+      if (convId) save((d) => d.unlock(convId!));
+      convId = null;
+      continuing = null;
+      resumeOk = false;
       messages = [];
       task = null;
       items = [headerItem];
@@ -994,6 +1183,8 @@ export async function runApp(cfg: Config, version: string) {
       return;
     }
     if (id === 'sendlist') return void ((listPinned = !listPinned), (listOpen = listPinned));
+    if (id.startsWith('at:')) return takeAt(atMatches()[+id.slice(3)].f);
+    if (id.startsWith('arg:')) return void ((sel = +id.slice(4)), onKey({ type: 'key', name: 'enter' }));
     if (panel && (id.startsWith('pick:') || id.startsWith('step:'))) return panel.click?.(id);
     if (id.startsWith('cmd:')) {
       buf = matches()[+id.slice(4)][0];
@@ -1020,6 +1211,7 @@ export async function runApp(cfg: Config, version: string) {
     // is open or running, so one press never loses work (SPEC §5.2).
     if (k.ctrl && k.name === 'c') {
       if (panel) return panel.cancel ? panel.cancel() : host.close();
+      if (rsearch || atPick) return void (rsearch = atPick = null);
       if (boxKind) return void (boxKind = null);
       if (big || listPinned) return void ((big = null), (listPinned = listOpen = false));
       if (busy) busy.abort();
@@ -1049,6 +1241,37 @@ export async function runApp(cfg: Config, version: string) {
       if (k.name === 'enter' && !k.shift) return panel.submit?.(buf);
       if (!panel.typing?.()) return;
     }
+
+    // ctrl+r searches your earlier prompts; the typing goes to the search.
+    if (!panel && rsearch) {
+      const m = rmatches();
+      if (k.name === 'escape') rsearch = null;
+      else if (k.name === 'enter' || k.name === 'tab') {
+        const h = m[rsearch.i % Math.max(1, m.length)];
+        rsearch = null;
+        if (h) (buf = h), (cur = buf.length), (anchor = null);
+      } else if ((k.ctrl && k.name === 'r') || k.name === 'up') rsearch.i++;
+      else if (k.name === 'down') rsearch.i = Math.max(0, rsearch.i - 1);
+      else if (k.name === 'backspace') (rsearch.q = rsearch.q.slice(0, -1)), (rsearch.i = 0);
+      else if (k.name === 'space' || (k.name === 'char' && k.ch && !k.ctrl)) (rsearch.q += k.ch ?? ' '), (rsearch.i = 0);
+      return;
+    }
+    if (!panel && k.ctrl && k.name === 'r') return void ((rsearch = { q: '', i: 0 }), (atPick = null));
+    // The @ picker takes ↑ ↓, tab/enter and esc while it's open.
+    if (!panel && atPick && atQuery() !== null) {
+      const m = atMatches();
+      if (k.name === 'up' || k.name === 'down') return void (atPick.sel = (atPick.sel + (k.name === 'up' ? m.length - 1 : 1)) % Math.max(1, m.length));
+      if ((k.name === 'tab' || (k.name === 'enter' && !k.shift)) && m.length) return takeAt(m[atPick.sel % m.length].f);
+      if (k.name === 'escape') return void (atPick = null);
+    }
+    // `/model ` lists models; ↑ ↓ choose one.
+    if (!panel && /^\/model\s+\S*$/.test(buf) && (k.name === 'up' || k.name === 'down')) {
+      const n = Math.max(1, knownModels().filter((r) => r.toLowerCase().includes(buf.split(/\s+/)[1].toLowerCase())).length);
+      return void (sel = (sel + (k.name === 'down' ? 1 : n - 1)) % n);
+    }
+    // tab, or → at the end, takes the ghost text.
+    const g = ghost();
+    if (g && (k.name === 'tab' || (k.name === 'right' && !k.shift && !k.ctrl))) return insert(g);
 
     if (cmdsOpen()) {
       const m = matches();
@@ -1093,7 +1316,11 @@ export async function runApp(cfg: Config, version: string) {
         break;
       case 'char':
         if (k.ch === '?' && !buf && !panel) boxKind = 'keys';
-        else if (!k.alt && k.ch) insert(k.ch);
+        else if (!k.alt && k.ch) {
+          insert(k.ch);
+          // @ at the start or after a space opens the file picker (ana@larch.dev stays text).
+          if (k.ch === '@' && !panel && (cur === 1 || /\s/.test(buf[cur - 2]))) atPick = { start: cur - 1, sel: 0 };
+        }
         break;
       case 'space':
         insert(' ');
@@ -1234,21 +1461,56 @@ export async function runApp(cfg: Config, version: string) {
     if (inp.isTTY) inp.setRawMode(false);
   };
 
-  // Quitting runs each own server's onQuit (docs/providers.md §4.3): keep it
-  // running (default), stop the service, or power the machine off.
-  async function quit() {
+  // Quitting is instant at any moment (SPEC §16): everything is already saved,
+  // a reply being streamed is kept as interrupted, and each own server's onQuit
+  // (stop the service or power the machine off, docs/providers.md §4.3) runs in a
+  // detached child that finishes on its own and logs to ~/.rime/logs/.
+  function quit() {
     if (quitting) return;
-    busy?.abort();
+    quitting = 'bye';
+    if (live && convId) save((d) => d.update(convId!, live!.seq, [{ type: 'text', text: live!.text() }], true));
+    if (convId) save((d) => d.unlock(convId!));
     header?.close();
     for (const [name, p] of Object.entries(cfg.providers)) {
       if (!p.ssh || !p.onQuit || p.onQuit === 'keep' || !tunnels[name]?.port) continue;
       // ponytail: saving the slot before stopping arrives with token-kit.
-      quitting = p.onQuit === 'stop' ? `stopping llama-server on ${p.ssh}…` : `powering off ${p.ssh}…`;
-      schedule();
-      await ssh(p.ssh, p.onQuit === 'stop' ? 'sudo systemctl stop llama-server' : 'sudo poweroff', 8000);
+      const logs = path.join(os.homedir(), '.rime', 'logs');
+      fs.mkdirSync(logs, { recursive: true });
+      const log = fs.openSync(path.join(logs, 'quit.log'), 'a');
+      spawn('ssh', [...SSH_OPTS, p.ssh, p.onQuit === 'stop' ? 'sudo systemctl stop llama-server' : 'sudo poweroff'], { detached: true, stdio: ['ignore', log, log] }).unref();
     }
     restore();
     process.exit(0);
+  }
+
+  // Reopens this project's last conversation (SPEC §16): the exact messages, and
+  // the frozen prefix it was sent with when it's recent enough for the cache to hit.
+  function reopen(c: Conversation) {
+    convId = c.id;
+    if (c.prefix && Date.now() - c.updated < 86400000) SYSTEM = c.prefix;
+    else save((d) => d.setPrefix(c.id, SYSTEM));
+    const stored: Stored[] = save((d) => d.messages(c.id)) ?? [];
+    for (const m of stored) {
+      const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;
+      if (m.role === 'system') {
+        const { type: _, ...oc } = blocks[0] ?? {};
+        messages.push({ role: 'system', content: [], output_config: oc });
+        continue;
+      }
+      messages.push({ role: m.role, content: m.content });
+      if (m.role === 'user') {
+        const t = String(blocks.find((b) => b.type === 'text')?.text ?? '');
+        items.push({ kind: 'user', text: t });
+        history.push(t);
+      } else items.push({ kind: 'reply', text: blocks.filter((b) => b.type === 'text').map((b) => b.text).join('') + (m.interrupted ? '…' : ''), done: true });
+    }
+    if (!stored.length) return;
+    continuing = { title: c.title || 'untitled', at: c.updated };
+    const last = stored.at(-1)!;
+    if (last.interrupted || last.role === 'user') {
+      resumeOk = true;
+      items.push({ kind: 'lines', lines: [[{ t: '  ↻ ', s: st.warn }, { t: 'interrupted when you quit · nothing was lost · ', s: st.dim }, { t: 'enter', s: st.accentB }, { t: ' continue', s: st.dim }]] });
+    }
   }
 
   const parse = createParser();
@@ -1265,6 +1527,14 @@ export async function runApp(cfg: Config, version: string) {
   write(MODES_ON);
   playHeader(headerOpts);
   // First run: nothing connected, so setup opens by itself.
+  // `rime` reopens this project's last conversation; there are no sessions.
+  if (db) {
+    if (!db.wal) note("rime.db can't use WAL on this disk, so saving uses the default journal.", 'dim');
+    const { conv, busy: taken } = save((d) => d.last(project)) ?? { conv: null, busy: false };
+    if (taken) note('The last conversation here is open in another Rime window, so this is a new one.', 'dim');
+    else if (conv) reopen(conv);
+    past = save((d) => d.prompts(project)) ?? [];
+  }
   if (!connected()) panel = createSetup(host);
   else if (cfg.model) useRef(cfg.model, true);
   frame();

@@ -26,7 +26,7 @@ Its mascot is a pixel ice cube that freezes while your server starts up.
 
 ## Install
 
-Rime needs Node 22.6 or newer.
+Rime needs Node 22.13 or newer (for its built-in SQLite).
 
 ```sh
 git clone https://github.com/CyberIce2077/rime.git
@@ -81,6 +81,12 @@ rime connect http://localhost:8080 --name local
 | `/usage` | tokens, cost and cache savings |
 | `/clear` | start a new conversation |
 | `/exit` | quit |
+
+There are no sessions to manage: `rime` always reopens the project's last conversation,
+and everything is saved as it happens, so quitting is instant. `/clear` starts a new one.
+
+Type `@` to attach a project file, and earlier prompts come back as dim suggestions
+(`tab` takes one, `ctrl+r` searches them).
 
 Drag a file, folder, screenshot or video onto the terminal, or paste a long log, and it
 becomes a chip in the prompt. Put the cursor on a chip or point at it to see exactly what
