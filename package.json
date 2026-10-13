@@ -1,6 +1,6 @@
 {
   "name": "rime-cli",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "A minimal, token-frugal AI coding CLI for the terminal",
   "keywords": [
     "cli",
