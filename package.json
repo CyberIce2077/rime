@@ -1,0 +1,27 @@
+{
+  "name": "rime-cli",
+  "version": "0.1.0",
+  "description": "A minimal, token-frugal AI coding CLI for the terminal",
+  "type": "module",
+  "bin": {
+    "rime": "dist/rime.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "node --experimental-strip-types --no-warnings src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2"
+  }
+}
