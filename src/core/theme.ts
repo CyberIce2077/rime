@@ -25,6 +25,9 @@ export const blend = (fg: RGB, a: number, under: RGB): RGB =>
 // The prompt placeholder is dim at 70% opacity in the prototype.
 export const PLACEHOLDER = blend(GLACIER.dim, 0.7, GLACIER.bg);
 
+// Mouse selection highlight.
+export const SELECTION = blend(GLACIER.accent, 0.35, GLACIER.bg);
+
 export function colorMode(stream?: { isTTY?: boolean }): ColorMode {
   if (process.env.NO_COLOR || !(stream && stream.isTTY)) return 'none';
   const ct = (process.env.COLORTERM || '').toLowerCase();

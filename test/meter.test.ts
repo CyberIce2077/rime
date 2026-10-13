@@ -1,7 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMeter, fmt$, fmtT } from '../src/plugins/token-kit/meter.ts';
-import { MODELS } from '../src/core/models.ts';
 
 test('formats tokens and dollars like the design', () => {
   assert.equal(fmtT(716), '716');
@@ -14,7 +13,7 @@ test('formats tokens and dollars like the design', () => {
 
 test('charges a turn and counts what caching saved', () => {
   const m = createMeter();
-  const opus = MODELS.find((x) => x.id === 'claude-opus-5-5')!.price;
+  const opus = { in: 4, read: 0.2, write: 5, out: 20 };
   const turn = m.charge({ input_tokens: 80, cache_read_input_tokens: 16600, cache_creation_input_tokens: 1200, output_tokens: 716 }, opus);
   assert.equal(turn.in, 17880);
   assert.equal(turn.cached, 16600);

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createParser, fit, lineWidth, strWidth, truncAnsi, wrap } from '../src/core/term.ts';
+import { createParser, fit, lineWidth, sliceCols, strWidth, truncAnsi, wrap } from '../src/core/term.ts';
 
 test('width counts wide characters and skips escapes', () => {
   assert.equal(strWidth('\x1b[1mab\x1b[0m'), 2);
@@ -36,4 +36,10 @@ test('parser decodes keys, modified enter, mouse, paste and cursor reports', () 
   assert.deepEqual(p('\x1b[12;1R'), [{ type: 'cpr', row: 12, col: 1 }]);
   assert.deepEqual(p('\x1b[200~one\r\n'), []);
   assert.deepEqual(p('two\x1b[201~x'), [{ type: 'paste', text: 'one\r\ntwo' }, { type: 'key', name: 'char', ch: 'x' }]);
+});
+
+test('sliceCols cuts plain text by screen column', () => {
+  assert.equal(sliceCols('\x1b[1mhello\x1b[0m world', 2, 4), 'ell');
+  assert.equal(sliceCols('日本語', 3, 4), '本');
+  assert.equal(sliceCols('abc', 2, 99), 'bc');
 });

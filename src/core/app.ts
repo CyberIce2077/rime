@@ -5,15 +5,16 @@
 
 import { type Message, ApiError, createAccumulator, streamMessages } from './api.ts';
 import type { Config } from './config.ts';
-import { type Header, type HeaderOpts, cubeArea, mascotStyle, playHeader } from './header.ts';
-import { EFFORTS, MODELS, findModel } from './models.ts';
-import { type InputEvent, type Line, createParser, fit, lineWidth, strWidth, truncAnsi, wrap } from './term.ts';
+import { copy } from './clipboard.ts';
+import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader } from './header.ts';
+import { MODELS, type Model, findModel } from './models.ts';
+import { type InputEvent, type Line, createParser, fit, lineWidth, sliceCols, strWidth, truncAnsi, wrap } from './term.ts';
 import { colorMode } from './theme.ts';
 import { type BoxRow, type Hit, type Item, box, caretOf, footRows, layoutInput, listRow, prompt, renderItem, spaced, status, styles } from './view.ts';
 import { createMeter, fmt$, fmtT } from '../plugins/token-kit/meter.ts';
 
 const CMDS: [string, string][] = [
-  ['/model', 'switch model or effort'],
+  ['/model', 'choose a model'],
   ['/clear', 'start a new conversation'],
   ['/usage', 'token, cost and savings breakdown'],
   ['/exit', 'quit Rime'],
@@ -33,11 +34,11 @@ const system = (cwd: string) =>
 
 const fmtP = (n: number) => (Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`);
 
-// Modes: alternate screen, SGR mouse clicks and wheel, bracketed paste, kitty
+// Modes: alternate screen, SGR mouse (clicks, drags for selection, wheel), bracketed paste, kitty
 // keyboard (disambiguate) and xterm modifyOtherKeys so shift+enter is
 // distinguishable, accent cursor color.
-const MODES_ON = '\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[>4;1m\x1b]12;#7FD4F5\x07';
-const MODES_OFF = '\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b]112\x07\x1b[?25h\x1b[?1049l';
+const MODES_ON = '\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[>4;1m\x1b]12;#7FD4F5\x07';
+const MODES_OFF = '\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b]112\x07\x1b[?25h\x1b[?1049l';
 
 export async function runApp(cfg: Config, version: string) {
   const out = process.stdout, inp = process.stdin;
@@ -48,14 +49,12 @@ export async function runApp(cfg: Config, version: string) {
   const SYSTEM = system(cwd);
 
   // ---- state ----
-  let model = cfg.model, effort = cfg.effort;
-  let sessionEffort = effort; // top-level effort, fixed per conversation for the cache
-  let sentEffort = effort; // the effort the model was last told about
+  let model: Model | undefined = cfg.model;
   let messages: Message[] = [];
   const history: string[] = [];
   let buf = '', cur = 0, sel = 0;
   let boxKind: 'keys' | 'model' | 'usage' | null = null;
-  let modelSel = 0, effortSel = 0;
+  let modelSel = 0;
   let busy: AbortController | null = null;
   let quitArmed: NodeJS.Timeout | null = null;
 
@@ -68,12 +67,16 @@ export async function runApp(cfg: Config, version: string) {
   let scheduled = false;
   const cache = new WeakMap<Item, { width: number; lines: string[] }>();
 
-  const style = mascotStyle();
-  const cube = cubeArea(style);
-  const details = () => `${model.context} context · ${effort} effort`;
+  // Mouse selection, in screen cells. `rows` is what the last frame drew.
+  let press: { x: number; y: number; hit?: string } | null = null;
+  let selection: { a: { x: number; y: number }; b: { x: number; y: number } } | null = null;
+  let copied: NodeJS.Timeout | null = null;
+  let rows: string[] = [];
+
+  const details = () => (model ? `${model.context} context` : '');
   let header!: Header;
   const headerOpts: HeaderOpts & { ready: (h: Header) => void } = {
-    version, model: model.label, details: details(), cwd, mode: st.mode, interactive: false, style,
+    version, model: model?.label, details: details(), cwd, mode: st.mode, interactive: false,
     onFrame: () => schedule(),
     ready: (h) => (header = h),
   };
@@ -114,7 +117,7 @@ export async function runApp(cfg: Config, version: string) {
   const cmdsOpen = () => boxKind !== 'keys' && buf.startsWith('/') && !/\s/.test(buf);
 
   function usageRows(width: number): BoxRow[] {
-    const t = meter.tokens, c = meter.cost, p = model.price;
+    const t = meter.tokens, c = meter.cost, p = model?.price;
     const sp = meter.spent(), sv = meter.savedTotal();
     const savedCell = `${fmt$(sv)} (${meter.pct()}%)`;
     const data: [string, string, string][] = [
@@ -130,9 +133,10 @@ export async function runApp(cfg: Config, version: string) {
     const row = (label: Line, tok: string, cost: string, s: string): BoxRow => ({
       line: [...fit(label, inner - tw - cw - 2, true), { t: ' ' + tok.padStart(tw) + ' ' + cost.padStart(cw), s }],
     });
-    const why = `context re-read at ${fmtP(p.read)} instead of ${fmtP(p.in)}`;
+    const why = p ? `context re-read at ${fmtP(p.read)} instead of ${fmtP(p.in)}` : 'context re-read at the cache price';
+    const prices = p ? `Prices per million tokens: ${fmtP(p.in)} input, ${fmtP(p.read)} cache read, ${fmtP(p.write)} cache write, ${fmtP(p.out)} output. ` : '';
     const foot = wrap([
-      { t: `Without Rime this session would have cost ${fmt$(sp + sv)}. Prices per million tokens: ${fmtP(p.in)} input, ${fmtP(p.read)} cache read, ${fmtP(p.write)} cache write, ${fmtP(p.out)} output. `, s: st.dim },
+      { t: `Without Rime this session would have cost ${fmt$(sp + sv)}. ${prices}`, s: st.dim },
       { t: '/usage', s: st.accent },
       { t: ' or a click on the meter closes this.', s: st.dim },
     ], inner);
@@ -164,16 +168,12 @@ export async function runApp(cfg: Config, version: string) {
       return box('shortcuts', [...KEYS.map(([k, h]) => listRow(k, h, false, st)), ...footRows('any key to close', st)], width, st);
     }
     if (boxKind === 'model') {
-      const rows = MODELS.map((m, i) =>
-        listRow(m.label, `${m.context} context · ${fmtP(m.price.in)} / ${fmtP(m.price.out)} per M tokens`, i === modelSel, st, `model:${i}`));
-      const eff: Line = [{ t: '  effort'.padEnd(15), s: st.title }];
-      EFFORTS.forEach((e, i) => {
-        if (i) eff.push({ t: ' · ', s: st.dim });
-        eff.push({ t: e, s: i === effortSel ? st.accentB : st.dim });
-      });
-      return box('model', [...rows, { line: eff }, ...footRows('↑↓ model · ←→ effort · ↵ select · esc close', st)], width, st);
+      const rows = MODELS.length
+        ? MODELS.map((m, i) => listRow(m.label, `${m.context} context · ${fmtP(m.price.in)} / ${fmtP(m.price.out)} per M tokens`, i === modelSel, st, `model:${i}`))
+        : [{ line: [{ t: '  no models yet', s: st.dim }] }];
+      return box('model', [...rows, ...footRows('↑↓ choose · ↵ select · esc close', st)], width, st);
     }
-    if (boxKind === 'usage') return box(`usage · this session · ${model.label}`, usageRows(width), width, st);
+    if (boxKind === 'usage') return box(`usage · this session${model ? ` · ${model.label}` : ''}`, usageRows(width), width, st);
     return null;
   }
 
@@ -192,6 +192,7 @@ export async function runApp(cfg: Config, version: string) {
 
     let left: Line, leftHits: Hit[] = [];
     if (quitArmed) left = [{ t: 'press ctrl+c again to quit', s: st.dim }];
+    else if (copied) left = [{ t: '✓', s: st.ok }, { t: ' copied to clipboard', s: st.dim }];
     else if (scrollOff > 0) {
       left = [{ t: '↓', s: st.accentB }, { t: ` ${scrollOff} lines below · pgdn`, s: st.dim }];
       leftHits = [{ x0: 1, x1: lineWidth(left), id: 'bottom' }];
@@ -229,15 +230,49 @@ export async function runApp(cfg: Config, version: string) {
     scrollOff = Math.max(0, Math.min(scrollOff, lines.length - viewH));
     const start = Math.max(0, lines.length - viewH - scrollOff);
     const view = lines.slice(start, start + viewH);
-    const rows = [...view, ...new Array(viewH - view.length).fill(''), ...u.lines];
+    const screen = [...view, ...new Array(viewH - view.length).fill(''), ...u.lines];
     headerRow = items[0] === headerItem ? 2 - start : -99;
     hits = u.rowHits.flatMap((hs, i) => hs.map((h) => ({ ...h, row: viewH + 1 + i })));
+    rows = screen.map((l) => truncAnsi(l, width));
     write(
       '\x1b[?2026h\x1b[?25l' +
       // Clear first: erasing after a full-width line would eat its last cell.
-      rows.map((l, i) => `\x1b[${i + 1};1H\x1b[2K${truncAnsi(l, width)}${st.reset}`).join('') +
+      rows.map((l, i) => `\x1b[${i + 1};1H\x1b[2K${l}${st.reset}`).join('') +
+      selectionSpans(width).map(({ y, x0, x1 }) => `\x1b[${y};${x0}H${st.selection}${sliceCols(rows[y - 1], x0, x1).padEnd(x1 - x0 + 1)}${st.reset}`).join('') +
       `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h\x1b[?2026l`,
     );
+  }
+
+  // The selected cells per screen row, from the anchor to the pointer in reading
+  // order. The mascot is never part of it: on header rows only the info text beside
+  // him counts, like the logo in Claude Code.
+  const infoCol = 3 + SCENE.COLS;
+  function selectionSpans(width: number) {
+    if (!selection) return [];
+    let { a, b } = selection;
+    if (b.y < a.y || (b.y === a.y && b.x < a.x)) [a, b] = [b, a];
+    const headerLines = items[0] === headerItem ? 3 : 0;
+    const spans: { y: number; x0: number; x1: number }[] = [];
+    for (let y = a.y; y <= b.y; y++) {
+      const onHeader = y >= headerRow && y < headerRow + headerLines;
+      const x0 = Math.max(y === a.y ? a.x : 1, onHeader ? infoCol : 1);
+      const x1 = y === b.y ? b.x : width;
+      if (onHeader && sliceCols(rows[y - 1] || '', infoCol, width).trim() === '') continue; // mascot-only row
+      if (x0 <= x1) spans.push({ y, x0, x1 });
+    }
+    return spans;
+  }
+
+  function copySelection() {
+    const text = selectionSpans(W()).map(({ y, x0, x1 }) => sliceCols(rows[y - 1] || '', x0, x1).trimEnd()).join('\n')
+      .replace(/^\n+|\n+$/g, '');
+    if (!text.trim()) return;
+    copy(text, write);
+    if (copied) clearTimeout(copied);
+    copied = setTimeout(() => {
+      copied = null;
+      schedule();
+    }, 1500);
   }
 
   const schedule = () => {
@@ -257,17 +292,15 @@ export async function runApp(cfg: Config, version: string) {
   async function send(text: string) {
     items.push({ kind: 'user', text });
     history.push(text);
+    if (!model) {
+      items.push({ kind: 'note', tone: 'warn', text: MODELS.length ? 'No model selected. Pick one with /model.' : 'No model selected. No models are set up yet.' });
+      return schedule();
+    }
     if (!cfg.apiKey) {
       items.push({ kind: 'note', tone: 'warn', text: 'No API key. Set ANTHROPIC_API_KEY, or put {"apiKey": "sk-ant-…"} in ~/.rime/config.' });
       return schedule();
     }
-    // Per-message effort keeps the cached prefix intact (beta, SPEC §6).
     const betas = ['server-side-fallback-2026-07-01'];
-    if (effort !== sentEffort) {
-      messages.push({ role: 'system', content: [], output_config: { effort } });
-      sentEffort = effort;
-    }
-    if (messages.some((m) => m.role === 'system')) betas.push('mid-conversation-output-config-2026-07-01');
     messages.push({ role: 'user', content: text });
 
     const thinking: Item = { kind: 'tool', verb: 'Thinking' };
@@ -283,7 +316,7 @@ export async function runApp(cfg: Config, version: string) {
 
     const acc = createAccumulator();
     let reply: Extract<Item, { kind: 'reply' }> | null = null;
-    let used = model;
+    let used: Model = model;
     const charge = () => {
       if (acc.usage.input_tokens !== undefined) items.push({ kind: 'cost', turn: meter.charge(acc.usage, used.price) });
     };
@@ -301,12 +334,11 @@ export async function runApp(cfg: Config, version: string) {
           max_tokens: 64000,
           system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
           messages,
-          output_config: { effort: sessionEffort },
           cache_control: { type: 'ephemeral' },
           fallbacks: 'default',
         },
       })) {
-        if (ev.type === 'message_start' && ev.message?.model) used = findModel(ev.message.model) ?? model;
+        if (ev.type === 'message_start' && ev.message?.model) used = findModel(ev.message.model) ?? used;
         const delta = acc.add(ev);
         if (!delta) continue;
         if (!reply) {
@@ -355,13 +387,11 @@ export async function runApp(cfg: Config, version: string) {
   // ---- commands ----
 
   function applyModel() {
-    model = MODELS[modelSel];
-    effort = EFFORTS[effortSel];
-    if (!messages.length) sessionEffort = sentEffort = effort;
-    headerOpts.model = model.label;
+    model = MODELS[modelSel] ?? model;
+    headerOpts.model = model?.label;
     headerOpts.details = details();
     header.redraw();
-    items.push({ kind: 'tool', verb: 'Model', rest: `${model.label} · ${effort} effort` });
+    items.push({ kind: 'tool', verb: 'Model', rest: model?.label ?? 'none' });
     boxKind = null;
   }
 
@@ -379,13 +409,11 @@ export async function runApp(cfg: Config, version: string) {
     const c = v.split(/\s+/)[0];
     if (c === '/model') {
       boxKind = 'model';
-      modelSel = MODELS.indexOf(model);
-      effortSel = EFFORTS.indexOf(effort);
+      modelSel = model ? MODELS.indexOf(model) : 0;
     } else if (c === '/clear') {
       busy?.abort();
       messages = [];
       items = [headerItem];
-      sessionEffort = sentEffort = effort;
       boxKind = null;
       scrollOff = 0;
       return;
@@ -499,9 +527,7 @@ export async function runApp(cfg: Config, version: string) {
       }
     }
     if (boxKind === 'model') {
-      if (k.name === 'up' || k.name === 'down') modelSel = (modelSel + (k.name === 'down' ? 1 : -1) + MODELS.length) % MODELS.length;
-      else if (k.name === 'left') effortSel = Math.max(0, effortSel - 1);
-      else if (k.name === 'right') effortSel = Math.min(EFFORTS.length - 1, effortSel + 1);
+      if ((k.name === 'up' || k.name === 'down') && MODELS.length) modelSel = (modelSel + (k.name === 'down' ? 1 : -1) + MODELS.length) % MODELS.length;
       else if (k.name === 'enter') applyModel();
       else if (k.name === 'escape') boxKind = null;
       return;
@@ -592,17 +618,29 @@ export async function runApp(cfg: Config, version: string) {
 
   function onEvent(ev: InputEvent) {
     if (ev.type === 'mouse') {
-      if (ev.button === 64 || ev.button === 65) scrollOff += ev.button === 64 ? 3 : -3; // wheel
-      else if (!ev.release && ev.button === 0) {
-        const onCube = ev.x >= cube.x0 && ev.x <= cube.x1 && ev.y >= headerRow + cube.y0 && ev.y <= headerRow + cube.y1;
-        const h = hits.find((h) => h.row === ev.y && ev.x >= h.x0 && ev.x <= h.x1);
+      const at = { x: ev.x, y: ev.y };
+      if (ev.button === 64 || ev.button === 65) {
+        scrollOff += ev.button === 64 ? 3 : -3; // wheel
+        selection = null;
+      } else if (ev.button === 0 && !ev.release) {
+        // Press: start a selection, blink if it's on him.
+        selection = null;
+        press = { ...at, hit: hits.find((h) => h.row === ev.y && ev.x >= h.x0 && ev.x <= h.x1)?.id };
+        const onCube = ev.x >= CUBE_COLS[0] && ev.x <= CUBE_COLS[1] && ev.y >= headerRow && ev.y < headerRow + 3;
         if (onCube && ev.y <= viewH) header.blink();
-        else if (h) act(h.id);
+      } else if (ev.button === 32 && press) {
+        // Drag with the left button held.
+        if (at.x !== press.x || at.y !== press.y || selection) selection = { a: press, b: at };
+      } else if (ev.button === 0 && ev.release && press) {
+        if (selection) copySelection();
+        else if (press.hit) act(press.hit); // a plain click
+        press = null;
       }
     } else if (ev.type === 'paste') {
       if (boxKind === 'keys' || boxKind === 'model') boxKind = null;
       insert(ev.text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, ''));
     } else if (ev.type === 'key') {
+      selection = null;
       if (ev.name === 'pageup' || ev.name === 'pagedown') scrollOff += (ev.name === 'pageup' ? 1 : -1) * Math.max(1, viewH - 2);
       else onKey(ev);
     }

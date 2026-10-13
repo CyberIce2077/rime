@@ -1,7 +1,7 @@
 // Pure rendering: transcript items, boxes, the prompt and the status line,
 // translated cell by cell from reference/rime-prototype.html.
 
-import { type ColorMode, type RGB, GLACIER, PLACEHOLDER, RESET, sgr } from './theme.ts';
+import { type ColorMode, type RGB, GLACIER, PLACEHOLDER, RESET, SELECTION, sgr } from './theme.ts';
 import { type Line, type Run, fit, lineWidth, serialize, strWidth, wrap } from './term.ts';
 import type { Turn } from '../plugins/token-kit/meter.ts';
 import { fmt$, fmtT } from '../plugins/token-kit/meter.ts';
@@ -18,6 +18,7 @@ export function styles(mode: ColorMode) {
     fg: c(G.fg), title: c(G.title), titleB: b + c(G.title), accent: c(G.accent), accentB: b + c(G.accent),
     dim: c(G.dim), ok: c(G.ok), del: c(G.del), warn: c(G.warn), line: c(G.line),
     bold: b, placeholder: c(PLACEHOLDER), panelBg: sgr(G.panel, true, mode),
+    selection: mode === 'none' ? '\x1b[7m' : sgr(SELECTION, true, mode) + c(G.title),
   };
 }
 

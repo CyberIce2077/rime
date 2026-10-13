@@ -25,19 +25,25 @@ type Rnd = () => number;
 type Flake = { c: number; r: number; b?: boolean; cap?: boolean };
 export type SnowState = { near: Flake[]; far: Flake[]; heights: number[]; cap: number[] };
 
-// Picks where the snow ends up for one run, keeping the same overall shape:
-// - ground: always one pixel in front of him (so his eyes stay clear), drifts of
-//   one or two beside him, and the outer edges either bare or lightly dusted;
-// - cap: a bumpy layer across the top of his head, at least three pixels wide.
+// Most snow each spot can hold: one block in front of him (so his eyes stay
+// clear), drifts of up to two beside him, a dusting at the outer edges, and a
+// single bumpy layer on his head.
+const GROUND_MAX = [1, 2, 2, 1, 1, 1, 1, 1, 1, 2, 2, 1];
+const CAP_MAX = [0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0];
+
+// Picks where the snow ends up for one run: 5 to 20 blocks (2026-10-13),
+// each landing on a random spot that still has room.
 export function snowShape(rnd: Rnd) {
-  const pick = (a: number, b: number) => a + Math.floor(rnd() * (b - a + 1));
-  const ground = [pick(0, 1), pick(1, 2), pick(1, 2), 1, 1, 1, 1, 1, 1, pick(1, 2), pick(1, 2), pick(0, 1)];
-  const head = [3, 4, 5, 6, 7, 8];
-  let cap: number[];
-  do {
-    cap = new Array(SCENE.COLS).fill(0);
-    for (const c of head) cap[c] = rnd() < 0.7 ? 1 : 0;
-  } while (cap.reduce((a, b) => a + b) < 3);
+  const ground = new Array(SCENE.COLS).fill(0), cap = new Array(SCENE.COLS).fill(0);
+  for (let n = 5 + Math.floor(rnd() * 16); n > 0; n--) {
+    const open: { pile: number[]; c: number }[] = [];
+    for (let c = 0; c < SCENE.COLS; c++) {
+      if (ground[c] < GROUND_MAX[c]) open.push({ pile: ground, c });
+      if (cap[c] < CAP_MAX[c]) open.push({ pile: cap, c });
+    }
+    const spot = open[Math.floor(rnd() * open.length)];
+    spot.pile[spot.c]++;
+  }
   return { ground, cap };
 }
 
@@ -146,24 +152,15 @@ export function scenePixels(state: SnowState, blinking = false) {
   return g;
 }
 
-// How the pixels are drawn. 'blocks': two pixel rows per line with half blocks
-// (3 lines). 'cells': each pixel is two colored spaces (6 lines), for terminals
-// that draw ▀/▄ from the font with an offset, which stripes the mascot.
-export type MascotStyle = 'blocks' | 'cells';
-
-export function mascotStyle(env = process.env): MascotStyle {
-  if (env.RIME_MASCOT === 'cells' || env.RIME_MASCOT === 'blocks') return env.RIME_MASCOT;
-  return env.TERM_PROGRAM === 'Apple_Terminal' ? 'cells' : 'blocks';
-}
-
-function cellLines(g: (RGB | null)[][], mode: ColorMode) {
-  return g.map((row) => row.map((p) => {
-    if (mode === 'none') return p && p !== PALETTE.D ? '██' : '  ';
-    return p ? sgr(p, true, mode) + '  ' : RESET(mode) + '  ';
-  }).join('') + RESET(mode));
-}
+const same = (a: RGB | null, b: RGB | null) => (a && b ? a.join() === b.join() : a === b);
 
 // Two pixel rows per terminal line using half blocks.
+//
+// Fonts don't always fill the cell with block glyphs: in Terminal.app with SF Mono
+// a 14px cell shows ▄ on rows 8–12 and only half of row 13, which left a faint line
+// under every lower pixel. An underline is drawn on exactly that last row in the
+// text colour, so ▄ + underline fills the bottom of the cell solidly. Every cell is
+// therefore a solid background (the top pixel) with a solid lower part on top.
 function pixelLines(g: (RGB | null)[][], mode: ColorMode) {
   const out: string[] = [];
   for (let y = 0; y < g.length; y += 2) {
@@ -174,10 +171,9 @@ function pixelLines(g: (RGB | null)[][], mode: ColorMode) {
         // Monochrome: everything solid except the eyes and empty sky.
         const on = (p: RGB | null) => p && p !== PALETTE.D;
         line += on(top) && on(bot) ? '█' : on(top) ? '▀' : on(bot) ? '▄' : ' ';
-      } else if (!top && !bot) line += RESET(mode) + ' ';
-      else if (top && !bot) line += RESET(mode) + sgr(top, false, mode) + '▀';
-      else if (!top && bot) line += RESET(mode) + sgr(bot, false, mode) + '▄';
-      else line += sgr(top!, false, mode) + sgr(bot!, true, mode) + '▀';
+      } else if (same(top, bot)) line += RESET(mode) + (top ? sgr(top, true, mode) : '') + ' ';
+      else if (!bot) line += RESET(mode) + sgr(top!, false, mode) + '▀'; // only while snow falls
+      else line += RESET(mode) + (top ? sgr(top, true, mode) : '') + sgr(bot, false, mode) + '\x1b[4m▄';
     }
     out.push(line + RESET(mode));
   }
@@ -201,42 +197,31 @@ export type HeaderOpts = {
   interactive?: boolean;
   interval?: number;
   onKey?: (s: string) => void;
-  style?: MascotStyle;
   // Rime addition: when the app owns the screen, it repaints on each frame instead
   // of the header writing to the terminal itself.
   onFrame?: () => void;
 };
 
 function infoLines(opts: HeaderOpts, mode: ColorMode) {
-  const { version = '0.1.0', model = 'Opus 5.5', details = '1M context · high effort', cwd = process.cwd() } = opts;
+  const { version = '0.1.0', model, details, cwd = process.cwd() } = opts;
   const c = (rgb: RGB) => sgr(rgb, false, mode);
   const R = RESET(mode);
   return [
     `${BOLD(mode)}${c(TEXT.title)}Rime${R} ${c(TEXT.dim)}v${version}${R}`,
-    `${c(TEXT.accent)}${model}${R} ${c(TEXT.dim)}· ${details}${R}`,
+    model ? `${c(TEXT.accent)}${model}${R}${details ? ` ${c(TEXT.dim)}· ${details}${R}` : ''}` : `${c(TEXT.dim)}no model selected${R}`,
     `${c(TEXT.dim)}${tildify(cwd)}${R}`,
   ];
 }
 
-// The header lines for one snow state (the settled scene by default): three with
-// half blocks, six with cells, the info lines beside his body.
+// The three header lines for one snow state (the settled scene by default).
 export function renderHeader(opts: HeaderOpts = {}, state = settledSnow(opts.seed), blinking = false) {
   const mode = opts.mode || colorMode(opts.stream || process.stdout);
   const info = infoLines(opts, mode);
-  const g = scenePixels(state, blinking);
-  if ((opts.style || mascotStyle()) === 'blocks') return pixelLines(g, mode).map((a, i) => ` ${a} ${info[i]}`);
-  return cellLines(g, mode).map((a, i) => ` ${a} ${info[i - 2] ?? ''}`.trimEnd());
+  return pixelLines(scenePixels(state, blinking), mode).map((a, i) => ` ${a} ${info[i]}`);
 }
 
-// Where his body is: 1-based columns (one leading space, then the scene) and
-// line offsets from the header's first line.
-export function cubeArea(style: MascotStyle) {
-  const w = style === 'cells' ? 2 : 1;
-  return {
-    x0: 2 + w * SCENE.SX, x1: 1 + w * (SCENE.SX + SPRITE[0].length),
-    y0: style === 'cells' ? SCENE.SY : 0, y1: style === 'cells' ? SCENE.SY + SPRITE.length - 1 : 2,
-  };
-}
+// Terminal columns (1-based) covered by his body: one leading space, then the scene.
+export const CUBE_COLS = [2 + SCENE.SX, 1 + SCENE.SX + SPRITE[0].length];
 
 export type Header = { blink(): void; close(): void; redraw(): void; lines(): string[] };
 
@@ -269,8 +254,7 @@ export function playHeader(opts: HeaderOpts & { ready?: (h: Header) => void } = 
   let first = true;
   let timer: NodeJS.Timeout | undefined;
 
-  const style = opts.style || mascotStyle();
-  const lines = () => renderHeader({ ...opts, mode, style }, state(), Date.now() < blinkUntil);
+  const lines = () => renderHeader({ ...opts, mode }, state(), Date.now() < blinkUntil);
 
   const draw = () => {
     const ls = lines();
@@ -299,11 +283,10 @@ export function playHeader(opts: HeaderOpts & { ready?: (h: Header) => void } = 
     const s = buf.toString('utf8');
     if (s === '\x03') { close(); process.exit(130); }
     const cpr = /\x1b\[(\d+);(\d+)R/.exec(s);
-    if (cpr && !headerRow) headerRow = Number(cpr[1]) - lines().length;
-    const cube = cubeArea(style);
+    if (cpr && !headerRow) headerRow = Number(cpr[1]) - 3;
     for (const m of s.matchAll(/\x1b\[<(\d+);(\d+);(\d+)M/g)) {
       const [button, x, y] = [Number(m[1]), Number(m[2]), Number(m[3])];
-      const onCube = x >= cube.x0 && x <= cube.x1 && y >= headerRow + cube.y0 && y <= headerRow + cube.y1;
+      const onCube = x >= CUBE_COLS[0] && x <= CUBE_COLS[1] && y >= headerRow && y < headerRow + 3;
       if (button === 0 && headerRow > 0 && onCube) blink();
     }
     if (opts.onKey) opts.onKey(s);

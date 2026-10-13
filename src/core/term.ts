@@ -210,3 +210,14 @@ export function truncAnsi(s: string, width: number): string {
   }
   return out;
 }
+
+// The plain text covering display columns [from, to] (1-based, inclusive).
+export function sliceCols(s: string, from: number, to: number): string {
+  let out = '', col = 1;
+  for (const ch of stripAnsi(s)) {
+    if (col >= from && col <= to) out += ch;
+    col += cpWidth(ch.codePointAt(0)!);
+    if (col > to) break;
+  }
+  return out;
+}

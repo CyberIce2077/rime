@@ -23,8 +23,7 @@ Set ANTHROPIC_API_KEY, or put {"apiKey": "sk-ant-…"} in ~/.rime/config.`);
     process.exit(1);
   }
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    const details = `${cfg.model.context} context · ${cfg.effort} effort`;
-    console.log(['', ...renderHeader({ version: pkg.version, model: cfg.model.label, details }), ''].join('\n'));
+    console.log(['', ...renderHeader({ version: pkg.version, model: cfg.model?.label, details: cfg.model && `${cfg.model.context} context` }), ''].join('\n'));
     console.error('rime: needs an interactive terminal');
     process.exit(1);
   }
