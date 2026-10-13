@@ -57,3 +57,19 @@ test('titles are the first line, trimmed by code', () => {
   assert.equal(titleOf('see  here'), 'see  here');
   assert.ok(titleOf('word '.repeat(30)).length <= 60);
 });
+
+test('a conversation can be renamed and deleted from the list', async () => {
+  const db = await openDb(tmp());
+  const a = db.create('/p', 'P'), b = db.create('/p', 'P');
+  db.append(a, 'user', 'first one');
+  db.append(b, 'user', 'second one');
+  db.rename(a, 'Kernel review');
+  assert.equal(db.get(a)!.title, 'Kernel review');
+  db.append(a, 'user', 'more');
+  assert.equal(db.get(a)!.title, 'Kernel review', 'a new message keeps your title');
+  db.delete(b);
+  assert.equal(db.get(b), undefined);
+  assert.deepEqual(db.messages(b), []);
+  assert.deepEqual(db.list('/p').map((c) => c.id), [a]);
+  db.close();
+});

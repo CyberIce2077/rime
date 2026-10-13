@@ -66,6 +66,40 @@ export async function startMock(o: MockOpts = {}) {
         else chunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'write', arguments: JSON.stringify(args) } }] });
         return end(o.xmlTools ? 'stop' : 'tool_calls');
       }
+      // "list slowly": thinks for a moment, then runs ls; a message you queued meanwhile
+      // arrives after the tool result, and the reply echoes it.
+      if (body.tools && last.role === 'user' && /list slowly/.test(JSON.stringify(last.content))) {
+        for (let k = 0; k < 6; k++) {
+          chunk({ reasoning_content: 'looking ' });
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        chunk({ tool_calls: [{ index: 0, id: 'call_4', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'ls' }) } }] });
+        return end('tool_calls');
+      }
+      if (body.tools && last.role === 'user' && body.messages.at(-2)?.role === 'tool') {
+        chunk({ content: `Listed. Got your note: ${typeof last.content === 'string' ? last.content : JSON.stringify(last.content)}` });
+        return end('stop');
+      }
+      // "clean the build": a guarded command (rm -rf), asked with two options only.
+      if (body.tools && last.role === 'user' && /clean the build/.test(JSON.stringify(last.content))) {
+        chunk({ tool_calls: [{ index: 0, id: 'call_2', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'rm -rf build' }) } }] });
+        return end('tool_calls');
+      }
+      // "which stack": the ask tool, a question with options.
+      if (body.tools && last.role === 'user' && /which stack/.test(JSON.stringify(last.content))) {
+        const args = { question: 'What does "still on GPU" mean for you?', options: [{ label: 'Same file, your own CUDA kernel', detail: 'MX-compat gives the layout; you write the GPU decode later' }, { label: 'Same file consumed by existing stacks', detail: 'llama.cpp, vLLM, TensorRT: write a conversion path instead' }] };
+        chunk({ tool_calls: [{ index: 0, id: 'call_3', type: 'function', function: { name: 'ask', arguments: JSON.stringify(args) } }] });
+        return end('tool_calls');
+      }
+      if (body.tools && last.role === 'tool' && /The user answered/.test(last.content)) {
+        chunk({ content: `Going with that: ${last.content.replace('The user answered: ', '')}.` });
+        return end('stop');
+      }
+      // "options in text": a reply that ends with (a)/(b) choices and a question.
+      if (/options in text/.test(JSON.stringify(last.content))) {
+        chunk({ content: 'One question decides it.\n\n- **(a) Same file, your own CUDA kernel** — then you write the GPU decode later.\n- **(b) Same file consumed by existing stacks** (llama.cpp, vLLM) — then you write a conversion path.\n\n(b) is less work. Which one did you have in mind?' });
+        return end('stop');
+      }
       if (body.tools && last.role === 'tool') {
         chunk({ content: /declined/.test(last.content) ? 'Okay, I left it.' : 'Created index.html.' });
         return end('stop');

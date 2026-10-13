@@ -3,12 +3,14 @@
 
 import { type Chip, fitTo, fmtK, isChip, parts, thumbSize, thumbnail } from './attach.ts';
 import { pixelCells } from './header.ts';
-import { type Line, fit, strWidth } from './term.ts';
+import { type Line, fit, strWidth, wrap } from './term.ts';
 import type { BoxRow, Styles } from './view.ts';
 
 const STRIP_MAX = 8;
 
-export function previewBox(c: Chip, width: number, o: { big: boolean; hovering: boolean; blind?: string }, st: Styles, redraw: () => void): { legend: Line; rows: BoxRow[] } {
+// Full size, a file, folder or long text is a viewer: `room` rows of it from
+// line `scroll` (wrapped to the width); `max` is the furthest it scrolls.
+export function previewBox(c: Chip, width: number, o: { big: boolean; hovering: boolean; blind?: string; scroll?: number; room?: number }, st: Styles, redraw: () => void): { legend: Line; rows: BoxRow[]; max: number } {
   const inner = width - 4;
   const dim = (t: string) => ({ t, s: st.dim });
   const rows: BoxRow[] = [];
@@ -20,7 +22,28 @@ export function previewBox(c: Chip, width: number, o: { big: boolean; hovering: 
     return { cols: t.cols, lines: pixelCells(px, st.mode).map((l) => l.map((x) => ({ t: x.t, s: x.s }))) };
   };
   let info: Line;
-  if (c.kind === 'image') {
+  let max = 0;
+  const textual = c.kind === 'file' || c.kind === 'text' || c.kind === 'folder';
+  if (o.big && textual) {
+    // Each line wrapped; a numbered line's continuation lines up under its text.
+    const src = c.kind === 'folder' ? c.tree! : c.text!.split('\n');
+    const vis: { line: Line; n: number }[] = [];
+    src.forEach((l, n) => {
+      const pad = /^\s*\d+ {2}/.exec(l)?.[0].length ?? 0;
+      wrap([{ t: l, s: st.fg }], inner).forEach((w, i) => vis.push({ line: i && pad ? [{ t: ' '.repeat(pad), s: '' }, ...w] : w, n }));
+    });
+    const room = Math.max(3, o.room ?? 30);
+    max = Math.max(0, vis.length - room);
+    const from = Math.max(0, Math.min(o.scroll ?? 0, max));
+    const shown = vis.slice(from, from + room);
+    rows.push(...shown.map((v) => ({ line: v.line })));
+    // Where you are first: a long path would push it off the line.
+    const where: Line = max ? [{ t: `lines ${shown[0].n + 1}–${shown.at(-1)!.n + 1} of ${src.length}`, s: st.accent }, dim(' · ')] : [];
+    info =
+      c.kind === 'file' ? [...where, { t: c.path!, s: st.title }, dim(`${max ? '' : ` · ${c.lines} lines`} · sent like a read: the first ${Math.min(c.lines!, 200)} lines · ~${fmtK(c.tok)} tokens`)]
+      : c.kind === 'folder' ? [...where, { t: c.path!, s: st.title }, dim(` · sent as this tree · ~${fmtK(c.tok)} tokens`)]
+      : [...where, { t: `${c.lines} lines`, s: st.title }, dim(` · sent in full · ~${fmtK(c.tok)} tokens`)];
+  } else if (c.kind === 'image') {
     const p = pixels(c.path!, c.w!, c.h!, Math.min(inner, o.big ? inner : 56), o.big ? 20 : 8);
     rows.push(...p.lines.map((line) => ({ line })));
     const [a, b] = fitTo(c.w!, c.h!, 1568);
@@ -62,10 +85,10 @@ export function previewBox(c: Chip, width: number, o: { big: boolean; hovering: 
   rows.push({ line: info });
   if (o.blind) rows.push({ line: [{ t: o.blind, s: st.warn }] });
   rows.push({ line: [], rule: 'full' }, {
-    line: [dim(o.big ? 'esc or a click on the chip closes this' : o.hovering ? 'move off the chip to close · click it for full size' : '← → move off the chip to close · backspace removes it · click it for full size')],
+    line: [dim(o.big ? (max ? '↑ ↓ or wheel scroll · ctrl+u ctrl+d page · esc closes' : 'esc or a click on the chip closes this') : o.hovering ? 'move off the chip to close · click it for full size' : '← → move off the chip to close · backspace removes it · click it for full size')],
   });
   const legend: Line = [{ t: c.kind === 'folder' || c.kind === 'file' || c.kind === 'path' ? c.kind : `${c.kind} ${c.n}`, s: st.accent }, dim(' · preview')];
-  return { legend, rows };
+  return { legend, rows, max };
 }
 
 // The dim line under the prompt: `+ 2 attachments · ~3.4k tokens to send ▸`.

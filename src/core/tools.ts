@@ -1,5 +1,5 @@
-// The core tools (SPEC §6.2): read, write, edit, bash, plus rime (Rime acting on
-// itself, §15). The list is frozen for the session (it sits at the front of the
+// The core tools (SPEC §6.2): read, write, edit, bash, plus ask (a question with
+// options for the user) and rime (Rime acting on itself, §15). The list is frozen for the session (it sits at the front of the
 // cached prefix), and every output is capped (§6.3).
 
 import { spawn } from 'node:child_process';
@@ -31,6 +31,11 @@ export const TOOLS: ToolDef[] = [
     name: 'bash',
     description: 'Run a shell command in the project folder. Long output is cut to its start and end.',
     input_schema: { type: 'object', properties: { command: { type: 'string' }, reason: { type: 'string', description: 'why, in a few words; shown to the user' }, timeout: { type: 'integer', description: 'seconds, default 120' } }, required: ['command'] },
+  },
+  {
+    name: 'ask',
+    description: 'Ask the user to choose before you go on: one question, 2-4 short options. They can also type their own answer. Use it instead of ending a reply with a question.',
+    input_schema: { type: 'object', properties: { question: { type: 'string' }, options: { type: 'array', items: { type: 'object', properties: { label: { type: 'string' }, detail: { type: 'string' } }, required: ['label'] } } }, required: ['question', 'options'] },
   },
   {
     name: 'rime',
@@ -154,4 +159,23 @@ export function bash(cwd: string, input: { command: string; timeout?: number }, 
       resolve({ content: `${status}${body ? '\n' + body : ''}`, error: code !== 0 || !!why, summary: status, output: body ? lines : [] });
     });
   });
+}
+
+// The ask tool's options however the model wrote them: objects, strings, or (from
+// a text tool call) a JSON string or one option per line.
+export function optionsOf(raw: unknown): { label: string; detail?: string }[] {
+  let v = raw;
+  if (typeof raw === 'string') {
+    try {
+      v = JSON.parse(raw);
+    } catch {
+      v = raw.split('\n').map((l) => l.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim()).filter(Boolean);
+    }
+  }
+  if (!Array.isArray(v)) return [];
+  return v
+    .map((o) => (typeof o === 'string' ? { label: o } : o && typeof o === 'object' ? { label: String((o as any).label ?? (o as any).title ?? ''), detail: (o as any).detail ?? (o as any).description } : { label: '' }))
+    .filter((o) => o.label.trim())
+    .slice(0, 6)
+    .map((o) => ({ label: o.label.trim(), ...(o.detail ? { detail: String(o.detail).trim() } : {}) }));
 }

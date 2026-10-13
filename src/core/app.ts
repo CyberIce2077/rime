@@ -14,9 +14,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
 import { type Decision, MODE_HELP, MODES, type Mode, decide, projectRules, removeProjectRule, ruleList } from './permissions.ts';
-import { type ToolResult, TOOLS, bash as bashTool, diffOf, edit as editTool, planEdit, read as readTool, rel, write as writeTool } from './tools.ts';
+import { type ToolResult, TOOLS, bash as bashTool, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, write as writeTool } from './tools.ts';
 import { WHEN, createSettings, phrase } from './settings.ts';
-import { type Did, example as exampleFor, nextStep as nextFor } from './suggest.ts';
+import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
 import { type Config, saveConfig } from './config.ts';
 import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } from './header.ts';
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
@@ -72,6 +72,7 @@ const KEYS: [string, string][] = [
 const CLICK_KEYS: Record<string, Key> = {
   esc: { name: 'escape' }, enter: { name: 'enter' }, tab: { name: 'tab' }, space: { name: 'space' }, backspace: { name: 'backspace' },
   'ctrl+c': { name: 'c', ctrl: true }, 'ctrl+j': { name: 'j', ctrl: true }, 'ctrl+v': { name: 'v', ctrl: true }, 'ctrl+o': { name: 'o', ctrl: true },
+  'ctrl+r': { name: 'r', ctrl: true }, 'ctrl+d': { name: 'd', ctrl: true }, '→': { name: 'right' },
 };
 
 // Frozen for the whole session: any byte change here would break the prompt cache.
@@ -84,6 +85,7 @@ const system = (cwd: string, agents = '') =>
   `You are Rime, a coding assistant running in the user's terminal.\n` +
   `Working directory: ${cwd}\n` +
   `Do the work with your tools: read files before you change them, create files with write, change them with edit, run commands with bash. Don't paste whole files into the chat; say in a line or two what you did.\n` +
+  `When you need the user to choose before you go on, use the ask tool instead of ending your reply with a question.\n` +
   `You run inside Rime. Use the rime tool to change Rime itself (tabs, panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
   `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.` +
   (agents ? `\n\nAGENTS.md:\n${agents}` : '');
@@ -148,6 +150,7 @@ export async function runApp(cfg: Config, version: string) {
   const counts: Partial<Record<Kind, number>> = {};
   let hover: string | null = null; // chip under the mouse
   let big: string | null = null; // chip opened full size
+  let bigScroll = { id: '', at: 0, max: 0, page: 10 }; // where a full-size file or text is scrolled to
   let listOpen = false, listPinned = false; // the "what gets sent" list
   let blindAsk = false; // asked whether to send the text without the images
   let flash: { text: string; t: NodeJS.Timeout } | null = null;
@@ -255,6 +258,12 @@ export async function runApp(cfg: Config, version: string) {
     continuing: { title: string; at: number } | null; // reopened, nothing sent yet
     resumeOk: boolean; // the last reply was cut off by quitting: enter continues it
     approval: { use: Block; decision: Decision; sel: number; done(a: 'yes' | 'always' | 'no' | 'stop'): void; diff?: ToolResult['diff'] } | null;
+    // A question with options: from the ask tool (`tool`, the turn waits for it), or
+    // read from a reply that ended with "(a) … (b) …" (picking sends it).
+    question: { q: string; options: { label: string; detail?: string }[]; sel: number; tool: boolean; done(answer: string | null): void } | null;
+    // Messages you sent while it worked: they go with the next tool results, or as
+    // the next message when the reply ends.
+    queued: { text: string; content: string | Block[] | Promise<Block[]> }[];
     declining: ((words: string | null) => void) | null; // "No, tell Rime instead": the next prompt is the reason
     convRules: { allow?: string[]; ask?: string[]; deny?: string[] }; // "don't ask again", saved with it
     meter: ReturnType<typeof createMeter>; // its tokens, cost and savings
@@ -263,11 +272,11 @@ export async function runApp(cfg: Config, version: string) {
   };
   const newSession = (): Session => ({
     convId: null, messages: [], items: [headerItem], task: null, busy: null, waiting: null, live: null, lastUserSeq: 0,
-    continuing: null, resumeOk: false, approval: null, declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '',
+    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '',
   });
   let S = newSession();
   const sessions: Session[] = [S]; // open in this window; the ones not on screen keep working
-  const needsYou = (x: Session) => !!(x.approval || x.declining);
+  const needsYou = (x: Session) => !!(x.approval || x.declining || x.question?.tool);
 
   const W = () => out.columns || 80;
   const H = () => out.rows || 24;
@@ -447,11 +456,13 @@ export async function runApp(cfg: Config, version: string) {
   // Your earlier prompts, newest first: this session, then this project's saved ones.
   let past: string[] = [];
   const earlier = () => [...history].reverse().concat(past).filter((p, i, a) => !/[\ue000-\uf8ff]/.test(p) && a.indexOf(p) === i);
-  // Dim ghost text completing the line from an earlier prompt.
+  // Dim ghost text completing the line from an earlier prompt in this
+  // conversation (↑ and ctrl+r search the whole project's).
   function ghost() {
     if (panel || atPick || rsearch || browsing || boxKind || range() || cur !== buf.length || buf.length < 3 || buf.startsWith('/') || [...buf].some(isChip)) return '';
     const low = buf.toLowerCase();
-    const h = earlier().find((p) => p.length > buf.length && p.toLowerCase().startsWith(low));
+    const mine = S.items.flatMap((it) => (it.kind === 'user' && !it.chips ? [it.text] : [])).reverse();
+    const h = mine.find((p) => p.length > buf.length && p.toLowerCase().startsWith(low));
     return h ? h.slice(buf.length) : '';
   }
   const rmatches = () => earlier().filter((p) => p.toLowerCase().includes(rsearch!.q.toLowerCase()));
@@ -546,14 +557,26 @@ export async function runApp(cfg: Config, version: string) {
 
   // The preview above the prompt: a chip full size, under the mouse or at the
   // caret, else the "what gets sent" list when it's open.
-  function chipBox(width: number) {
+  // Scrolls the full-size preview (keys and wheel); false when it can't scroll.
+  function scrollBig(by: number) {
+    if (!big || !bigScroll.max) return false;
+    bigScroll.at = Math.max(0, Math.min(bigScroll.max, bigScroll.at + by));
+    return true;
+  }
+
+  function chipBox(width: number, height: number) {
     if (panel || cmdsOpen() || boxKind) return null;
     const sb = suggestBox(width);
     if (sb) return sb;
     const id = big ?? hover ?? nearChip();
     const c = id ? chips.get(id) : undefined;
     if (c && id) {
-      const v = previewBox(c, width, { big: big === id, hovering: hover === id && big !== id, blind: blind() && media(c) ? `${blindNote()}. Rime asks before sending the text without it.` : undefined }, st, schedule);
+      if (big === id && bigScroll.id !== id) bigScroll = { id, at: 0, max: 0, page: 10 };
+      // Full size it takes the room the prompt and status line leave, less a few
+      // transcript lines and its own frame.
+      const room = Math.max(3, height - 16);
+      const v = previewBox(c, width, { big: big === id, hovering: hover === id && big !== id, blind: blind() && media(c) ? `${blindNote()}. Rime asks before sending the text without it.` : undefined, scroll: bigScroll.at, room }, st, schedule);
+      if (big === id) Object.assign(bigScroll, { max: v.max, at: Math.min(bigScroll.at, v.max), page: Math.max(1, Math.floor(room / 2)) });
       return box(v.legend, v.rows, width, st, st.accent, big ? 'key:esc' : undefined);
     }
     if (listOpen && buf.trim()) {
@@ -566,17 +589,23 @@ export async function runApp(cfg: Config, version: string) {
   function ui(width: number, height: number) {
     const lines: string[] = [];
     const rowHits: Hit[][] = [];
-    const b = approvalBox(width) ?? currentBox(width) ?? chipBox(width);
+    const b = approvalBox(width) ?? questionBox(width) ?? currentBox(width) ?? chipBox(width, height);
     if (b && b.lines.length <= height - 5) {
       lines.push(...b.lines);
       rowHits.push(...b.hits);
+    }
+    // Messages waiting for Rime to take them, dim, in the order they'll go.
+    for (const q of S.queued.slice(-3)) {
+      const t = [...q.text].map((ch) => (isChip(ch) && chips.get(ch) ? `[${label(chips.get(ch)!)}]` : ch)).join('').split('\n')[0];
+      lines.push(str(fit([{ t: '› ', s: st.dim }, { t, s: st.dim }, { t: ' · queued', s: st.accent }], width), st));
+      rowHits.push([]);
     }
     // The line under the prompt sums up the next message.
     const sent = !panel && buf.trim() && !buf.startsWith('/') ? sendLine(buf, chips, listOpen, st, blind() && hasMedia(buf) ? `${blindNote()}` : undefined) : [];
     // The prompt grows to 10 rows (at most a third of the screen), then scrolls.
     const maxRows = Math.max(1, Math.min(10, Math.floor(height / 3), height - lines.length - 3 - (sent.length ? 1 : 0)));
     const p = prompt(buf, cur, width, maxRows, st, {
-      placeholder: panel?.placeholder?.() ?? (S.declining ? 'tell Rime what to do instead' : S.resumeOk ? 'enter continues the interrupted reply, or ask something new' : S.nextStep ? S.nextStep : example && !S.messages.length ? `Try "${example}"` : undefined),
+      placeholder: panel?.placeholder?.() ?? (S.declining ? 'tell Rime what to do instead' : S.question ? 'pick one above, or type your own answer' : S.resumeOk ? 'enter continues the interrupted reply, or ask something new' : S.nextStep ? S.nextStep : example && !S.messages.length ? `Try "${example}"` : undefined),
       // A suggestion shows the key that takes it.
       tabHint: !panel && !S.declining && !S.resumeOk && (buf ? !!ghost() : !!(S.nextStep || (example && !S.messages.length))),
       masked: panel?.masked?.() ?? false,
@@ -627,6 +656,7 @@ export async function runApp(cfg: Config, version: string) {
       const key = (t: string) => ({ t, s: st.accentB });
       const parts: { line: Line; id?: string }[] = [];
       if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
+      if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
       if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
       const asking = sessions.filter((x) => x !== S && needsYou(x)).length;
       const working = sessions.filter((x) => x !== S && (x.busy || x.waiting) && !needsYou(x)).length;
@@ -1001,6 +1031,7 @@ export async function runApp(cfg: Config, version: string) {
     C.continuing = null;
     C.resumeOk = false;
     C.nextStep = '';
+    if (!C.question?.tool) C.question = null; // a picker from the last reply is answered or moot now
 
     const ac = new AbortController();
     const m = model, cn = conn;
@@ -1023,7 +1054,7 @@ export async function runApp(cfg: Config, version: string) {
         if (!uses.length) break;
         esc = () => ac.abort();
         const results = await runTools(uses, ac.signal, did, C);
-        C.messages.push({ role: 'user', content: results });
+        C.messages.push({ role: 'user', content: [...results, ...(ac.signal.aborted ? [] : await takeQueued(C))] });
         C.lastUserSeq = store(C.messages.at(-1)!);
         if (ac.signal.aborted) {
           note('stopped', 'dim');
@@ -1033,9 +1064,42 @@ export async function runApp(cfg: Config, version: string) {
     } finally {
       if (C.busy === me) C.busy = null;
       C.nextStep = nextFor(said, did, project);
+      offerChoices(said, C);
       example = exampleFor(project);
+      // What you sent meanwhile: stopped, it goes back to the prompt; else it's next.
+      if (C.queued.length && ac.signal.aborted) unqueue(C);
+      else if (C.queued.length) {
+        const q = C.queued.splice(0);
+        const contents = await Promise.all(q.map((x) => x.content));
+        const content = contents.every((x) => typeof x === 'string') ? contents.join('\n') : contents.flatMap((x) => (typeof x === 'string' ? [{ type: 'text', text: x } as Block] : x));
+        void send(q.map((x) => x.text).join('\n'), false, content, C);
+      }
       schedule();
     }
+  }
+
+  // Queued messages joining the conversation after tool results: shown where they
+  // land in the transcript, sent as blocks after the results.
+  async function takeQueued(C: Session): Promise<Block[]> {
+    const q = C.queued.splice(0);
+    const out: Block[] = [];
+    for (const x of q) {
+      const labels = Object.fromEntries([...new Set([...x.text].filter(isChip))].flatMap((ch) => (chips.get(ch) ? [[ch, label(chips.get(ch)!)]] : [])));
+      C.items.push({ kind: 'user', text: x.text, ...(Object.keys(labels).length ? { chips: labels } : {}) });
+      const c = await x.content;
+      out.push(...(typeof c === 'string' ? [{ type: 'text', text: c } as Block] : c));
+    }
+    schedule();
+    return out;
+  }
+
+  // Queued messages back into the prompt (after esc), ahead of anything typed since.
+  function unqueue(C: Session) {
+    if (C !== S) return; // waits on that conversation until you're back in it
+    const text = C.queued.splice(0).map((x) => x.text).join('\n');
+    buf = buf ? `${text}\n${buf}` : text;
+    cur = buf.length;
+    anchor = null;
   }
 
   // One streamed reply. Returns its blocks, or ok: false when it was stopped or failed.
@@ -1176,6 +1240,22 @@ export async function runApp(cfg: Config, version: string) {
     }
   }
 
+  // A reply that ended with "(a) … (b) … which one?": the picker, where a pick
+  // is sent as your next message.
+  function offerChoices(reply: string, C: Session) {
+    const ch = choicesOf(reply);
+    if (!ch) return;
+    C.nextStep = '';
+    C.question = {
+      q: ch.question, options: ch.options, sel: 0, tool: false,
+      done: (a) => {
+        C.question = null;
+        if (a) void send(a, false, a, C);
+        schedule();
+      },
+    };
+  }
+
   // A saved message as you sent it: attachments as chips, not their contents.
   const userItem = (blocks: Block[]): Item => {
     const labels: Record<string, string> = {};
@@ -1194,8 +1274,8 @@ export async function runApp(cfg: Config, version: string) {
   const permCtx = () => ({ mode, project, rules: ruleList(cfg.permissions, projectRules(project), S.convRules), granted: (p: string) => [...chips.values()].some((c) => c.path && (p === c.path || p.startsWith(c.path + path.sep))) });
   const describe = (u: Block) => {
     const i = (u.input ?? {}) as Record<string, any>;
-    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime' }[String(u.name)] ?? String(u.name);
-    const rest = u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
+    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime', ask: 'Asked' }[String(u.name)] ?? String(u.name);
+    const rest = u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'ask' ? String(i.question ?? '') : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
     return { verb, rest };
   };
   const toolLine = (u: Block): Item => ({ kind: 'tool', ...describe(u) });
@@ -1215,6 +1295,38 @@ export async function runApp(cfg: Config, version: string) {
       }
       if (skip) {
         out.push(result(u.id, skip, true));
+        continue;
+      }
+      // A question for you: the turn waits for your pick (or your own words).
+      if (u.name === 'ask') {
+        const options = optionsOf(input.options);
+        const q = String(input.question ?? '').trim();
+        if (!q || options.length < 2) {
+          out.push(result(u.id, 'ask needs a question and 2-4 options.', true));
+          continue;
+        }
+        const a = await new Promise<string | null>((res) => {
+          const done = (v: string | null) => {
+            signal.removeEventListener('abort', stop);
+            C.question = null;
+            schedule();
+            res(v);
+          };
+          const stop = () => done(null);
+          signal.addEventListener('abort', stop, { once: true });
+          C.question = { q, options, sel: 0, tool: true, done };
+          schedule();
+        });
+        C.items.push(toolLine(u));
+        if (a === null) {
+          detail([[{ t: 'not answered', s: st.dim }]]);
+          out.push(result(u.id, 'Not answered: the user stopped Rime.', true));
+          skip = 'Not run: the user stopped Rime.';
+          continue;
+        }
+        detail([[{ t: a, s: st.title }]]);
+        out.push(result(u.id, `The user answered: ${a}`));
+        schedule();
         continue;
       }
       const d = decide(String(u.name), input, permCtx());
@@ -1355,6 +1467,24 @@ export async function runApp(cfg: Config, version: string) {
     });
   }
 
+  // The question box above the prompt: the question, its options (with a dim
+  // line of detail), and that you can also just type an answer.
+  function questionBox(width: number) {
+    const Q = S.question;
+    if (!Q || panel) return null;
+    const dim = (t: string) => ({ t, s: st.dim });
+    const rows: BoxRow[] = wrap([{ t: Q.q, s: st.titleB }], width - 4).map((line) => ({ line }));
+    rows.push({ line: [] });
+    Q.options.forEach((o, i) => {
+      const on = Q.sel === i;
+      const head = wrap([{ t: on ? '› ' : '  ', s: st.accent }, { t: `${i + 1} `, s: st.dim }, { t: o.label, s: on ? st.accentB : st.fg }], width - 4);
+      head.forEach((line, k) => rows.push({ line: k ? [{ t: '    ', s: '' }, ...line] : line, bg: on ? st.panelBg : undefined, hit: `q:${i}` }));
+      if (o.detail) wrap([dim(o.detail)], width - 8).slice(0, 2).forEach((line) => rows.push({ line: [{ t: '    ', s: '' }, ...line], bg: on ? st.panelBg : undefined, hit: `q:${i}` }));
+    });
+    rows.push(...footRows(['↑ ↓', ' choose · ', 'enter', ' or ', Q.options.map((_, i) => i + 1).join(' '), ' · or type your own answer · ', 'esc', Q.tool ? ' stop' : ' close'], st));
+    return box([{ t: Q.tool ? 'Rime asks' : 'pick one', s: st.accent }], rows, width, st, st.accent, 'key:esc');
+  }
+
   // /permissions (SPEC §17): the mode (auto only from here), the rules with where
   // each came from, adding and removing them, and the last decisions.
   function createPermissions(): Panel {
@@ -1461,9 +1591,11 @@ export async function runApp(cfg: Config, version: string) {
     const again = a.use.name === 'bash' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/outside/.test(a.decision.why);
     return again ? [0, 1, 2] : [0, 2];
   }
-  function answer(n: number) {
-    if (!S.approval || !approvalOptions().includes(n - 1)) return;
-    S.approval.done(n === 1 ? 'yes' : n === 2 ? 'always' : 'no');
+  // `o`: the option (0 yes, 1 don't ask again, 2 no). On screen they're numbered
+  // 1, 2, 3 in the order shown, so with two options "No" is 2.
+  function answer(o: number) {
+    if (!S.approval || !approvalOptions().includes(o)) return;
+    S.approval.done(o === 0 ? 'yes' : o === 1 ? 'always' : 'no');
   }
   function cycleMode() {
     setMode(mode === 'auto' || mode === 'god' ? 'ask' : MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
@@ -1494,11 +1626,12 @@ export async function runApp(cfg: Config, version: string) {
       u.name === 'bash' ? `Yes, and don't ask again for ${d.label} commands in this conversation` : 'Yes, and allow edits for the rest of this conversation',
       'No, and tell Rime what to do instead (esc)',
     ];
-    for (const n of approvalOptions()) {
-      const on = S.approval.sel === n;
-      rows.push({ line: [{ t: on ? '› ' : '  ', s: st.accent }, { t: `${n + 1} `, s: st.dim }, { t: labels[n], s: on ? st.accent : st.fg }], bg: on ? st.panelBg : undefined, hit: `dec:${n + 1}` });
-    }
-    rows.push(...footRows(['↑ ↓', ' choose · ', 'enter', ' or ', approvalOptions().length === 3 ? '1 2 3' : '1 3', ' · ', 'esc', ' no · ', 'shift+tab', ' mode'], st));
+    const opts = approvalOptions();
+    opts.forEach((n, i) => {
+      const on = S.approval!.sel === n;
+      rows.push({ line: [{ t: on ? '› ' : '  ', s: st.accent }, { t: `${i + 1} `, s: st.dim }, { t: labels[n], s: on ? st.accent : st.fg }], bg: on ? st.panelBg : undefined, hit: `dec:${n}` });
+    });
+    rows.push(...footRows(['↑ ↓', ' choose · ', 'enter', ' or ', opts.map((_, i) => i + 1).join(' '), ' · ', 'esc', ' no · ', 'shift+tab', ' mode'], st));
     return box([{ t: title, s: st.warn }, dim(` · ${MODE_HELP[mode]}`)], rows, width, st, st.warn);
   }
 
@@ -1507,7 +1640,7 @@ export async function runApp(cfg: Config, version: string) {
   // for you) keeps going in the background; an idle one is put away (it's saved).
   function show(x: Session) {
     if (x === S) return;
-    if (!S.busy && !needsYou(S) && !S.waiting) {
+    if (!S.busy && !needsYou(S) && !S.waiting && !S.queued.length) {
       sessions.splice(sessions.indexOf(S), 1);
       if (S.convId) save((d) => d.unlock(S.convId!));
     }
@@ -1516,6 +1649,7 @@ export async function runApp(cfg: Config, version: string) {
     scrollOff = 0;
     browsing = null;
     blindAsk = false;
+    if (!x.busy && x.queued.length) unqueue(x);
     schedule();
   }
 
@@ -1530,11 +1664,13 @@ export async function runApp(cfg: Config, version: string) {
   // ← on an empty prompt (or /conversations, or a click on "← conversations")
   // fills the screen with your conversations: a dot on the ones working (blue,
   // pulsing), waiting for you (yellow) or open in another Rime window (dim), and a
-  // preview of the highlighted one. Search, the timeline, rename, pin, fork and
-  // delete come in Phase 4b.
+  // preview of the highlighted one. ctrl+r renames the highlighted one, ctrl+d
+  // deletes it (after asking). The timeline, pin and fork come in Phase 4b.
   type ListRow = { id: number | null; title: string; project: string; updated: number; model: string | null; n: number; other: boolean; session?: Session };
   // `on`: the highlighted conversation, so the highlight stays on it when the list reorders.
-  let list: { pick: number; on: number | Session | null; filter: string; all: boolean; rows: ListRow[]; at: number } | null = null;
+  // `edit`: the new title being typed (`fresh`: still the old one, selected, so
+  // typing replaces it); `confirm`: the conversation about to be deleted.
+  let list: { pick: number; on: number | Session | null; filter: string; all: boolean; rows: ListRow[]; at: number; edit?: string; fresh?: boolean; confirm?: boolean } | null = null;
   const keyOf = (r: ListRow) => r.id ?? r.session ?? null;
   const previews = new Map<number, { at: number; items: Item[] }>();
 
@@ -1606,19 +1742,33 @@ export async function runApp(cfg: Config, version: string) {
     const lw = wide ? Math.floor(width * 0.48) : width;
     const pw = width - lw - 3;
     const top: Line[] = [
-      [{ t: ' conversations', s: st.titleB }, dim(L.all ? ' · all projects' : ` · ${tildify(project)}`)],
+      [
+        { t: ' conversations', s: st.titleB },
+        // What just happened (renamed, deleted, why not), in place of the project
+        // for a moment, since the status line is hidden here.
+        ...(flash ? (flash.text.startsWith('✓') ? [{ t: ' · ✓', s: st.ok }, dim(flash.text.slice(1))] : [{ t: ` · ${flash.text}`, s: st.warn }]) : [dim(L.all ? ' · all projects' : ` · ${tildify(project)}`)]),
+      ],
       [{ t: ' › ', s: st.accentB }, L.filter ? { t: L.filter, s: st.title } : { t: 'type to search', s: st.placeholder }],
       [{ t: '─'.repeat(width), s: st.line }],
     ];
-    const foot: Line[] = [
-      [{ t: '─'.repeat(width), s: st.line }],
-      [
-        { t: ' ↑ ↓', s: st.accentB }, dim(' choose · '), { t: '→', s: st.accentB }, dim(' or '), { t: 'enter', s: st.accentB }, dim(' open · '),
-        { t: 'n', s: st.accentB }, dim(' new · '), { t: 'a', s: st.accentB }, dim(L.all ? ' this project · ' : ' all projects · '),
-        { t: 'esc', s: st.accentB }, dim(' back · '),
-        { t: '● ', s: st.accentB }, dim('working '), { t: '● ', s: st.warn }, dim('needs you '), { t: '● ', s: st.dim }, dim('another window'),
-      ],
-    ];
+    // The footer's keys are clickable, like every footer (SPEC §5.1).
+    const sel = rows[L.pick];
+    const parts: [string, string, string?][] =
+      L.edit !== undefined ? [['enter', ' save · '], ['esc', ' cancel'], ['', '   type the new title']]
+      : L.confirm ? [['', `delete "${sel?.title ?? ''}"? `, 'warn'], ['enter', ' delete · '], ['esc', ' keep it']]
+      : [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ['ctrl+r', ' rename · '], ['ctrl+d', ' delete · '], ['n', ' new · '], ['a', L.all ? ' this project · ' : ' all projects · '], ['esc', ' back']];
+    const footLine: Line = [{ t: ' ', s: '' }];
+    const footHits: { x0: number; x1: number; id: string }[] = [];
+    for (const [k, label, tone] of parts) {
+      if (k) {
+        const x0 = lineWidth(footLine) + 1;
+        footLine.push({ t: k, s: st.accentB });
+        if (k !== '↑ ↓') footHits.push({ x0, x1: x0 + strWidth(k) - 1, id: `key:${k}` });
+      }
+      footLine.push({ t: label, s: tone === 'warn' ? st.warn : st.dim });
+    }
+    if (L.edit === undefined && !L.confirm) footLine.push(dim(' · '), { t: '● ', s: st.accentB }, dim('working '), { t: '● ', s: st.warn }, dim('needs you '), { t: '● ', s: st.dim }, dim('another window'));
+    const foot: Line[] = [[{ t: '─'.repeat(width), s: st.line }], footLine];
     const bodyH = Math.max(1, height - top.length - foot.length);
     // The list, grouped by day, scrolled to keep the highlight in view.
     const left: { line: Line; i?: number }[] = [];
@@ -1628,7 +1778,9 @@ export async function runApp(cfg: Config, version: string) {
       const sel = i === L.pick;
       const meta = [ago(r.updated), r.model?.split('/').pop(), r.n ? `${r.n} messages` : '', L.all && r.project !== project ? tildify(r.project) : ''].filter(Boolean).join(' · ');
       const tw = Math.max(8, lw - 4 - Math.min(meta.length, Math.floor(lw / 2)) - 2);
-      const title = fit([{ t: r.title, s: sel ? st.accentB : r.session === S ? st.titleB : st.title }], tw);
+      const title =
+        sel && L.edit !== undefined ? [{ t: L.edit.slice(-(tw - 1)), s: L.fresh ? st.selection : st.title }, { t: '▏', s: st.accent }]
+        : fit([{ t: r.title, s: sel && L.confirm ? st.del : sel ? st.accentB : r.session === S ? st.titleB : st.title }], tw);
       left.push({ line: [{ t: sel ? '›' : ' ', s: st.accent }, dotOf(r), ...title, { t: '  ', s: '' }, ...fit([dim(meta)], lw - 3 - tw - 2)], i });
     });
     if (!rows.length) left.push({ line: [dim(L.filter ? ` no conversation matches "${L.filter}"` : ' No conversations yet. n starts one.')] });
@@ -1654,15 +1806,47 @@ export async function runApp(cfg: Config, version: string) {
       if (l?.i !== undefined) rowHits.push({ row: top.length + k + 1, x0: 1, x1: lw, id: `conv:${l.i}` });
     }
     for (const l of foot) lines.push(str(fit(l, width), st));
+    rowHits.push(...footHits.filter((h) => h.x1 <= width).map((h) => ({ ...h, row: lines.length })));
     return { lines, rowHits };
   }
 
   function listKey(k: Key) {
     const L = list!;
     const rows = listRows();
+    const r = rows[L.pick];
+    // Typing a new title: enter saves it, esc leaves it as it was.
+    if (L.edit !== undefined) {
+      if (k.name === 'escape' || (k.ctrl && k.name === 'c')) return void (L.edit = undefined);
+      if (k.name === 'enter') return renameRow(r, L.edit);
+      const fresh = L.fresh;
+      L.fresh = false;
+      if (k.name === 'backspace' || (k.ctrl && k.name === 'w')) {
+        if (fresh) return void (L.edit = '');
+        return void (L.edit = k.alt || k.ctrl ? L.edit.replace(/\S*\s*$/, '') : [...L.edit].slice(0, -1).join(''));
+      }
+      if (k.ctrl && k.name === 'u') return void (L.edit = '');
+      if ((k.name === 'char' && k.ch && !k.ctrl) || k.name === 'space') return void (L.edit = (fresh ? '' : L.edit) + (k.ch ?? ' '));
+      return;
+    }
+    // Deleting asks first: enter deletes, anything else keeps it.
+    if (L.confirm) {
+      L.confirm = false;
+      if (k.name === 'enter') deleteRow(r);
+      return;
+    }
     if (k.name === 'escape' || (k.ctrl && k.name === 'c')) {
       if (L.filter && k.name === 'escape') return void (L.filter = '');
       return void (list = null);
+    }
+    if (k.ctrl && k.name === 'r' && r) {
+      if (r.id === null) return say('send a message first; then it can have a name');
+      return void ((L.edit = r.title === 'untitled' ? '' : r.title), (L.fresh = true));
+    }
+    if (k.ctrl && k.name === 'd' && r) {
+      if (r.id === null) return say("nothing to delete: it isn't saved until you send something");
+      if (r.other) return say("it's open in another Rime window; close it there first");
+      if (r.session && (r.session.busy || r.session.waiting || r.session.approval)) return say("it's still working; stop it first");
+      return void (L.confirm = true);
     }
     const go = (i: number) => {
       L.pick = Math.max(0, Math.min(rows.length - 1, i));
@@ -1676,6 +1860,32 @@ export async function runApp(cfg: Config, version: string) {
     if (k.name === 'char' && k.ch === 'n' && !L.filter) return void ((list = null), newConversation());
     if (k.name === 'char' && k.ch === 'a' && !L.filter) return void ((L.all = !L.all), (L.at = 0));
     if ((k.name === 'char' && k.ch && !k.ctrl) || k.name === 'space') return void (L.filter += k.ch ?? ' ');
+  }
+
+  function renameRow(r: ListRow | undefined, title: string) {
+    list!.edit = undefined;
+    const t = title.replace(/\s+/g, ' ').trim();
+    if (!r || r.id === null || !t || t === r.title) return;
+    save((d) => d.rename(r.id!, t));
+    r.title = t;
+    if (r.session?.continuing) r.session.continuing.title = t;
+    if (S.continuing && S.convId === r.id) S.continuing.title = t;
+    list!.at = 0;
+    say(`✓ renamed to "${t}"`);
+  }
+
+  function deleteRow(r?: ListRow) {
+    if (!r || r.id === null) return;
+    const x = r.session;
+    if (x) {
+      sessions.splice(sessions.indexOf(x), 1);
+      x.convId = null; // nothing of it is saved any more
+      if (x === S) show(newSession()); // you were in it: a fresh one takes its place
+    }
+    save((d) => d.delete(r.id!));
+    previews.delete(r.id);
+    list!.at = 0;
+    say(`✓ deleted "${r.title}"`);
   }
 
   function openRow(r?: ListRow) {
@@ -1819,9 +2029,30 @@ export async function runApp(cfg: Config, version: string) {
       anchor = null;
       return S.declining(v);
     }
+    // Your own answer to a question.
+    if (S.question && v && !v.startsWith('/')) {
+      const Q = S.question;
+      if (Q.tool) {
+        buf = '';
+        cur = 0;
+        anchor = null;
+        return Q.done(v);
+      }
+      S.question = null; // a picker from the reply: your words go as a message
+    }
     if (!v && S.resumeOk && !S.busy) return void send('continue');
     if (!v) return;
-    if (S.busy && !v.startsWith('/')) return; // one reply at a time; esc stops it
+    // While it works, a message waits for the next tool results (or the end of the reply).
+    if (S.busy && !v.startsWith('/')) {
+      if ([...v].some(isChip) && blind() && hasMedia(v)) return say("this model can't see images; send it when the reply is done");
+      S.queued.push({ text: v, content: [...v].some(isChip) ? blocksFor(v, chips, cwd, true) : v });
+      history.push(v);
+      buf = '';
+      cur = 0;
+      anchor = null;
+      big = hover = null;
+      return;
+    }
     // A model that can't see: ask before sending the text without the images.
     // ponytail: the router (Phase 7) will move the task to a connected model that can see.
     if (!v.startsWith('/') && blind() && hasMedia(v) && !blindAsk) return void (blindAsk = true);
@@ -2002,6 +2233,7 @@ export async function runApp(cfg: Config, version: string) {
     if (id === 'conversations') return openList();
     if (id.startsWith('conv:') && list) return openRow(listRows()[+id.slice(5)]);
     if (id.startsWith('dec:') && S.approval) return void answer(+id.slice(4));
+    if (id.startsWith('q:') && S.question) return S.question.done(S.question.options[+id.slice(2)].label);
     if (id.startsWith('undo:')) {
       const it = S.items[+id.slice(5)];
       if (it?.kind === 'gear') settings.undo(it.change);
@@ -2039,13 +2271,22 @@ export async function runApp(cfg: Config, version: string) {
       if (k.name === 'up' || k.name === 'down') {
         const i = opts.indexOf(S.approval.sel);
         S.approval.sel = opts[(i + (k.name === 'up' ? opts.length - 1 : 1)) % opts.length];
-      } else if (k.name === 'enter') answer(S.approval.sel + 1);
-      else if (k.name === 'char' && /^[123]$/.test(k.ch ?? '') && opts.includes(+k.ch! - 1)) answer(+k.ch!);
-      else if (k.name === 'escape') answer(3);
+      } else if (k.name === 'enter') answer(S.approval.sel);
+      else if (k.name === 'char' && /^[1-9]$/.test(k.ch ?? '') && opts[+k.ch! - 1] !== undefined) answer(opts[+k.ch! - 1]);
+      else if (k.name === 'escape') answer(2);
       else if (k.name === 'tab' && k.shift) cycleMode();
       else if (k.ctrl && k.name === 'c') S.busy?.abort();
       else if (k.name === 'left') openList(); // the question waits here while you look elsewhere
       return;
+    }
+    // A question: on an empty prompt ↑ ↓, 1 2 3 and enter pick; typing writes your
+    // own answer (enter sends it); esc stops the turn, or closes a picker.
+    if (S.question && !panel && !buf && !boxKind && !rsearch) {
+      const Q = S.question, n = Q.options.length;
+      if (k.name === 'up' || k.name === 'down') return void (Q.sel = (Q.sel + (k.name === 'up' ? n - 1 : 1)) % n);
+      if (k.name === 'char' && /^[1-9]$/.test(k.ch ?? '') && +k.ch! <= n) return Q.done(Q.options[+k.ch! - 1].label);
+      if (k.name === 'enter' && !k.shift) return Q.done(Q.options[Q.sel].label);
+      if (k.name === 'escape') return void (Q.tool ? S.busy?.abort() : (S.question = null));
     }
     if (k.name === 'tab' && k.shift && !panel) return cycleMode();
     // ← on an empty prompt opens your conversations.
@@ -2143,6 +2384,11 @@ export async function runApp(cfg: Config, version: string) {
         return;
       }
     }
+    // A full-size file or text scrolls with ↑ ↓ and ctrl+u ctrl+d while it's open.
+    if (big && !panel && ((k.name === 'up' || k.name === 'down') && !k.shift || (k.ctrl && (k.name === 'u' || k.name === 'd')))) {
+      const by = k.name === 'up' ? -1 : k.name === 'down' ? 1 : k.name === 'u' ? -bigScroll.page : bigScroll.page;
+      if (scrollBig(by)) return;
+    }
     // esc closes the nearest thing first: a full-size preview, the selection, the
     // "what gets sent" list, a box; then it stops Rime.
     if (k.name === 'escape') {
@@ -2209,6 +2455,13 @@ export async function runApp(cfg: Config, version: string) {
       case 'up':
       case 'down': {
         const up = k.name === 'up';
+        // ↑ on an empty prompt takes your last queued message back to edit.
+        if (up && !buf && S.queued.length && !k.shift) {
+          buf = S.queued.pop()!.text;
+          cur = buf.length;
+          navigated = true;
+          break;
+        }
         if (k.shift) anchor ??= cur;
         else anchor = null;
         if (vertical(up ? -1 : 1) || k.shift || browsing?.edited) break;
@@ -2262,7 +2515,7 @@ export async function runApp(cfg: Config, version: string) {
       if (ev.button === 64 || ev.button === 65 || ev.button === 96 || ev.button === 97) {
         // The wheel scrolls; a transcript selection stays on its text (and grows
         // with the view while the button is held).
-        scrollOff += ev.button % 2 === 0 ? 3 : -3;
+        if (!scrollBig(ev.button % 2 === 0 ? -3 : 3)) scrollOff += ev.button % 2 === 0 ? 3 : -3;
         if (!selection?.log) selection = null;
       } else if (ev.button === 35) {
         // Motion with no button (any-motion reporting): hovering a chip previews
@@ -2336,7 +2589,8 @@ export async function runApp(cfg: Config, version: string) {
       else if (panel.typing?.()) insert(ev.text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, ''));
     } else if (ev.type === 'key') {
       selection = null;
-      if (ev.name === 'pageup' || ev.name === 'pagedown') scrollOff += (ev.name === 'pageup' ? 1 : -1) * Math.max(1, viewH - 2);
+      if ((ev.name === 'pageup' || ev.name === 'pagedown') && scrollBig((ev.name === 'pageup' ? -2 : 2) * bigScroll.page)) schedule();
+      else if (ev.name === 'pageup' || ev.name === 'pagedown') scrollOff += (ev.name === 'pageup' ? 1 : -1) * Math.max(1, viewH - 2);
       else onKey(ev);
     }
     if (buf !== before) {
@@ -2430,6 +2684,7 @@ export async function runApp(cfg: Config, version: string) {
     if (lastReply.role === 'assistant' && !lastReply.interrupted) {
       const t = typeof lastReply.content === 'string' ? lastReply.content : lastReply.content.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
       C.nextStep = nextFor(t, { wrote: [], ran: [] }, project);
+      offerChoices(t, C);
     }
     // Tool calls left without results when Rime closed get them now.
     const last = C.messages.at(-1);

@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { example, nextStep, offerOf } from '../src/core/suggest.ts';
+import { choicesOf, example, nextStep, offerOf } from '../src/core/suggest.ts';
+import { optionsOf } from '../src/core/tools.ts';
 
 test('a reply that offers something is answered with its first offer', () => {
   const cat = 'Here you go:\n\n```\n /\\_/\\\n```\n\nWant me to save it to a file, or make an animated one (multiple frames cycling in the terminal)?';
@@ -22,6 +23,11 @@ test('a reply that offers something is answered with its first offer', () => {
   assert.equal(offerOf('Done.\n\nLet me know if you want me to add a dark mode.'), 'yes, add a dark mode');
   assert.equal(offerOf('If you like, I can wire it into the router.'), 'yes, wire it into the router');
   assert.equal(offerOf('Happy to write the migration too.'), 'yes, write the migration too');
+  assert.equal(
+    offerOf("Before I start writing: which chip is the target (M1? M4?) — it sets the numbers. I'll start on milestone 1 (packer + reference decoder) regardless, since it's machine-independent."),
+    'yes, start on milestone 1',
+  );
+  assert.equal(offerOf("I'll wait for your answer."), null);
 });
 
 test('a review of a file suggests fixing it; a single command suggests running it', () => {
@@ -59,4 +65,25 @@ test('the empty prompt suggests what fits this project now', { skip: spawnSync('
   fs.writeFileSync(path.join(p, 'src', 'app.ts'), 'const a = 1;\n');
   git('commit', '-qam', 'done');
   assert.equal(example(p), 'explain what src/app.ts does');
+});
+
+test('a reply that ends with (a)/(b) choices becomes a picker', () => {
+  const reply = 'One question decides it: what does "still on GPU" mean for you?\n\n· **(a) Same file, your own CUDA kernel** — then MX-compat gives you the layout.\n· **(b) Same file consumed by existing stacks** (llama.cpp, vLLM) — then you write a conversion path.\n\n(b) is much less work. Which one did you have in mind?';
+  assert.deepEqual(choicesOf(reply), {
+    question: 'Which one did you have in mind?',
+    options: [
+      { label: 'Same file, your own CUDA kernel', detail: 'then MX-compat gives you the layout.' },
+      { label: 'Same file consumed by existing stacks', detail: '(llama.cpp, vLLM) — then you write a conversion path.' },
+    ],
+  });
+  assert.equal(choicesOf('(a) one\n(b) two\n\nDone.'), null, 'no question, no picker');
+  assert.equal(choicesOf('Steps:\n(a) build\n(c) ship\n\nOk?'), null, 'letters in order only');
+  assert.deepEqual(choicesOf('a) Postgres: robust\nb) SQLite: simple\n\nWhich?')!.options.map((o) => o.label), ['Postgres', 'SQLite']);
+});
+
+test("the ask tool's options are read however the model wrote them", () => {
+  assert.deepEqual(optionsOf([{ label: 'A', detail: 'x' }, 'B']), [{ label: 'A', detail: 'x' }, { label: 'B' }]);
+  assert.deepEqual(optionsOf('["A","B"]'), [{ label: 'A' }, { label: 'B' }]);
+  assert.deepEqual(optionsOf('- A\n- B'), [{ label: 'A' }, { label: 'B' }]);
+  assert.deepEqual(optionsOf([{ title: 'A', description: 'd' }]), [{ label: 'A', detail: 'd' }]);
 });

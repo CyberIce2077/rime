@@ -26,7 +26,7 @@ function lastSentence(text: string) {
 function shorten(offer: string) {
   offer = offer.replace(/^(also|go ahead and|just)\s+/i, '');
   offer = offer.split(/,?\s+or\s+|;\s*|\s+\(|\s+[—–]\s+|\s+-\s+/)[0];
-  offer = offer.split(/,?\s+(?:so(?: that)?|which|because|to make sure)\s+/)[0].replace(/[,.\s]+$/, '');
+  offer = offer.split(/,?\s+(?:so(?: that)?|which|because|since|to make sure)\s+/)[0].replace(/\s+(?:regardless|anyway|first|now|for now)$/i, '').replace(/[,.\s]+$/, '');
   if (!offer) return '';
   return offer.length > 90 ? 'yes, go ahead' : `yes, ${offer}`;
 }
@@ -43,9 +43,29 @@ export function offerOf(reply: string): string | null {
     /\b(?:I can|I could) (?:also )?(.+?)(?:,? if you(?:'d)? (?:like|want)(?: me to)?)?[?.!]$/i.exec(last) ??
     /\blet me know if you(?:'d)? (?:want|like) me to (.+?)[.!?]?$/i.exec(last) ??
     /\bif you(?:'d)? (?:like|want),? I(?: can|'ll| will) (.+?)[.!?]?$/i.exec(last) ??
-    /\b(?:I'm |I am )?happy to (.+?)(?:,? if you(?:'d)? (?:like|want))?[.!?]?$/i.exec(last);
+    /\b(?:I'm |I am )?happy to (.+?)(?:,? if you(?:'d)? (?:like|want))?[.!?]?$/i.exec(last) ??
+    // "I'll start on milestone 1 regardless, since …": what it means to do next.
+    /^(?:next,? |then,? |so,? |meanwhile,? )?I(?:'ll| will) (?!wait|need|leave|let you|be |keep|stop)(.+?)[.!]?$/i.exec(last);
   if (m) return shorten(m[1]) || '';
   return last.endsWith('?') ? '' : null;
+}
+
+// A reply that ends by asking you to pick, with its options as "(a) … (b) …"
+// lines: the same picker as the ask tool. Labels are the bold part, or the text
+// before a dash or colon.
+export function choicesOf(reply: string): { question: string; options: { label: string; detail?: string }[] } | null {
+  const question = lastSentence(reply);
+  if (!question.endsWith('?')) return null;
+  const options: { label: string; detail?: string }[] = [];
+  for (const m of reply.replace(/```[\s\S]*?(```|$)/g, '').matchAll(/^\s*(?:[-*·•]\s+)?(?:\*\*)?\(?([a-f])\)\s*(.+)$/gm)) {
+    if (m[1] !== 'abcdef'[options.length]) break;
+    const line = m[2].replace(/^\*\*\s*/, '');
+    const bold = /^(.+?)\*\*\s*(?:[—–:-]\s*)?(.*)$/.exec(line);
+    const [label, detail] = bold ? [bold[1], bold[2]] : (line.split(/\s+[—–]\s+|:\s+|\s+-\s+/, 2) as [string, string?]);
+    const clean = (t = '') => t.replace(/[*_`]/g, '').trim();
+    options.push({ label: clean(label).replace(/[.,;]$/, ''), ...(clean(detail) ? { detail: clean(detail) } : {}) });
+  }
+  return options.length >= 2 ? { question, options } : null;
 }
 
 // A single shell command the reply tells you to run ("```sh\nnpm i express\n```").

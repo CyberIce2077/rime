@@ -100,6 +100,8 @@ export async function openDb(file = DB_PATH) {
     drop: db.prepare('DELETE FROM messages WHERE conversation = ? AND seq = ?'),
     touch: db.prepare('UPDATE conversations SET updated = ? WHERE id = ?'),
     title: db.prepare("UPDATE conversations SET title = ? WHERE id = ? AND title = ''"),
+    rename: db.prepare('UPDATE conversations SET title = ? WHERE id = ?'),
+    forget: [db.prepare('DELETE FROM messages WHERE conversation = ?'), db.prepare('DELETE FROM timeline WHERE conversation = ?'), db.prepare('DELETE FROM conversations WHERE id = ?')],
     usage: db.prepare('UPDATE conversations SET tokens = tokens + ?, cost = cost + ?, model = ? WHERE id = ?'),
     prefix: db.prepare('UPDATE conversations SET prefix = ?, prefix_hash = ? WHERE id = ?'),
     rules: db.prepare('UPDATE conversations SET rules = ? WHERE id = ?'),
@@ -152,6 +154,18 @@ export async function openDb(file = DB_PATH) {
       q.touch.run(Date.now(), conv);
     },
     remove: (conv: number, seq: number) => void q.drop.run(conv, seq),
+    // From the conversations window: a new title, or the whole conversation gone.
+    rename: (conv: number, title: string) => void q.rename.run(title, conv),
+    delete(conv: number) {
+      db.exec('BEGIN');
+      try {
+        for (const s of q.forget) s.run(conv);
+        db.exec('COMMIT');
+      } catch (e) {
+        db.exec('ROLLBACK');
+        throw e;
+      }
+    },
     usage: (conv: number, tokens: number, cost: number, model: string) => void q.usage.run(tokens, cost, model, conv),
     setPrefix: (conv: number, prefix: string, hash?: string) => void q.prefix.run(prefix, hash ?? null, conv),
     setRules: (conv: number, rules: object) => void q.rules.run(JSON.stringify(rules), conv),
