@@ -46,7 +46,7 @@ export async function listModels(conn: Conn) {
   return conn.wire === 'anthropic' ? anthropic.listModels(conn.base, conn.key) : openai.listModels(conn.base, conn.key);
 }
 
-export function modelOf(cfg: Config, conn: Conn, id: string, info: { label?: string; context?: number; price?: Model['price'] } = {}): Model {
+export function modelOf(cfg: Config, conn: Conn, id: string, info: { label?: string; context?: number; price?: Model['price']; vision?: boolean } = {}): Model {
   const ref = `${conn.name}/${id}`;
   const o = cfg.models[ref] ?? {};
   return {
@@ -58,6 +58,8 @@ export function modelOf(cfg: Config, conn: Conn, id: string, info: { label?: str
     price: o.price ?? (conn.local ? { in: 0, read: 0, write: 0, out: 0 } : info.price),
     efforts: o.efforts,
     budgets: o.budgets,
+    // Every current Claude model sees images; elsewhere the listing or the server says.
+    vision: o.vision ?? info.vision ?? (conn.wire === 'anthropic' ? true : undefined),
   };
 }
 

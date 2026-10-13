@@ -39,13 +39,14 @@ export async function postStream(url: string, headers: Record<string, string>, b
 }
 
 // A JSON request with a timeout. Resolves to { status, json } and never throws
-// on HTTP errors; network errors and timeouts reject.
-export async function call(url: string, opts: { method?: string; headers?: Record<string, string>; body?: Json; timeout?: number } = {}) {
+// on HTTP errors; network errors, timeouts and aborts reject.
+export async function call(url: string, opts: { method?: string; headers?: Record<string, string>; body?: Json; timeout?: number; signal?: AbortSignal } = {}) {
+  const timeout = AbortSignal.timeout(opts.timeout ?? 5000);
   const res = await fetch(url, {
     method: opts.method || (opts.body ? 'POST' : 'GET'),
     headers: { ...(opts.body ? { 'content-type': 'application/json' } : {}), ...opts.headers },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
-    signal: AbortSignal.timeout(opts.timeout ?? 5000),
+    signal: opts.signal ? AbortSignal.any([timeout, opts.signal]) : timeout,
   });
   const text = await res.text();
   let json: any = null;

@@ -32,6 +32,7 @@ export type ModelConfig = {
   price?: Price;
   efforts?: Partial<Record<Effort | 'off', string>>;
   budgets?: Partial<Record<Effort, number>>;
+  vision?: boolean;
 };
 
 export type Config = {

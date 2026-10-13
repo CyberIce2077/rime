@@ -7,7 +7,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { argv, buildOf, parseGpu, parseIni, parseUnit, sections, sshHosts } from '../src/setup/ssh.ts';
 import { magicPacket, wake } from '../src/setup/wol.ts';
-import { runSteps } from '../src/setup/steps.ts';
+import { Cancelled, happened, runSteps } from '../src/setup/steps.ts';
+import { createServer } from '../src/setup/panels.ts';
+import { styles } from '../src/core/view.ts';
+import { stripAnsi } from '../src/core/term.ts';
 import { createLoader, bar } from '../src/setup/loader.ts';
 import { PALETTE, SCENE, SPRITE } from '../src/core/header.ts';
 import { startMock } from './fixtures/mock-llama.ts';
@@ -143,6 +146,103 @@ test('setup steps: a failing step stops the run with its error', { timeout: 1500
     await assert.rejects(run.promise, /ssh failed/);
     assert.equal(run.state.steps[1].status, 'fail');
     assert.equal(run.state.steps[2].status, 'todo');
+  } finally {
+    await r.close();
+  }
+});
+
+test('setup steps: cancelling a load unloads it again and closes Rime\'s tunnel', { timeout: 30000 }, async () => {
+  const r = await rig(true);
+  const tunnel = { child: null as any, port: 0 };
+  try {
+    const run = runSteps(
+      { name: 'gpubox', host: 'gpubox', remote: r.remote, model: 'qwen3.8-27b', router: true },
+      { system: 'SYS', controls: { reasoning: true }, tunnel, onUpdate: (s) => s.steps[4].status === 'run' && run.cancel() },
+    );
+    await assert.rejects(run.promise, Cancelled);
+    assert.deepEqual(run.state.steps.map((v) => v.status), ['done', 'done', 'done', 'done', 'stopped', 'todo', 'todo']);
+    assert.ok(r.mock.state.requests.some((q) => q.path === '/models/unload'), 'POST /models/unload');
+    assert.equal(tunnel.port, 0, 'Rime closed the tunnel it opened');
+    assert.deepEqual(happened({ host: 'gpubox', model: 'qwen3.8-27b' }, run.state), ['opened Rime\'s tunnel (closed now)', 'started llama-server', 'loading qwen3.8-27b, unloaded again']);
+  } finally {
+    tunnel.child?.kill();
+    await r.close();
+  }
+});
+
+test('setup steps: cancelling the wake wait stops at once', { timeout: 15000 }, async () => {
+  const r = await rig(false);
+  const tunnel = { child: null as any, port: 0 };
+  try {
+    const run = runSteps(
+      { name: 'gpubox', host: 'gpubox', remote: r.remote, model: 'qwen3.8-27b', router: true },
+      { system: 'SYS', controls: { reasoning: false }, edited: { wake: 'true' }, tunnel, onUpdate: () => {} },
+    );
+    setTimeout(() => run.cancel(), 600);
+    const t0 = Date.now();
+    await assert.rejects(run.promise, Cancelled);
+    assert.ok(Date.now() - t0 < 2000, 'no waiting for the machine');
+    assert.equal(run.state.steps[0].status, 'stopped');
+    assert.deepEqual(happened({ host: 'gpubox' }, run.state), ['stopped waiting for gpubox (it may still boot)']);
+  } finally {
+    await r.close();
+  }
+});
+
+// /server against the mock: a server with nothing loaded offers to load it.
+async function serverPanel(r: Awaited<ReturnType<typeof rig>>) {
+  const said: string[] = [], calls: string[] = [];
+  const cfg = { providers: { gpubox: { preset: 'llamacpp', ssh: 'gpubox', model: 'qwen3.8-27b', tunnel: { remote: r.remote } } }, models: {} };
+  const panel = createServer({
+    st: styles('none'), cfg, system: 'SYS', redraw() {}, close: () => calls.push('close'), setBuffer() {}, save() {}, activate() {}, open() {},
+    say: (it: any) => said.push(it.text ?? ''), tunnel: () => ({ child: null, port: r.mock.port }), background() {},
+    openSteps() {}, ensure: (n: string) => calls.push(`ensure ${n}`), down: (n: string) => calls.push(`down ${n}`), promptRate: () => undefined,
+  } as any, 'gpubox');
+  const text = () => panel.view(80).rows.map((x) => stripAnsi(x.line.map((c) => c.t).join(''))).join('\n');
+  const until = async (re: RegExp) => {
+    for (let i = 0; i < 100 && !re.test(text()); i++) await new Promise((res) => setTimeout(res, 50));
+    assert.match(text(), re);
+  };
+  return { panel, text, until, said, calls };
+}
+
+test('/server: load the model back after an unload, and confirm before unloading', { timeout: 20000 }, async () => {
+  const r = await rig(true);
+  r.mock.state.started = true;
+  try {
+    const s = await serverPanel(r);
+    await s.until(/no model loaded/);
+    await s.until(/› Load qwen3\.8-27b/);
+    s.panel.key({ name: 'enter' }, '');
+    await s.until(/qwen3\.8-27b is loaded\./);
+    assert.equal(r.mock.state.loaded, true);
+    assert.ok(s.calls.includes('ensure gpubox'), 'the chat reconnects');
+    await s.until(/› Unload model/);
+    s.panel.key({ name: 'enter' }, '');
+    assert.match(s.text(), /Unload qwen3\.8-27b\?[\s\S]*runs: POST \/models\/unload[\s\S]*› Unload\s+[\s\S]*Keep it loaded/);
+    s.panel.key({ name: 'escape' }, '');
+    assert.equal(r.mock.state.loaded, true, 'esc keeps it loaded');
+    s.panel.key({ name: 'enter' }, '');
+    s.panel.key({ name: 'enter' }, '');
+    await s.until(/was unloaded/);
+    assert.equal(r.mock.state.loaded, false);
+    assert.ok(s.calls.includes('down gpubox'));
+  } finally {
+    await r.close();
+  }
+});
+
+test('/server: ctrl+c stops a load part-way and unloads it again', { timeout: 20000 }, async () => {
+  const r = await rig(true);
+  r.mock.state.started = true;
+  try {
+    const s = await serverPanel(r);
+    await s.until(/› Load qwen3\.8-27b/);
+    s.panel.key({ name: 'enter' }, '');
+    assert.match(s.text(), /loading qwen3\.8-27b/);
+    s.panel.cancel!();
+    await s.until(/Cancelled\. Loading was stopped and the model unloaded again/);
+    assert.ok(r.mock.state.requests.some((q) => q.path === '/models/unload'));
   } finally {
     await r.close();
   }

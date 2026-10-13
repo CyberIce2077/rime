@@ -17,6 +17,8 @@ export const GLACIER = {
   ok: hex('#8FE3C8'),
   del: hex('#F2A3B3'),
   warn: hex('#F5D58A'),
+  water: hex('#163047'), // chips (rime-prompt.html)
+  water2: hex('#21445F'),
 };
 
 export const blend = (fg: RGB, a: number, under: RGB): RGB =>

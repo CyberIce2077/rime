@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { caretOf, layoutInput, prompt, renderItem, styles } from '../src/core/view.ts';
+import { caretOf, layoutInput, prompt, renderItem, splitToolCalls, styles } from '../src/core/view.ts';
 import { stripAnsi, strWidth } from '../src/core/term.ts';
 
 const st = styles('none');
@@ -25,4 +25,14 @@ test('a reply is indented two cells and wrapped at 76', () => {
   assert.ok(lines.every((l) => l.startsWith('  ')));
   assert.ok(lines.every((l) => strWidth(l) <= 78));
   assert.equal(stripAnsi(lines.at(-1)!), '  · item');
+});
+
+test('tool calls written as text are caught until Rime has tools', () => {
+  const qwen = 'Let me look.\n<tool_call>\n<function=Bash>\n<parameter=command>\nls -la src\n</parameter>\n</function>\n</tool_call>';
+  assert.deepEqual(splitToolCalls(qwen), { text: 'Let me look.', calls: ['`ls -la src`'] });
+  assert.deepEqual(splitToolCalls('<tool_call>\n{"name": "read", "arguments": {"path": "a.ts"}}\n</tool_call>').calls, ['`a.ts`']);
+  assert.deepEqual(splitToolCalls('Checking <tool_c'), { text: 'Checking ', calls: [] }, 'a half-streamed tag stays hidden');
+  assert.deepEqual(splitToolCalls('a < b'), { text: 'a < b', calls: [] });
+  const r = renderItem({ kind: 'reply', text: qwen, done: true }, 80, st);
+  assert.deepEqual(r.map(stripAnsi), ['  Let me look.']);
 });

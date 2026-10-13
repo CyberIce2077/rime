@@ -61,13 +61,13 @@ export async function routerModels(root: string): Promise<ServerModel[] | null> 
   }));
 }
 
-export const loadModel = (root: string, model: string) => call(`${root}/models/load`, { body: { model }, timeout: 15000 });
+export const loadModel = (root: string, model: string, signal?: AbortSignal) => call(`${root}/models/load`, { body: { model }, timeout: 15000, signal });
 export const unloadModel = (root: string, model: string) => call(`${root}/models/unload`, { body: { model }, timeout: 15000 });
 
 // Waits until `model` is loaded, reporting 0..1 progress from /models/sse
 // (download bytes, then loading stages) and polling /models as a fallback.
 // Progress never moves backwards (the docs warn mmap can misreport).
-export async function waitLoaded(root: string, model: string, onProgress: (p: number | null) => void, timeoutMs = 600000) {
+export async function waitLoaded(root: string, model: string, onProgress: (p: number | null) => void, timeoutMs = 600000, signal?: AbortSignal) {
   let best = 0;
   const report = (p: number | null) => {
     if (p === null) return onProgress(null);
@@ -95,6 +95,8 @@ export async function waitLoaded(root: string, model: string, onProgress: (p: nu
       ac.abort();
       reject(e);
     };
+    if (signal?.aborted) return fail(new Error('cancelled'));
+    signal?.addEventListener('abort', () => fail(new Error('cancelled')), { once: true });
     // ponytail: the /models/sse event shape is read leniently (verify on b11514).
     fetch(`${root}/models/sse`, { signal: ac.signal })
       .then(async (res) => {

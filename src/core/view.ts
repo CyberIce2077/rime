@@ -4,6 +4,7 @@
 import { type ColorMode, type RGB, GLACIER, PLACEHOLDER, RESET, SELECTION, sgr } from './theme.ts';
 import { type Line, type Run, fit, lineWidth, serialize, strWidth, wrap } from './term.ts';
 import type { Turn } from '../plugins/token-kit/meter.ts';
+import { type Change, WHEN } from './settings.ts';
 import { fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
 
 export type Styles = ReturnType<typeof styles>;
@@ -19,6 +20,10 @@ export function styles(mode: ColorMode) {
     dim: c(G.dim), ok: c(G.ok), del: c(G.del), warn: c(G.warn), line: c(G.line),
     bold: b, placeholder: c(PLACEHOLDER), panelBg: sgr(G.panel, true, mode),
     selection: mode === 'none' ? '\x1b[7m' : sgr(SELECTION, true, mode) + c(G.title),
+    // A chip in the prompt or a sent message; `chipOn` when the caret is on it.
+    chip: mode === 'none' ? '' : sgr(G.water, true, mode) + c(G.accent),
+    chipWarn: mode === 'none' ? '' : sgr(G.water, true, mode) + c(G.warn),
+    chipOn: mode === 'none' ? '\x1b[4m' : sgr(G.water2, true, mode) + b + c(G.accent),
   };
 }
 
@@ -29,12 +34,13 @@ export const str = (l: Line, st: Styles) => serialize(l, st.reset);
 
 export type Item =
   | { kind: 'header'; lines: () => string[] }
-  | { kind: 'user'; text: string }
+  | { kind: 'user'; text: string; chips?: Record<string, string> } // chip char -> its label
   | { kind: 'reply'; text: string; done: boolean }
   | { kind: 'tool'; verb: string; rest?: string; extra?: Line }
   | { kind: 'cost'; turn: Turn }
   | { kind: 'note'; text: string; tone: 'warn' | 'dim' }
-  | { kind: 'lines'; lines: Line[] }; // already styled, e.g. "● gpubox is ready" 
+  | { kind: 'lines'; lines: Line[] } // already styled, e.g. "● gpubox is ready"
+  | { kind: 'gear'; change: Change; note?: string }; // a setting Rime changed, with undo
 
 // Messages are capped at 76ch like the prototype's .msg.
 const MSG = 76;
@@ -70,6 +76,34 @@ export function markdown(text: string, st: Styles): Line[] {
   return out;
 }
 
+// Until Rime has tools (Phase 4), a model with none in the request may write
+// its own tool calls as text: Qwen's `<tool_call><function=Bash><parameter=command>
+// ls -la</parameter>…` or the JSON form. Returns the text before them (without a
+// half-streamed tag) and a short description of each call.
+export function splitToolCalls(text: string): { text: string; calls: string[] } {
+  const i = text.indexOf('<tool_call>');
+  if (i < 0) {
+    const tail = text.slice(text.lastIndexOf('<'));
+    return { text: tail.length < 11 && '<tool_call>'.startsWith(tail) ? text.slice(0, -tail.length) : text, calls: [] };
+  }
+  const calls = [...text.slice(i).matchAll(/<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g)].map(([, body]) => {
+    let name = /<function=([^>\s]+)>/.exec(body)?.[1];
+    let arg = /<parameter=[^>]*>\s*([\s\S]*?)\s*(?:<\/parameter>|$)/.exec(body)?.[1];
+    if (!name) {
+      try {
+        const j = JSON.parse(body.trim());
+        name = j.name;
+        const a = typeof j.arguments === 'string' ? JSON.parse(j.arguments) : j.arguments;
+        arg = Object.values(a ?? {}).find((v) => typeof v === 'string') as string | undefined;
+      } catch {}
+    }
+    const one = (arg ?? '').split('\n')[0].trim();
+    if (!one) return name ?? 'a tool';
+    return `\`${one.length > 48 ? one.slice(0, 47) + '…' : one}${one.length <= 48 && (arg ?? '').includes('\n') ? ' …' : ''}\``;
+  });
+  return { text: text.slice(0, i).trimEnd(), calls };
+}
+
 const indent = (lines: Line[], n: number) => lines.map((l) => [run(' '.repeat(n)), ...l]);
 
 // Renders one item to terminal lines.
@@ -80,12 +114,14 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
       return ['', ...item.lines(), ''];
     case 'user': {
       const w = Math.min(MSG, width);
+      // Chips keep their look in the transcript (and their preview on hover).
+      const body = (p: string): Line => [...p].map((ch) => (item.chips?.[ch] ? run(`[${item.chips[ch]}]`, st.chip) : run(ch, st.title)));
       const lines = item.text.split('\n').flatMap((p, i) =>
-        wrap(i === 0 ? [run('› ', st.accentB), run(p, st.title)] : [run(p, st.title)], w));
+        wrap(i === 0 ? [run('› ', st.accentB), ...body(p)] : body(p), w));
       return all(lines);
     }
     case 'reply':
-      return all(indent(markdown(item.text, st).flatMap((l) => wrap(l, Math.min(MSG, width - 2))), 2));
+      return all(indent(markdown(splitToolCalls(item.text).text, st).flatMap((l) => wrap(l, Math.min(MSG, width - 2))), 2));
     case 'tool': // the screen cuts it to width
       return all([[run('● ', st.accent), run(item.verb, st.titleB), ...(item.rest ? [run(' ' + item.rest, st.dim)] : []), ...(item.extra || [])]]);
     case 'cost': {
@@ -101,6 +137,12 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
     }
     case 'lines':
       return item.lines.map((l) => str(l, st));
+    case 'gear': {
+      // ⚙ effort high (was medium) · from the next message · undo
+      const c = item.change;
+      const what = item.note ?? `${c.label} ${c.to} (was ${c.from}) · ${WHEN[c.applies]}`;
+      return all([[run('⚙ ', st.accent), run(what, st.dim), ...(item.note ? [] : c.undone ? [run(' · undone', st.dim)] : [run(' · ', st.dim), run('undo', st.accent)])]]);
+    }
     case 'note': {
       const w = Math.min(MSG, width - 2);
       const lines = item.text.split('\n').flatMap((p, i) =>
@@ -112,16 +154,19 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
 
 // ---- Boxes ----
 
-export type BoxRow = { line: Line; bg?: string; rule?: 'inner' | 'full'; hit?: string };
+export type BoxRow = { line: Line; bg?: string; rule?: 'inner' | 'full'; hit?: string; segs?: Hit[] };
 
 // A rounded frame with a legend in the top border, like the prototype's
-// .cmds / .usage boxes. Rows get one cell of padding on each side.
-export function box(legend: string | Line, rows: BoxRow[], width: number, st: Styles, color = st.accent): { lines: string[]; hits: (string | undefined)[] } {
+// .cmds / .usage boxes. Rows get one cell of padding on each side. `hits` holds
+// the clickable ranges per line (1-based columns): whole rows, footer keys
+// (`segs`, relative to the row's text) and the ✕ on the frame (`closeId`).
+export function box(legend: string | Line, rows: BoxRow[], width: number, st: Styles, color = st.accent, closeId?: string): { lines: string[]; hits: Hit[][] } {
   const inner = width - 2;
   const lg: Line = typeof legend === 'string' ? [run(legend, color)] : legend;
-  const top = [run('╭─ ', color), ...lg, run(' ' + '─'.repeat(Math.max(0, inner - lineWidth(lg) - 3)) + '╮', color)];
+  const x = closeId ? [run(' ✕ ', st.dim), run('─', color)] : [];
+  const top = [run('╭─ ', color), ...lg, run(' ' + '─'.repeat(Math.max(0, inner - lineWidth(lg) - 3 - lineWidth(x))), color), ...x, run('╮', color)];
   const lines: string[] = [str(fit(top, width, false), st)];
-  const hits: (string | undefined)[] = [undefined];
+  const hits: Hit[][] = [closeId ? [{ x0: width - 4, x1: width - 2, id: closeId }] : []];
   for (const r of rows) {
     if (r.rule === 'full') lines.push(str([run('├', color), run('─'.repeat(inner), st.line), run('┤', color)], st));
     else if (r.rule === 'inner') lines.push(str([run('│ ', color), run('─'.repeat(inner - 2), st.line), run(' │', color)], st));
@@ -130,10 +175,10 @@ export function box(legend: string | Line, rows: BoxRow[], width: number, st: St
       const pad = run(' ', r.bg || '');
       lines.push(str([run('│', color), pad, ...body, pad, run('│', color)], st));
     }
-    hits.push(r.hit);
+    hits.push([...(r.hit ? [{ x0: 1, x1: width, id: r.hit }] : []), ...(r.segs ?? []).filter((h) => h.x1 <= inner - 2).map((h) => ({ ...h, x0: h.x0 + 2, x1: h.x1 + 2 }))]);
   }
   lines.push(str([run('╰' + '─'.repeat(inner) + '╯', color)], st));
-  hits.push(undefined);
+  hits.push([]);
   return { lines, hits };
 }
 
@@ -156,27 +201,38 @@ export function settingRow(label: string, value: string, selected: boolean, st: 
 }
 
 // The box foot: a rule, then dim text where `keys` (bold accent) and plain parts
-// alternate, e.g. ['↑ ↓', ' choose · ', 'enter', ' next'].
+// alternate, e.g. ['↑ ↓', ' choose · ', 'enter', ' next']. Every key is also
+// clickable (SPEC §5.1): its hit id is `key:<key>`.
 export function footRows(text: string | string[], st: Styles): BoxRow[] {
   const parts = typeof text === 'string' ? [text] : text;
-  return [{ line: [], rule: 'full' }, { line: parts.map((t, i) => run(t, parts.length > 1 && i % 2 === 0 ? st.accentB : st.dim)) }];
+  const segs: Hit[] = [];
+  let x = 1;
+  parts.forEach((t, i) => {
+    const w = strWidth(t);
+    if (parts.length > 1 && i % 2 === 0 && t) segs.push({ x0: x, x1: x + w - 1, id: `key:${t}` });
+    x += w;
+  });
+  return [{ line: [], rule: 'full' }, { line: parts.map((t, i) => run(t, parts.length > 1 && i % 2 === 0 ? st.accentB : st.dim)), segs }];
 }
 
 // ---- Prompt ----
 
-export type PromptView = { lines: string[]; cursor: { row: number; col: number } };
-
 const PLACEHOLDER_TEXT = 'ask Rime to change some code, or / for commands';
 
+// How wide a character is in the prompt: chips (private-use characters) show as
+// their [label].
+export type ChipWidth = (ch: string) => number | undefined;
+const cellW = (ch: string, chipW?: ChipWidth) => chipW?.(ch) ?? strWidth(ch);
+
 // Splits the buffer into rows of `tw` cells, remembering where each row starts.
-export function layoutInput(buf: string, tw: number) {
+export function layoutInput(buf: string, tw: number, chipW?: ChipWidth) {
   const rows: { start: number; text: string }[] = [];
   let pos = 0;
   for (const para of buf.split('\n')) {
     let cur = '', w = 0, start = pos;
     for (const ch of para) {
-      const cw = strWidth(ch);
-      if (w + cw > tw) { rows.push({ start, text: cur }); start = pos; cur = ''; w = 0; }
+      const cw = Math.min(tw, cellW(ch, chipW));
+      if (w + cw > tw && cur) { rows.push({ start, text: cur }); start = pos; cur = ''; w = 0; }
       cur += ch; w += cw; pos += ch.length;
     }
     rows.push({ start, text: cur });
@@ -185,29 +241,77 @@ export function layoutInput(buf: string, tw: number) {
   return rows;
 }
 
-export function caretOf(rows: { start: number; text: string }[], cursor: number) {
+const rowWidth = (s: string, chipW?: ChipWidth) => [...s].reduce((w, ch) => w + cellW(ch, chipW), 0);
+
+export function caretOf(rows: { start: number; text: string }[], cursor: number, chipW?: ChipWidth) {
   let r = 0;
   for (let i = 0; i < rows.length; i++) if (rows[i].start <= cursor) r = i;
-  return { row: r, col: strWidth(rows[r].text.slice(0, cursor - rows[r].start)) };
+  return { row: r, col: rowWidth(rows[r].text.slice(0, cursor - rows[r].start), chipW) };
 }
 
-export function prompt(buf: string, cursor: number, width: number, maxRows: number, st: Styles, placeholder = PLACEHOLDER_TEXT, masked = false): PromptView {
+// The buffer offset under a cell of a laid-out row (for clicks and drags).
+export function offsetAt(row: { start: number; text: string }, col: number, chipW?: ChipWidth) {
+  let w = 0, i = 0;
+  for (const ch of row.text) {
+    const cw = cellW(ch, chipW);
+    if (w + cw / 2 > col) break;
+    w += cw;
+    i += ch.length;
+  }
+  return row.start + i;
+}
+
+export type PromptOpts = {
+  placeholder?: string;
+  masked?: boolean;
+  sel?: [number, number]; // selected buffer range
+  chip?: (ch: string) => { label: string; warn?: boolean } | undefined;
+  near?: string; // the chip the caret is on
+};
+
+export type PromptView = { lines: string[]; cursor: { row: number; col: number }; rows: { start: number; text: string }[]; first: number; hits: Hit[] };
+
+export function prompt(buf: string, cursor: number, width: number, maxRows: number, st: Styles, o: PromptOpts = {}): PromptView {
   const inner = width - 4, tw = Math.max(1, inner - 2);
   const border = st.dim; // .prompt:focus-within, and the prompt always has focus
-  if (masked) buf = '•'.repeat([...buf].length), cursor = buf.length;
-  const rows = layoutInput(buf, tw);
-  const caret = caretOf(rows, cursor);
+  const placeholder = o.placeholder ?? PLACEHOLDER_TEXT;
+  if (o.masked) buf = '•'.repeat([...buf].length), cursor = buf.length;
+  const chipW: ChipWidth | undefined = o.chip ? (ch) => { const c = o.chip!(ch); return c ? strWidth(c.label) + 2 : undefined; } : undefined;
+  const rows = layoutInput(buf, tw, chipW);
+  const caret = caretOf(rows, cursor, chipW);
   // Keep the caret's row in view when the input is taller than allowed.
   const first = Math.max(0, Math.min(caret.row - maxRows + 1, rows.length - maxRows));
   const shown = rows.slice(first, first + maxRows);
   const lines = [str([run('╭' + '─'.repeat(width - 2) + '╮', border)], st)];
   shown.forEach((r, i) => {
     const lead = first + i === 0 ? run('› ', st.accentB) : run('  ');
-    const text = buf ? run(r.text, st.title) : run(placeholder, st.placeholder);
-    lines.push(str([run('│ ', border), ...fit([lead, text], inner, !buf), run(' │', border)], st));
+    const text: Line = [];
+    if (!buf) text.push(run(placeholder, st.placeholder));
+    let at = r.start;
+    for (const ch of r.text) {
+      const selected = !!o.sel && at >= o.sel[0] && at < o.sel[1];
+      const c = o.chip?.(ch);
+      if (c) text.push(run(`[${c.label}]`, selected ? st.selection : ch === o.near ? st.chipOn : c.warn ? st.chipWarn : st.chip));
+      else text.push(run(ch, selected ? st.selection : st.title));
+      at += ch.length;
+    }
+    lines.push(str([run('│ ', border), ...fit([lead, ...text], inner, !buf), run(' │', border)], st));
   });
-  lines.push(str([run('╰' + '─'.repeat(width - 2) + '╯', border)], st));
-  return { lines, cursor: { row: 1 + caret.row - first, col: 4 + caret.col } };
+  // With more than one line the frame shows the count and the keys (clickable).
+  const hits: Hit[] = [];
+  const n = buf.split('\n').length;
+  const foot: Line = n > 1 && !o.masked ? [run(` ${n} lines · `, st.dim), run('enter', st.accentB), run(' send · ', st.dim), run('ctrl+j', st.accentB), run(' new line ', st.dim)] : [];
+  const fw = lineWidth(foot);
+  if (fw && fw + 4 <= width) {
+    let x = width - 1 - fw; // 1-based column where the foot starts
+    for (const r of foot) {
+      const w = strWidth(r.t);
+      if (r.t === 'enter' || r.t === 'ctrl+j') hits.push({ x0: x, x1: x + w - 1, id: `key:${r.t}` });
+      x += w;
+    }
+    lines.push(str([run('╰' + '─'.repeat(width - 3 - fw), border), ...foot, run('─╯', border)], st));
+  } else lines.push(str([run('╰' + '─'.repeat(width - 2) + '╯', border)], st));
+  return { lines, cursor: { row: 1 + caret.row - first, col: 4 + caret.col }, rows, first, hits };
 }
 
 // ---- Status line ----

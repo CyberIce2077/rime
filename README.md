@@ -62,12 +62,14 @@ rime connect http://localhost:8080 --name local
 | Key | Does |
 |---|---|
 | `enter` | send |
-| `shift+enter` | new line |
-| `esc` | stop the reply, or close a box |
+| `ctrl+j` | new line (`shift+enter` too, where the terminal reports it) |
+| `esc` | stop the reply, go back one screen, or close a box |
+| `ctrl+c` | cancel what is open or running |
 | `↑` | edit your last message |
+| `ctrl+v` | paste an image from the clipboard |
 | `/` | commands |
 | `?` | shortcuts |
-| `ctrl+c` twice | quit |
+| `ctrl+c` twice | quit (only when nothing is open) |
 
 | Command | Does |
 |---|---|
@@ -75,9 +77,14 @@ rime connect http://localhost:8080 --name local
 | `/setup` | connect your own server, this computer, or a provider |
 | `/server` | status and controls for your server: load, restart, stop, power off |
 | `/connect` | add a provider or URL directly |
+| `/settings` | every setting, applied right away, with undo |
 | `/usage` | tokens, cost and cache savings |
 | `/clear` | start a new conversation |
 | `/exit` | quit |
+
+Drag a file, folder, screenshot or video onto the terminal, or paste a long log, and it
+becomes a chip in the prompt. Put the cursor on a chip or point at it to see exactly what
+the model will get; the line under the prompt sums up the whole message.
 
 To copy text, drag to select it; Rime copies the selection when you let go.
 Set `NO_COLOR` to turn colour off, or `RIME_NO_ANIMATION=1` to skip the snowfall.

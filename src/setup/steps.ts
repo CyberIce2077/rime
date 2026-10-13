@@ -29,8 +29,9 @@ export type Server = {
   router: boolean;
 };
 
-export type StepView = { id: Step; cmd: string; note?: string; status: 'todo' | 'run' | 'done' | 'off' | 'fail'; result: string; progress: number | null; detail?: string };
-export type RunState = { steps: StepView[]; overall: number; done: boolean; error?: string };
+export type StepView = { id: Step; cmd: string; note?: string; status: 'todo' | 'run' | 'done' | 'off' | 'fail' | 'stopped'; result: string; progress: number | null; detail?: string };
+// `opened`: Rime opened its own tunnel in this run (closed again on cancel).
+export type RunState = { steps: StepView[]; overall: number; done: boolean; error?: string; cancelled?: boolean; opened?: boolean };
 
 export function defaults(s: Server, port: number | string, effort = 'medium'): Record<Step, string> {
   return {
@@ -52,7 +53,14 @@ export const NOTES: Partial<Record<Step, (s: Server) => string>> = {
 export type Run = {
   state: RunState;
   promise: Promise<{ base: string; tps?: number; warm?: number }>;
+  cancel(): void; // stops the current step now (docs/providers.md §3.6)
 };
+
+export class Cancelled extends Error {
+  constructor() {
+    super('cancelled');
+  }
+}
 
 type Opts = {
   edited?: Partial<Record<Step, string>>;
@@ -66,11 +74,29 @@ type Opts = {
 };
 
 const secs = (ms: number) => (ms < 10000 ? (ms / 1000).toFixed(1) : String(Math.round(ms / 1000))) + 's';
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleepFor = (signal: AbortSignal) => (ms: number) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new Cancelled());
+    const t = setTimeout(() => {
+      signal.removeEventListener('abort', stop);
+      resolve();
+    }, ms);
+    const stop = () => {
+      clearTimeout(t);
+      reject(new Cancelled());
+    };
+    signal.addEventListener('abort', stop, { once: true });
+  });
 const lastLine = (s: string) => s.trim().split('\n').at(-1) ?? '';
 
 export function runSteps(s: Server, o: Opts): Run {
   const usual = o.usualWakeSeconds ?? 30;
+  const ac = new AbortController();
+  const signal = ac.signal;
+  const sleep = sleepFor(signal);
+  const halt = () => {
+    if (signal.aborted) throw new Cancelled();
+  };
   const base = () => `http://127.0.0.1:${o.tunnel.port}`;
   const cmds = { ...defaults(s, o.tunnel.port || '{port}', o.controls.effort ?? 'default'), ...o.edited };
   const state: RunState = {
@@ -85,10 +111,12 @@ export function runSteps(s: Server, o: Opts): Run {
   };
   const edited = (id: Step) => o.edited?.[id] !== undefined;
   const answers = async () => {
+    halt();
     const r = await llama.health(base(), 1500).catch(() => null);
     return r !== null && (r.status === 200 || r.status === 503);
   };
   const reachable = async () => {
+    halt();
     const h = await resolveHost(s.host);
     return tcpOpen(h.hostname, h.port, 1500);
   };
@@ -98,7 +126,7 @@ export function runSteps(s: Server, o: Opts): Run {
       if (await reachable()) return 'on';
       if (!s.mac && !edited('wake')) throw new Error(`${s.host} is off and Rime has no MAC address to wake it`);
       const t0 = Date.now();
-      if (edited('wake')) await shell(v.cmd, 10000);
+      if (edited('wake')) await shell(v.cmd, 10000, signal);
       else {
         const h = await resolveHost(s.host);
         await wake(s.mac!, s.broadcast);
@@ -116,7 +144,8 @@ export function runSteps(s: Server, o: Opts): Run {
     },
     async connect(v) {
       const t0 = Date.now();
-      const r = await shell(v.cmd, 20000);
+      const r = await shell(v.cmd, 20000, signal);
+      halt();
       if (r.code !== 0) throw new Error(`ssh failed: ${lastLine(r.err) || `exit ${r.code}`}`);
       return secs(Date.now() - t0);
     },
@@ -134,7 +163,9 @@ export function runSteps(s: Server, o: Opts): Run {
       v.cmd = cmd;
       const child = spawn('sh', ['-c', `exec ${cmd}`], { stdio: 'ignore' });
       o.tunnel.child = child;
+      state.opened = true;
       while (!(await tcpOpen('127.0.0.1', o.tunnel.port, 300))) {
+        halt();
         if (child.exitCode !== null) throw new Error(`the tunnel closed (exit ${child.exitCode})`);
         if (Date.now() - t0 > 15000) throw new Error('the tunnel didn\'t open within 15 s');
         await sleep(200);
@@ -144,7 +175,8 @@ export function runSteps(s: Server, o: Opts): Run {
     async start(v) {
       if (await answers()) return 'running';
       const t0 = Date.now();
-      const r = await ssh(s.host, v.cmd, 30000);
+      const r = await ssh(s.host, v.cmd, 30000, undefined, signal);
+      halt();
       if (r.code !== 0) throw new Error(`${v.cmd}: ${lastLine(r.err) || `exit ${r.code}`}`);
       while (!(await answers())) {
         if (Date.now() - t0 > 60000) throw new Error('llama-server didn\'t answer on /health within 60 s');
@@ -161,6 +193,7 @@ export function runSteps(s: Server, o: Opts): Run {
         v.progress = null;
         update();
         while ((await llama.health(base()).catch(() => null))?.status !== 200) {
+          halt();
           if (Date.now() - t0 > 600000) throw new Error('the model didn\'t load within 10 minutes');
           await sleep(500);
         }
@@ -170,17 +203,18 @@ export function runSteps(s: Server, o: Opts): Run {
       if (list?.find((m) => m.id === s.model)?.status === 'loaded') return 'loaded';
       const http = /^(GET|POST)\s+(\/\S*)\s*(.*)$/.exec(v.cmd);
       if (http) {
-        const r = await call(`${base()}${http[2]}`, { method: http[1], body: http[3] ? JSON.parse(http[3]) : undefined, timeout: 15000 });
+        const r = await call(`${base()}${http[2]}`, { method: http[1], body: http[3] ? JSON.parse(http[3]) : undefined, timeout: 15000, signal });
         if (r.status >= 400) throw new Error(`${http[1]} ${http[2]}: ${r.json?.error?.message ?? r.status}`);
       } else {
-        const r = await ssh(s.host, v.cmd, 60000);
+        const r = await ssh(s.host, v.cmd, 60000, undefined, signal);
+        halt();
         if (r.code !== 0) throw new Error(`${v.cmd}: ${lastLine(r.err) || `exit ${r.code}`}`);
       }
       await llama.waitLoaded(base(), s.model, (p) => {
         v.progress = p;
         v.result = p === null ? '' : `${Math.round(p * 100)}%`;
         update();
-      });
+      }, undefined, signal);
       return secs(Date.now() - t0);
     },
     async warm() {
@@ -189,6 +223,7 @@ export function runSteps(s: Server, o: Opts): Run {
       const r = await call(`${base()}/v1/chat/completions`, {
         body: { model: s.model, messages: [{ role: 'system', content: o.system }, { role: 'user', content: 'hi' }], max_tokens: 1, id_slot: 0, cache_prompt: true },
         timeout: 300000,
+        signal,
       });
       if (r.status >= 400) throw new Error(`warming the cache: ${r.json?.error?.message ?? r.status}`);
       const t = r.json?.timings;
@@ -199,6 +234,7 @@ export function runSteps(s: Server, o: Opts): Run {
       const r = await call(`${base()}/v1/chat/completions`, {
         body: { model: s.model, messages: [{ role: 'system', content: o.system }, { role: 'user', content: 'Reply with one word: ready' }], max_tokens: 16, ...extras },
         timeout: 300000,
+        signal,
       });
       if (r.status >= 400) throw new Error(`test reply: ${r.json?.error?.message ?? r.status}`);
       const tps = r.json?.timings?.predicted_per_second;
@@ -214,11 +250,29 @@ export function runSteps(s: Server, o: Opts): Run {
       update();
       try {
         v.result = await impl[v.id](v);
+        halt();
         v.status = 'done';
         v.progress = 1;
         v.detail = undefined;
         update();
       } catch (e) {
+        if (signal.aborted) {
+          // Each step stops in its own way: a load is unloaded again (which also
+          // cancels a download), and Rime closes the tunnel it opened (never one
+          // the user had open already).
+          v.status = 'stopped';
+          v.result = 'stopped';
+          v.detail = undefined;
+          state.cancelled = true;
+          if (v.id === 'load' && s.model) await llama.unloadModel(base(), s.model).catch(() => {});
+          if (state.opened) {
+            o.tunnel.child?.kill();
+            o.tunnel.child = null;
+            o.tunnel.port = 0;
+          }
+          update();
+          throw new Cancelled();
+        }
         v.status = 'fail';
         state.error = (e as Error).message;
         update();
@@ -230,5 +284,21 @@ export function runSteps(s: Server, o: Opts): Run {
     const num = (id: Step) => parseFloat(state.steps.find((x) => x.id === id)?.result.replace(/,/g, '') ?? '');
     return { base: `${base()}/v1`, tps: num('test') || undefined, warm: num('warm') || undefined };
   })();
-  return { state, promise };
+  return { state, promise, cancel: () => ac.abort() };
+}
+
+// What a cancelled run had already done, for "Setup stopped. So far Rime:".
+export function happened(s: Pick<Server, 'host' | 'model'>, state: RunState): string[] {
+  const out: string[] = [];
+  for (const v of state.steps) {
+    if (v.status === 'done') {
+      if (v.id === 'wake' && v.result !== 'on') out.push(`woke ${s.host}`);
+      if (v.id === 'tunnel' && state.opened) out.push('opened Rime\'s tunnel (closed now)');
+      if (v.id === 'start' && v.result !== 'running') out.push('started llama-server');
+      if (v.id === 'load' && v.result !== 'loaded') out.push(`loaded ${s.model ?? 'the model'}`);
+    } else if (v.status === 'stopped') {
+      out.push(v.id === 'load' ? `loading ${s.model ?? 'the model'}, unloaded again` : v.id === 'wake' ? `stopped waiting for ${s.host} (it may still boot)` : `stopped at ${NAMES[v.id]}`);
+    }
+  }
+  return out;
 }

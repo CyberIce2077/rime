@@ -28,7 +28,19 @@ export function toWire(system: string, messages: Message[]): Wire[] {
         const c = b.content;
         out.push({ role: 'tool', tool_call_id: b.tool_use_id, content: typeof c === 'string' ? c : JSON.stringify(c) });
       }
-      if (text) out.push({ role: 'user', content: text });
+      // Attachments: images go as image_url parts (data URLs), in order with the text.
+      if (m.content.some((b) => b.type === 'image')) {
+        out.push({
+          role: 'user',
+          content: m.content.filter((b) => b.type === 'text' || b.type === 'image').map((b) => {
+            const src = b.source as { media_type: string; data: string } | undefined;
+            return b.type === 'text' ? { type: 'text', text: b.text } : { type: 'image_url', image_url: { url: `data:${src?.media_type};base64,${src?.data}` } };
+          }),
+        });
+      } else {
+        const t = m.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+        if (t) out.push({ role: 'user', content: t });
+      }
     }
   }
   return out;
@@ -119,6 +131,7 @@ export async function listModels(base: string, key?: string) {
       id: String(m.id ?? m.name),
       label: m.name && m.name !== m.id ? m.name : undefined,
       context: m.meta?.n_ctx_train ?? m.context_length ?? m.max_model_len,
+      vision: Array.isArray(m.architecture?.input_modalities) ? m.architecture.input_modalities.includes('image') : undefined,
       price: m.pricing ? { in: +m.pricing.prompt * 1e6, out: +m.pricing.completion * 1e6, read: +(m.pricing.input_cache_read ?? m.pricing.prompt) * 1e6, write: +(m.pricing.input_cache_write ?? m.pricing.prompt) * 1e6 } : undefined,
     })),
   };

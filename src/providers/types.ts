@@ -32,6 +32,7 @@ export type Model = {
   price?: Price; // $ per million tokens; unknown when missing, local = 0
   efforts?: Partial<Record<Effort | 'off', string>>; // neutral level -> value the model takes
   budgets?: Partial<Record<Effort, number>>;
+  vision?: boolean; // can it see images? unknown when missing
 };
 
 // Rime's neutral controls (docs/providers.md §5).

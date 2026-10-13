@@ -4,7 +4,7 @@
 
 import type { ChildProcess } from 'node:child_process';
 import type { Config, ProviderConfig, Step } from '../core/config.ts';
-import { type Key, type Line, fit, lineWidth } from '../core/term.ts';
+import { type Key, type Line, fit, lineWidth, wrap } from '../core/term.ts';
 import type { BoxRow, Item, Styles } from '../core/view.ts';
 import { listRow, settingRow } from '../core/view.ts';
 import * as llama from '../providers/llamacpp.ts';
@@ -14,10 +14,10 @@ import { connOf, keyOf, listModels, modelOf, prettyLabel } from '../providers/re
 import type { Effort, Model } from '../providers/types.ts';
 import { bar, createLoader } from './loader.ts';
 import * as sshx from './ssh.ts';
-import { BUILTIN, NAMES, type Run, STEPS, type Server, defaults, runSteps } from './steps.ts';
+import { BUILTIN, Cancelled, NAMES, type Run, type RunState, STEPS, type Server, defaults, happened, runSteps } from './steps.ts';
 import { broadcastFor, wake } from './wol.ts';
 
-export type PanelView = { legend: Line; rows: BoxRow[]; foot: string[] };
+export type PanelView = { legend: Line; rows: BoxRow[]; foot: string[]; warn?: boolean };
 
 // A box above the prompt that owns the keyboard while it's open.
 export interface Panel {
@@ -30,6 +30,8 @@ export interface Panel {
   submit?(buf: string): void;
   changed?(buf: string): void; // the prompt text changed while typing
   click?(id: string): void;
+  // ctrl+c or ✕: cancel the whole flow (SPEC §5.2). Without it the box just closes.
+  cancel?(): void;
 }
 
 export type Tunnel = { child: ChildProcess | null; port: number };
@@ -45,14 +47,26 @@ export type Host = {
   save(): void;
   activate(model: Model, base: string): void; // make it the current model
   tunnel(name: string): Tunnel;
-  background(name: string, run: Run, done: Promise<unknown>): void; // keep going from the header
+  // Keep a run going from the header; `panel` is what /setup brings back.
+  background(name: string, run: Run, done: Promise<unknown>, panel?: Panel): void;
+  open(panel: Panel): void; // replace the open box
 };
+
+// Answers from a setup that was cancelled before it finished. Nothing is saved
+// to the config; the next /setup offers to continue (SPEC §5.2). Kept for this
+// Rime process only.
+type Draft = { at: 'where' | 'model' | 'steps'; host: string; data: Record<string, any> };
+let draft: Draft | null = null;
 
 type Mark = 'ok' | 'warn' | 'run' | 'fail';
 type Check = { mark: Mark; text: Line };
 
 const EFF: Effort[] = ['low', 'medium', 'high'];
 const QUIT: [ProviderConfig['onQuit'] & string, string][] = [['keep', 'keep running'], ['stop', 'stop the server'], ['poweroff', 'power off {host}']];
+// Own-server screens and their place in "setup · n of 4".
+const ORDER = ['start', 'where', 'model', 'steps'] as const;
+// Steps that change the machine are marked before they run.
+const CHANGES: Step[] = ['wake', 'start', 'load'];
 
 // start: the first screen; 'steps' reopens a saved server's steps, 'connect'
 // probes `url` (/connect) and goes straight to its key or models.
@@ -63,15 +77,15 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
   const plain = (t: string) => ({ t, s: st.fg });
   const accent = (t: string) => ({ t, s: st.accent });
 
-  let screen: 'start' | 'where' | 'model' | 'steps' | 'running' | 'local' | 'providers' | 'key' | 'models' = 'start';
+  let screen: 'start' | 'resume' | 'where' | 'model' | 'steps' | 'running' | 'local' | 'providers' | 'key' | 'models' = 'start';
   let pick = 0;
   let filter = '';
 
   // ---- own server state ----
   let host = sshx.sshHosts()[0] ?? '';
-  let draft = host; // what's typed in the prompt on the "where" screen
+  let typed = host; // what's typed in the prompt on the "where" screen
   let checks: Check[] = [];
-  let checking = false, checked = false, needMac = false;
+  let checking = false, checked = false, needMac = false, needWake = false, wakePort = 22;
   let hostname = '', user: string | undefined;
   let unit: sshx.Unit | null = null, build: string | undefined, gpu: sshx.Gpu | null = null;
   let presets: Record<string, Record<string, string>> = {};
@@ -88,6 +102,9 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
   const loader = createLoader();
   let anim: NodeJS.Timeout | null = null;
   let blinkAt = 0;
+  let inBg = false; // the run went to the background; finishing mustn't close another box
+  let stopping = false; // ctrl+c was pressed while steps run
+  let woke = false; // the user said yes to waking the machine
 
   // ---- local / provider state ----
   let local: { port: number; probe: Probe }[] = [];
@@ -114,6 +131,9 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     connectProbe();
   }
 
+  // An earlier setup was cancelled: offer to continue it.
+  if (start === 'start' && draft) screen = 'resume';
+
   // Reopening /setup for a saved server goes straight to its steps.
   if (start === 'steps' && serverName && h.cfg.providers[serverName]) {
     const p = h.cfg.providers[serverName];
@@ -135,10 +155,10 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
   };
 
   // Where does it run? Each check appears as it finishes.
-  async function survey() {
+  async function survey(woken = false) {
     checking = true;
-    checked = needMac = false;
-    checks = [];
+    checked = needMac = needWake = false;
+    if (!woken) checks = [];
     try {
       const r = await sshx.resolveHost(host);
       hostname = r.hostname;
@@ -148,13 +168,17 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         ? add('ok', plain(`${host} in ~/.ssh/config `), dim(`· ${hostname}${user ? ` · user ${user}` : ''}`))
         : add('warn', plain(`${host} isn't in ~/.ssh/config `), dim('· using it as an address'));
       mac = mac ?? h.cfg.providers[name()]?.wake?.mac;
-      if (!(await sshx.tcpOpen(hostname, r.port, 2000))) {
+      if (!woken && !(await sshx.tcpOpen(hostname, r.port, 2000))) {
+        // Waking changes the machine, so Rime asks first (the MAC counts as a yes).
+        wakePort = r.port;
         if (!mac) {
           needMac = true;
           add('warn', plain(`${host} is off `), dim('· type its MAC address below and Rime will wake it, or turn it on and press enter'));
-          return;
+        } else {
+          needWake = true;
+          add('warn', plain(`${host} is off `), dim(`· enter wakes it (Wake-on-LAN ${mac})`));
         }
-        await wakeUp(r.port);
+        return;
       }
       const c = add('run', plain(`connecting to ${host}…`));
       const t = await sshx.ssh(host, 'true', 20000);
@@ -196,7 +220,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
   }
 
   async function wakeUp(port: number) {
-    add('warn', plain(`${host} is off `), dim(`· Rime can wake it: Wake-on-LAN ${mac}`));
+    checks = [add('ok', plain(`${host} was off `), dim(`· woken after you said yes (Wake-on-LAN ${mac})`))];
     const c = add('run', plain(`waking ${host}`));
     const t0 = Date.now();
     await wake(mac!, broadcastFor(hostname));
@@ -228,21 +252,47 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
       onUpdate: () => h.redraw(),
     });
     runError = '';
+    stopping = false;
     screen = 'running';
     blinkAt = 0;
+    inBg = false;
     anim = setInterval(() => {
       loader.tick(Date.now(), !run?.state.done);
       h.redraw();
     }, 120);
+    const mine = run;
     const done = run.promise.then(
       (r) => finish(s, r),
       (e) => {
-        runError = (e as Error).message;
         stopAnim();
+        if (e instanceof Cancelled) return stopped(s, mine);
+        runError = (e as Error).message;
         h.redraw();
       },
     );
     return done;
+  }
+
+  // A cancelled run: say what already happened and ask what to do about it.
+  function stopped(s: Server, r: Run) {
+    keepDraft('steps');
+    h.open(createStopped(h, { name: s.name, host: s.host, model: s.model, state: r.state, after: 'Nothing was saved. /setup picks up at the steps.' }, () => {
+      h.open(self);
+      begin();
+    }));
+  }
+
+  // Keeps the answers so far, so the next /setup can pick up here.
+  function keepDraft(at: Draft['at']) {
+    draft = { at, host, data: { host, typed, checks, checked, hostname, user, unit, build, gpu, presets, mac, models, modelPick, woke, settings: { ...settings }, edits: { ...edits }, skip: new Set(skip) } };
+  }
+  function resumeDraft(d: Draft) {
+    ({ host, typed, checks, checked, hostname, user, unit, build, gpu, presets, mac, models, modelPick, woke, edits, skip } = d.data as any);
+    Object.assign(settings, d.data.settings);
+    screen = d.at;
+    pick = 0;
+    stepSel = 0;
+    if (d.at === 'where') h.setBuffer(host);
   }
 
   const stopAnim = () => {
@@ -283,8 +333,9 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     h.activate(m, r.base);
     // He blinks once, then the box gives way to the ready line.
     blinkAt = Date.now();
-    await new Promise((res) => setTimeout(res, screen === 'running' ? 1600 : 0));
+    await new Promise((res) => setTimeout(res, screen === 'running' && !inBg ? 1600 : 0));
     stopAnim();
+    draft = null;
     const warm = r.warm ? ` · cache warm (${r.warm >= 1000 ? (r.warm / 1000).toFixed(1) + 'k' : r.warm} tokens in slot 0)` : '';
     h.say({
       kind: 'lines',
@@ -293,7 +344,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         [dim('  Saved. Change anything with /setup, manage the server with /server.')],
       ],
     });
-    if (screen === 'running') h.close();
+    if (screen === 'running' && !inBg) h.close();
   }
 
   // ---- provider / local finishing ----
@@ -380,18 +431,25 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     ['This computer', 'llama.cpp on this machine'],
     ['A provider', 'OpenRouter, OpenAI, Anthropic, DeepSeek, Groq, …'],
   ];
+  const RESUME: [string, string][] = [
+    ['Continue', 'pick up where you stopped, with your answers'],
+    ['Start over', 'forget the answers and begin at screen 1'],
+    ['Not now', 'close; /setup asks again next time'],
+  ];
+  const AT: Record<Draft['at'], string> = { where: 'where it runs', model: 'the model', steps: 'the steps' };
 
-  // marker (3) · name (14) · command, wrapped · result, right-aligned (9)
+  // marker (3) · name (14) · command, wrapped · result, right-aligned
   function stepRows(width: number): BoxRow[] {
     const s = server();
     const t = h.tunnel(s.name);
     const cmds = { ...defaults(s, t.port || 18080, EFF[settings.effort]), ...edits };
-    const inner = width - 4, resW = 9, cmdW = Math.max(10, inner - 17 - resW);
+    const tag = `changes ${host}`.slice(0, 22);
+    const inner = width - 4, resW = run ? 9 : Math.max(9, tag.length + 1), cmdW = Math.max(10, inner - 17 - resW);
     const rows: BoxRow[] = [];
     STEPS.forEach((id, i) => {
       const v = run?.state.steps[i];
       const status = v?.status ?? (skip.has(id) ? 'off' : 'todo');
-      const mk = { todo: { t: '○', s: st.dim }, run: { t: '●', s: st.accent }, done: { t: '✓', s: st.ok }, off: { t: '–', s: st.dim }, fail: { t: '✗', s: st.del } }[status];
+      const mk = { todo: { t: '○', s: st.dim }, run: { t: '●', s: st.accent }, done: { t: '✓', s: st.ok }, off: { t: '–', s: st.dim }, fail: { t: '✗', s: st.del }, stopped: { t: '■', s: st.warn } }[status];
       const off = status === 'off';
       const strike = st.mode === 'none' ? '' : '\x1b[9m';
       const cmd = v?.cmd ?? cmds[id];
@@ -406,8 +464,10 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
       const selected = screen === 'steps' && i === stepSel;
       chunks.forEach((c, j) => {
         const left: Line = j === 0 ? [{ t: mk.t.padEnd(3), s: mk.s }, { t: NAMES[id].padEnd(14), s: off ? st.dim + strike : st.title }] : [{ t: ' '.repeat(17), s: '' }];
-        const result = j === 0 ? (v?.result ?? (skip.has(id) ? 'skip' : '')) : '';
-        rows.push({ line: [...fit([...left, ...c], inner - resW, false), { t: result.padStart(resW), s: st.dim }], bg: selected ? st.panelBg : undefined, hit: `step:${i}` });
+        // Before anything runs, steps that change the machine say so.
+        const marked = j === 0 && !run && !off && CHANGES.includes(id);
+        const result = j === 0 ? (v?.result ?? (off ? 'skip' : marked ? tag : '')) : '';
+        rows.push({ line: [...fit([...left, ...c], inner - resW, false), { t: result.padStart(resW), s: marked ? st.warn : st.dim }], bg: selected ? st.panelBg : undefined, hit: `step:${i}` });
       });
     });
     return rows;
@@ -424,6 +484,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     let what: Line;
     if (state.done) what = [{ t: '✓ ', s: st.ok }, { t: 'ready', s: st.titleB }];
     else if (runError) what = [{ t: '✗ ', s: st.del }, plain(runError)];
+    else if (stopping) what = [{ t: '■ ', s: st.warn }, plain(cur?.id === 'load' ? 'stopping, unloading the model again' : 'stopping'), dim('.'.repeat(1 + (Math.floor(now / 350) % 3)))];
     else if (cur?.id === 'load') what = [accent('● '), plain('loading '), { t: label, s: st.titleB }, dim(cur.progress === null ? ' · waiting for the server' : ` · ${Math.round((cur.progress ?? 0) * 100)}%${gpu ? ` into the ${gpu.name.replace(/^NVIDIA\s+|Tesla\s+/g, '').replace(/-(PCIE|SXM\d?).*$/i, '')}` : ''}`)];
     else if (cur?.id === 'wake') what = [accent('● '), plain(`waking ${s.host}`), dim(cur.detail ? ` · ${cur.detail}` : '')];
     else {
@@ -435,59 +496,104 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     return cube.map((c, i) => ({ line: [...c, { t: '  ', s: '' }, ...txt[i]] }));
   }
 
-  return {
+  const say = (text: string) => h.say({ kind: 'note', tone: 'dim', text });
+
+  // Moves the run to the header's compact loader; /setup brings this box back.
+  function background() {
+    if (!run) return;
+    inBg = true;
+    stopAnim();
+    h.background(name(), run, run.promise.catch(() => {}), self);
+    say('Setup continues in the background · /setup to watch it, ctrl+c stops it');
+    h.close();
+  }
+
+  const self: Panel = {
     view(width) {
-      const legend = (more?: string): Line => [accent('setup'), ...(more ? [dim(` · ${more}`)] : [])];
-      if (screen === 'start') {
-        const any = Object.keys(h.cfg.providers).length > 0;
+      // Back from the background: the loader animates again.
+      if (inBg && screen === 'running') {
+        inBg = false;
+        if (run && !run.state.done && !runError && !anim) {
+          anim = setInterval(() => {
+            loader.tick(Date.now(), !run?.state.done);
+            h.redraw();
+          }, 120);
+        }
+      }
+      const legend = (more?: string, n?: number): Line => [accent('setup'), ...(more ? [dim(` · ${more}`)] : []), ...(n ? [dim(` · ${n} of 4`)] : [])];
+      const why = (t: string): BoxRow[] => wrap([dim(t)], width - 4).map((line) => ({ line }));
+      const BACK = ['esc', ' back · '], CANCEL = ['ctrl+c', ' cancel'];
+      if (screen === 'resume') {
         return {
           legend: legend(),
           rows: [
+            { line: [plain('You were setting up '), title(draft?.host ?? host), plain(' and stopped at '), title(AT[draft?.at ?? 'where']), plain('.')] },
+            ...why('Your answers are kept. Nothing was saved to Rime\'s config.'),
+            blank,
+            ...RESUME.map(([n, d], i) => listRow(n, d, i === pick, st, `pick:${i}`, 22)),
+          ],
+          foot: ['↑ ↓', ' choose · ', 'enter', ' go · ', ...CANCEL],
+        };
+      }
+      if (screen === 'start') {
+        const any = Object.keys(h.cfg.providers).length > 0;
+        return {
+          legend: legend(undefined, 1),
+          rows: [
             { line: [plain(any ? 'How do you want to run Rime?' : 'No model is connected yet. How do you want to run Rime?')] },
+            ...why('Nothing is installed, changed or saved until you confirm at the end.'),
             blank,
             ...START.map(([n, d], i) => listRow(n, d, i === pick, st, `pick:${i}`, 22)),
           ],
-          foot: ['↑ ↓', ' choose · ', 'enter', ' next · ', 'esc', ' later (/setup any time)'],
+          foot: ['↑ ↓', ' choose · ', 'enter', ' next · ', 'esc', ' later · ', ...CANCEL],
         };
       }
       if (screen === 'where') {
         const known = sshx.sshHosts();
         const rows: BoxRow[] = [
-          { line: [plain('Where does it run? '), accent('› '), title(draft || '…')] },
+          { line: [plain('Where does it run? '), accent('› '), title(typed || '…')] },
+          ...why('Rime only checks over ssh here and changes nothing. If the machine is off, it asks before waking it.'),
           blank,
           ...checks.map((c) => ({ line: [MARK[c.mark], plain(' '), ...c.text] })),
         ];
         if (!checks.length && known.length) rows.push({ line: [dim(`Hosts in ~/.ssh/config: ${known.join(' · ')}`)] });
         return {
-          legend: legend('my own server'),
+          legend: legend('my own server', 2),
           rows,
-          foot: checked ? ['enter', ' next · Rime reaches the server through an ssh tunnel, so it stays on 127.0.0.1'] : ['enter', ' check · type a host from ~/.ssh/config, a name, or an IP · ', 'esc', ' back'],
+          foot: needWake ? ['enter', ` wake ${host} · `, ...BACK, ...CANCEL] : ['enter', checked ? ' next · ' : ' check · ', ...BACK, ...CANCEL],
         };
       }
       if (screen === 'model') {
         const rows: BoxRow[] = [{ line: [dim(`Models in ${host}'s ${unit?.router ? 'presets.ini' : 'server'}`)] }];
         if (!models.length) rows.push({ line: [dim('  none found; the server will use what it has loaded')] });
         models.forEach((m, i) => rows.push(listRow(m.id, m.help, pick === i, st, `pick:${i}`, 22)));
-        rows.push(blank, { line: [dim('Settings')] });
+        rows.push(blank, { line: [dim('Settings (saved when setup finishes)')] });
         const vals = [EFF[settings.effort], ['on', 'off'][settings.reasoning], ['yes', 'no'][settings.wake], QUIT[settings.quit][1].replace('{host}', host), ['yes', 'no'][settings.save]];
         const labels = ['Default effort', 'Reasoning', `Wake ${host} when needed`, 'When Rime quits', 'Save the cache first'];
         labels.forEach((l, i) => rows.push(settingRow(l, vals[i], pick === models.length + i, st, `pick:${models.length + i}`)));
-        return { legend: legend('model and settings'), rows, foot: ['↑ ↓', ' choose · ', '← →', ' change a setting · ', 'enter', ' next'] };
+        return { legend: legend('model and settings', 3), rows, foot: ['↑ ↓', ' choose · ', '← →', ' change · ', 'enter', ' next · ', ...BACK, ...CANCEL] };
       }
       if (screen === 'steps') {
         return {
-          legend: legend('steps'),
-          rows: [{ line: [dim(`Rime will run these on ${host}. Select a command and press e to edit it.`)] }, blank, ...stepRows(width)],
+          legend: legend('steps', 4),
+          rows: [
+            { line: [dim(`Rime will run these on ${host}. Nothing has run yet.`)] },
+            ...why('Select a command and press e to edit it. You can cancel while they run.'),
+            blank,
+            ...stepRows(width),
+          ],
           foot: editing
-            ? ['enter', ' save this command · ', 'esc', ' cancel']
-            : ['enter', ' run all · ', 'e', ' edit · ', 'space', ' skip a step · ', 'r', ' reset to default'],
+            ? ['enter', ' save this command · ', 'esc', ' undo the edit']
+            : ['enter', ' run all · ', 'e', ' edit · ', 'space', ' skip · ', 'r', ' reset · ', ...BACK, ...CANCEL],
         };
       }
       if (screen === 'running') {
         return {
           legend: legend('running'),
           rows: [...loaderRows(), blank, ...stepRows(width)],
-          foot: runError ? ['enter', ' retry · ', 'e', ' edit steps · ', 'l', ' show server log · ', 'esc', ' close'] : ['esc', ' run in background · ', 'l', ' show server log'],
+          foot: runError
+            ? ['enter', ' retry · ', 'e', ' edit steps · ', 'l', ' server log · ', 'esc', ' close']
+            : run?.state.done || stopping ? ['', ''] : ['ctrl+c', ' cancel · ', 'b', ' run in background · ', 'l', ' server log'],
         };
       }
       if (screen === 'local') {
@@ -498,7 +604,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
           rows.push({ line: [dim('Servers on this computer')] });
           local.forEach((l, i) => rows.push(listRow(`${PRESETS[l.probe.kind === 'openai' ? 'generic' : l.probe.kind === 'llamacpp' ? 'llamacpp' : l.probe.kind].label} :${l.port}`, [l.probe.build, l.probe.models.map((m) => m.id).join(', ')].filter(Boolean).join(' · '), i === pick, st, `pick:${i}`, 22)));
         }
-        return { legend: legend('this computer'), rows, foot: ['↑ ↓', ' choose · ', 'enter', local.length ? ' next · ' : ' look again · ', 'esc', ' back'] };
+        return { legend: legend('this computer'), rows, foot: ['↑ ↓', ' choose · ', 'enter', local.length ? ' next · ' : ' look again · ', ...BACK, ...CANCEL] };
       }
       if (screen === 'providers') {
         const list = filtered(HOSTED, (p) => PRESETS[p].label);
@@ -506,7 +612,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
           const env = PRESETS[p].keyEnv;
           return listRow(PRESETS[p].label, env && process.env[env] ? [{ t: `✓ ${env} found`, s: st.ok }] : `needs a key${env ? ` · or set ${env}` : ''}`, i === pick, st, `pick:${i}`, 22);
         });
-        return { legend: legend('a provider'), rows: rows.length ? rows : [{ line: [dim(`no provider matches ${filter}`)] }], foot: ['↑ ↓', ' choose · ', 'enter', ' next · type to filter · ', 'esc', ' back'] };
+        return { legend: legend('a provider'), rows: rows.length ? rows : [{ line: [dim(`no provider matches ${filter}`)] }], foot: ['↑ ↓', ' choose · ', 'enter', ' next · type to filter · ', ...BACK, ...CANCEL] };
       }
       if (screen === 'key') {
         const pre = PRESETS[preset];
@@ -517,7 +623,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
             { line: [dim(`Rime keeps it in ~/.rime/config (mode 0600)${pre.keyEnv ? `, or set ${pre.keyEnv} instead` : ''}.`)] },
             ...(keyError ? [blank, { line: [{ t: '✗ ', s: st.del }, plain(keyError)] }] : []),
           ],
-          foot: ['enter', ' test the key · ', 'esc', ' back'],
+          foot: ['enter', ' test the key · ', ...BACK, ...CANCEL],
         };
       }
       // models
@@ -529,17 +635,18 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         rows: shown.length
           ? shown.map((m, i) => listRow(m.label ?? prettyLabel(m.id), [m.id, m.context ? `${Math.round(m.context / 1000)}k context` : ''].filter(Boolean).join(' · '), offset + i === pick, st, `pick:${offset + i}`, 22))
           : [{ line: [dim(filter ? `no model matches ${filter}` : 'no models listed')] }],
-        foot: ['↑ ↓', ' choose · ', 'enter', ' use it · type to filter · ', 'esc', ' back'],
+        foot: ['↑ ↓', ' choose · ', 'enter', ' use it · type to filter · ', ...BACK, ...CANCEL],
       };
     },
 
     placeholder() {
-      if (screen === 'where') return needMac ? 'MAC address to wake it, e.g. 00:11:22:33:44:55' : 'gpubox, a host name, or an IP address';
+      if (screen === 'where') return needMac ? 'MAC address to wake it, e.g. 00:11:22:33:44:55' : needWake ? `Enter wakes ${host}` : 'gpubox, a host name, or an IP address';
       if (screen === 'steps') return editing ? 'Edit the command, enter saves' : 'Enter runs every step';
       if (screen === 'running') return 'You can type; it sends once the model is ready';
       if (screen === 'key') return `${PRESETS[preset]?.label ?? 'API'} key`;
       if (screen === 'models' || screen === 'providers') return 'Type to filter';
       if (screen === 'model') return 'Type to filter models';
+      if (screen === 'resume') return 'Pick an option';
       return 'Pick an option, or type to filter';
     },
 
@@ -552,6 +659,29 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     masked: () => screen === 'key',
     typing: () => ['where', 'key', 'models', 'providers'].includes(screen) || editing !== null,
 
+    // ctrl+c or ✕ (SPEC §5.2): before anything runs, close and keep the answers;
+    // while steps run, stop the current one now and ask what to do.
+    cancel() {
+      if (screen === 'running') {
+        if (run && !run.state.done && !runError) {
+          if (!stopping) {
+            stopping = true;
+            run.cancel();
+          }
+          return;
+        }
+        if (run?.state.done) return; // it's finishing
+        stopAnim();
+        return h.close();
+      }
+      editing = null;
+      if (screen === 'where' || screen === 'model' || screen === 'steps') {
+        keepDraft(screen);
+        say(`Setup cancelled. ${woke ? `Rime woke ${host}; nothing else was` : 'Nothing was'} changed or saved. /setup picks up where you left off.`);
+      } else say('Setup cancelled. Nothing was changed or saved.');
+      h.close();
+    },
+
     key(k, buf) {
       const nav = (n: number) => {
         if (k.name === 'up') pick = (pick - 1 + n) % Math.max(1, n);
@@ -559,14 +689,28 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         else return false;
         return true;
       };
-      if (screen === 'start') {
+      if (screen === 'resume') {
         if (k.name === 'escape') return h.close(), true;
+        if (nav(RESUME.length)) return true;
+        if (k.name === 'enter') {
+          if (pick === 0 && draft) resumeDraft(draft);
+          else if (pick === 1) {
+            draft = null;
+            screen = 'start';
+            pick = 0;
+          } else h.close();
+          return true;
+        }
+        return true;
+      }
+      if (screen === 'start') {
+        if (k.name === 'escape') return say('Setup closed. Run /setup when you\'re ready.'), h.close(), true;
         if (nav(START.length)) return true;
         if (k.name === 'enter') {
           filter = '';
           if (pick === 0) {
             screen = 'where';
-            draft = host;
+            typed = host;
             h.setBuffer(host);
           } else if (pick === 1) {
             screen = 'local';
@@ -608,7 +752,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
           if (k.name === 'escape') return (editing = null, h.setBuffer(''), true);
           return false; // enter goes to submit()
         }
-        if (k.name === 'escape') return (screen = models.length ? 'model' : 'where', pick = 0, true);
+        if (k.name === 'escape') return (screen = 'model', pick = 0, true);
         if (k.name === 'up') return (stepSel = (stepSel + STEPS.length - 1) % STEPS.length, true);
         if (k.name === 'down') return (stepSel = (stepSel + 1) % STEPS.length, true);
         const id = STEPS[stepSel];
@@ -647,12 +791,8 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
           if (k.name === 'escape') return (stopAnim(), h.close(), true);
           return true;
         }
-        if (k.name === 'escape' && run && !run.state.done) {
-          h.background(name(), run, run.promise.then((r) => finish(server(), r)).catch(() => {}));
-          stopAnim();
-          h.close();
-          return true;
-        }
+        // esc does nothing while steps run, so it can't cancel by accident.
+        if (k.name === 'char' && k.ch === 'b' && run && !run.state.done && !stopping) return background(), true;
         return true;
       }
       if (screen === 'local') {
@@ -710,14 +850,23 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     submit(buf) {
       if (screen === 'where') {
         const v = buf.trim();
-        if (needMac) {
-          if (!/^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(v)) {
-            add('fail', plain(`${v || 'that'} isn't a MAC address `), dim('· six pairs like 00:11:22:33:44:55'));
-            return;
+        if (needMac || needWake) {
+          if (needMac) {
+            if (!/^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(v)) {
+              add('fail', plain(`${v || 'that'} isn't a MAC address `), dim('· six pairs like 00:11:22:33:44:55'));
+              return;
+            }
+            mac = v.toLowerCase().replace(/-/g, ':');
+            h.setBuffer(host);
           }
-          mac = v.toLowerCase().replace(/-/g, ':');
-          h.setBuffer(host);
-          survey();
+          // A yes: wake it, then carry on reading the server.
+          needMac = needWake = false;
+          checking = true;
+          woke = true;
+          wakeUp(wakePort).then(() => survey(true), (e) => {
+            add('fail', plain((e as Error).message));
+            checking = false;
+          });
           return;
         }
         if (checked && v === host) {
@@ -755,11 +904,78 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     },
 
     changed(buf) {
-      if (screen === 'where') draft = buf;
+      if (screen === 'where') typed = buf;
       else if (screen === 'models' || screen === 'providers') {
         filter = buf;
         pick = 0;
       }
+    },
+  };
+  return self;
+}
+
+// A run that was cancelled part-way (SPEC §5.2, docs/providers.md §3.6): what
+// already happened, and what should happen to the machine now.
+// `startup`: the run that brings a saved server up (at startup or for a message),
+// rather than /setup.
+export function createStopped(h: Host, r: { name: string; host: string; model?: string; state: RunState; startup?: boolean; after: string }, resume: () => void): Panel {
+  const { st } = h;
+  const head = r.startup ? `Rime stopped bringing ${r.name} up.` : 'Setup stopped.';
+  const done0 = r.startup ? `Stopped bringing ${r.name} up.` : 'Setup cancelled.';
+  const dim = (t: string) => ({ t, s: st.dim });
+  const plain = (t: string) => ({ t, s: st.fg });
+  const started = r.state.steps.some((v) => v.id === 'start' && v.status === 'done' && v.result !== 'running');
+  const cut = r.state.steps.find((v) => v.status === 'stopped');
+  const opts: ['leave' | 'stop' | 'off' | 'continue', string, string][] = [
+    ['leave', 'Leave it as it is', started ? 'llama-server keeps running' : `${r.host} stays as it is`],
+    ...(started ? [['stop', 'Stop llama-server', 'sudo systemctl stop llama-server'] as ['stop', string, string]] : []),
+    ['off', `Power off ${r.host}`, 'sudo poweroff'],
+    ['continue', r.startup ? 'Continue' : 'Continue setup', `resume from ${cut ? NAMES[cut.id] : 'the next step'}`],
+  ];
+  const did = happened(r, r.state);
+  let pick = 0;
+  let working = '';
+
+  async function choose(i: number) {
+    const c = opts[i][0];
+    if (c === 'continue') return resume();
+    let done = started ? `llama-server is still running on ${r.host}.` : `${r.host} is as it was left.`;
+    if (c !== 'leave') {
+      working = c === 'stop' ? 'stopping llama-server…' : `powering off ${r.host}…`;
+      h.redraw();
+      const x = await sshx.ssh(r.host, c === 'stop' ? 'sudo systemctl stop llama-server' : 'sudo poweroff', 30000);
+      done = c === 'off' ? `${r.host} is powering off.` : x.code === 0 ? `llama-server was stopped; ${r.host} is still on.` : `Stopping llama-server failed: ${x.err.trim().split('\n').at(-1) || `exit ${x.code}`}.`;
+    }
+    h.say({ kind: 'note', tone: 'dim', text: `${done0} ${done} ${r.after}` });
+    h.close();
+  }
+
+  return {
+    view: () => ({
+      legend: [{ t: r.startup ? 'server' : 'setup', s: st.warn }, dim(' · stopped')],
+      warn: true,
+      rows: [
+        { line: [plain(`${head} So far Rime:`)] },
+        ...(did.length ? did : ['did nothing yet']).map((l) => ({ line: [dim(`  · ${l}`)] })),
+        { line: [dim(`Nothing was saved to Rime's config. What should happen to ${r.host}?`)] },
+        { line: [] },
+        ...opts.map(([, n, d], i) => listRow(n, d, i === pick, st, `pick:${i}`, 22)),
+        ...(working ? [{ line: [] }, { line: [{ t: '● ', s: st.accent }, plain(working)] }] : []),
+      ],
+      foot: ['↑ ↓', ' choose · ', 'enter', ' do it · ', 'esc', ` ${opts.at(-1)![1].toLowerCase()}`],
+    }),
+    placeholder: () => `Pick what happens to ${r.host}`,
+    key(k) {
+      if (working) return true;
+      if (k.name === 'up') return (pick = (pick + opts.length - 1) % opts.length, true);
+      if (k.name === 'down') return (pick = (pick + 1) % opts.length, true);
+      if (k.name === 'enter') return choose(pick), true;
+      if (k.name === 'escape') return resume(), true;
+      return true;
+    },
+    cancel: () => void (working || choose(0)), // the default: leave it as it is
+    click(id) {
+      pick = Number(id.split(':')[1]);
     },
   };
 }

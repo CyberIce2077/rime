@@ -10,31 +10,37 @@ import path from 'node:path';
 
 export type Result = { code: number; out: string; err: string };
 
-// Runs a command without a shell. Never throws; a timeout kills it (code 124).
-export function run(cmd: string, args: string[], timeoutMs = 15000, input?: string): Promise<Result> {
+// Runs a command without a shell. Never throws; a timeout or an abort kills it
+// (code 124).
+export function run(cmd: string, args: string[], timeoutMs = 15000, input?: string, signal?: AbortSignal): Promise<Result> {
   return new Promise((resolve) => {
     let out = '', err = '';
+    if (signal?.aborted) return resolve({ code: 124, out, err: 'cancelled' });
     const p = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     const t = setTimeout(() => p.kill('SIGKILL'), timeoutMs);
+    const kill = () => p.kill('SIGKILL');
+    signal?.addEventListener('abort', kill, { once: true });
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (err += d));
     p.on('error', (e) => {
       clearTimeout(t);
+      signal?.removeEventListener('abort', kill);
       resolve({ code: 127, out, err: e.message });
     });
-    p.on('close', (code, signal) => {
+    p.on('close', (code, sig) => {
       clearTimeout(t);
-      resolve({ code: signal ? 124 : (code ?? 1), out, err });
+      signal?.removeEventListener('abort', kill);
+      resolve({ code: sig ? 124 : (code ?? 1), out, err });
     });
     p.stdin.end(input ?? '');
   });
 }
 
 // A user-editable step command runs through the shell, like typing it.
-export const shell = (command: string, timeoutMs?: number) => run('sh', ['-c', command], timeoutMs);
+export const shell = (command: string, timeoutMs?: number, signal?: AbortSignal) => run('sh', ['-c', command], timeoutMs, undefined, signal);
 
 export const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5'];
-export const ssh = (host: string, remote: string, timeoutMs?: number, input?: string) => run('ssh', [...SSH_OPTS, host, remote], timeoutMs, input);
+export const ssh = (host: string, remote: string, timeoutMs?: number, input?: string, signal?: AbortSignal) => run('ssh', [...SSH_OPTS, host, remote], timeoutMs, input, signal);
 
 const CODE_HOSTS = /^(github\.com|gitlab\.com|bitbucket\.org|ssh\.dev\.azure\.com)$/i;
 
