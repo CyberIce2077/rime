@@ -67,6 +67,7 @@ export function body(req: Request): Wire {
     stream_options: { include_usage: true },
     ...(req.maxTokens ? { max_tokens: req.maxTokens } : {}),
   };
+  if (req.tools?.length) b.tools = req.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } }));
   if (conn.llamacpp) return { ...b, ...extras(model, controls, req.slot) };
   // ponytail: effort field names per host are from the design note; verify per preset.
   if (conn.effortField === 'reasoning.effort') {
@@ -107,6 +108,13 @@ export async function* stream(req: Request): AsyncGenerator<Event> {
     if (c?.finish_reason) yield { type: 'stop', reason: STOP[c.finish_reason] ?? c.finish_reason };
     usage = usageOf(ch.usage, ch.timings) ?? usage;
   }
+  // A server whose chat template doesn't handle tools leaves Qwen's own
+  // <tool_call> XML in the text: read the calls from there instead.
+  if (!calls.length && req.tools?.length && text.includes('<tool_call>')) {
+    const x = textToolCalls(text, req.tools.map((t) => t.name));
+    text = x.text;
+    for (const c of x.calls) calls.push({ id: c.id, name: c.name, args: JSON.stringify(c.input) });
+  }
   const blocks: Block[] = [];
   if (reasoning) blocks.push({ type: 'thinking', thinking: reasoning, signature: '' });
   if (text) blocks.push({ type: 'text', text });
@@ -115,10 +123,41 @@ export async function* stream(req: Request): AsyncGenerator<Event> {
     try {
       input = JSON.parse(tc.args || '{}');
     } catch {}
-    blocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input });
+    blocks.push({ type: 'tool_use', id: tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`, name: tc.name, input });
   }
+  if (calls.length) yield { type: 'stop', reason: 'tool_use' };
   yield { type: 'blocks', blocks };
   if (usage) yield { type: 'usage', usage };
+}
+
+// Qwen's tool-call text: <tool_call><function=bash><parameter=command>ls</parameter>
+// </function></tool_call>, or the JSON form {"name": …, "arguments": {…}}.
+export function textToolCalls(text: string, names: string[]) {
+  const calls: { id: string; name: string; input: Record<string, unknown> }[] = [];
+  const lower = new Map(names.map((n) => [n.toLowerCase(), n]));
+  for (const [, body] of text.matchAll(/<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g)) {
+    let name: string | undefined, input: Record<string, unknown> = {};
+    const fn = /<function=([^>\s]+)>/.exec(body);
+    if (fn) {
+      name = fn[1];
+      for (const [, k, v] of body.matchAll(/<parameter=([^>\s]+)>\n?([\s\S]*?)\n?<\/parameter>/g)) {
+        try {
+          input[k] = /^\s*[[{0-9tfn-]/.test(v) && !/^\s*\d+[^\d.]/.test(v) ? JSON.parse(v) : v;
+        } catch {
+          input[k] = v;
+        }
+      }
+    } else {
+      try {
+        const j = JSON.parse(body.trim());
+        name = j.name;
+        input = typeof j.arguments === 'string' ? JSON.parse(j.arguments) : (j.arguments ?? {});
+      } catch {}
+    }
+    const known = name && lower.get(name.toLowerCase());
+    if (known) calls.push({ id: `call_${Math.random().toString(36).slice(2, 10)}`, name: known, input });
+  }
+  return { text: calls.length ? text.slice(0, text.indexOf('<tool_call>')).trimEnd() : text, calls };
 }
 
 export async function listModels(base: string, key?: string) {

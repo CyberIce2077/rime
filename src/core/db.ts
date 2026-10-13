@@ -12,7 +12,7 @@ import type { Block } from '../providers/types.ts';
 
 export const DB_PATH = path.join(os.homedir(), '.rime', 'rime.db');
 
-export type Conversation = { id: number; project: string; title: string; created: number; updated: number; model: string | null; tokens: number; cost: number; prefix: string | null; lock_pid: number | null };
+export type Conversation = { id: number; project: string; title: string; created: number; updated: number; model: string | null; tokens: number; cost: number; prefix: string | null; prefix_hash: string | null; lock_pid: number | null; rules: string | null };
 export type Stored = { seq: number; role: 'user' | 'assistant' | 'system'; content: string | Block[]; interrupted: boolean };
 
 const SCHEMA = `
@@ -77,13 +77,16 @@ export async function openDb(file = DB_PATH) {
   const mode = String((db.prepare('PRAGMA journal_mode=WAL').get() as { journal_mode: string }).journal_mode);
   db.exec('PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=3000;');
   db.exec(SCHEMA);
+  // Added after the first version: "don't ask again" rules belong to a conversation.
+  if (!(db.prepare('PRAGMA table_info(conversations)').all() as { name: string }[]).some((c) => c.name === 'rules')) db.exec('ALTER TABLE conversations ADD COLUMN rules TEXT');
   try {
     fs.chmodSync(file, 0o600);
   } catch {}
 
   const q = {
     last: db.prepare('SELECT * FROM conversations WHERE project = ? ORDER BY updated DESC, id DESC LIMIT 1'),
-    create: db.prepare('INSERT INTO conversations (project, title, created, updated, model, prefix, lock_pid) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+    list: db.prepare('SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation = c.id) AS n FROM conversations c WHERE c.project = ? ORDER BY c.pinned DESC, c.updated DESC, c.id DESC LIMIT ?'),
+    create: db.prepare('INSERT INTO conversations (project, title, created, updated, model, prefix, prefix_hash, lock_pid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
     lock: db.prepare('UPDATE conversations SET lock_pid = ? WHERE id = ?'),
     unlock: db.prepare('UPDATE conversations SET lock_pid = NULL WHERE id = ? AND lock_pid = ?'),
     get: db.prepare('SELECT * FROM conversations WHERE id = ?'),
@@ -94,7 +97,8 @@ export async function openDb(file = DB_PATH) {
     touch: db.prepare('UPDATE conversations SET updated = ? WHERE id = ?'),
     title: db.prepare("UPDATE conversations SET title = ? WHERE id = ? AND title = ''"),
     usage: db.prepare('UPDATE conversations SET tokens = tokens + ?, cost = cost + ?, model = ? WHERE id = ?'),
-    prefix: db.prepare('UPDATE conversations SET prefix = ? WHERE id = ?'),
+    prefix: db.prepare('UPDATE conversations SET prefix = ?, prefix_hash = ? WHERE id = ?'),
+    rules: db.prepare('UPDATE conversations SET rules = ? WHERE id = ?'),
     messages: db.prepare('SELECT seq, role, content, interrupted FROM messages WHERE conversation = ? ORDER BY seq'),
     prompts: db.prepare("SELECT m.content FROM messages m JOIN conversations c ON c.id = m.conversation WHERE c.project = ? AND m.role = 'user' ORDER BY c.updated DESC, m.seq DESC LIMIT ?"),
   };
@@ -110,9 +114,20 @@ export async function openDb(file = DB_PATH) {
       q.lock.run(process.pid, c.id);
       return { conv: c, busy: false };
     },
-    create(project: string, prefix: string, model?: string) {
+    // This project's conversations, pinned first, then newest (the ← list).
+    list(project: string, limit = 200) {
+      return q.list.all(project, limit) as (Conversation & { n: number })[];
+    },
+    // Opens a conversation from the list, unless another live window has it.
+    take(id: number): Conversation | null {
+      const c = q.get.get(id) as Conversation | undefined;
+      if (!c || (c.lock_pid && c.lock_pid !== process.pid && alive(c.lock_pid))) return null;
+      q.lock.run(process.pid, id);
+      return c;
+    },
+    create(project: string, prefix: string, model?: string, hash?: string) {
       const now = Date.now();
-      return Number(q.create.run(project, '', now, now, model ?? null, prefix, process.pid).lastInsertRowid);
+      return Number(q.create.run(project, '', now, now, model ?? null, prefix, hash ?? null, process.pid).lastInsertRowid);
     },
     get: (id: number) => q.get.get(id) as Conversation | undefined,
     unlock: (id: number) => void q.unlock.run(id, process.pid),
@@ -131,7 +146,8 @@ export async function openDb(file = DB_PATH) {
     },
     remove: (conv: number, seq: number) => void q.drop.run(conv, seq),
     usage: (conv: number, tokens: number, cost: number, model: string) => void q.usage.run(tokens, cost, model, conv),
-    setPrefix: (conv: number, prefix: string) => void q.prefix.run(prefix, conv),
+    setPrefix: (conv: number, prefix: string, hash?: string) => void q.prefix.run(prefix, hash ?? null, conv),
+    setRules: (conv: number, rules: object) => void q.rules.run(JSON.stringify(rules), conv),
     messages: (conv: number): Stored[] =>
       (q.messages.all(conv) as { seq: number; role: Stored['role']; content: string; interrupted: number }[]).map((r) => ({ seq: r.seq, role: r.role, content: JSON.parse(r.content), interrupted: !!r.interrupted })),
     // Your earlier prompts in this project, newest first (ghost text and ctrl+r).

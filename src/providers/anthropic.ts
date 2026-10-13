@@ -18,6 +18,7 @@ export async function* stream(req: Request): AsyncGenerator<Event> {
     messages: req.messages.map((m) => (Array.isArray(m.content) ? { ...m, content: m.content.filter((b) => b.type !== 'thinking' || b.signature) } : m)),
     cache_control: { type: 'ephemeral' },
     ...(effort ? { output_config: { effort } } : {}),
+    ...(req.tools?.length ? { tools: req.tools } : {}), // tools → system → messages: all in the cached prefix
   };
   const headers: Record<string, string> = { 'x-api-key': conn.key || '', 'anthropic-version': '2023-06-01' };
   if (betas.length) headers['anthropic-beta'] = betas.join(',');
@@ -40,6 +41,17 @@ export async function* stream(req: Request): AsyncGenerator<Event> {
         b.thinking = ((b.thinking as string) || '') + d.thinking;
         yield { type: 'thinking', text: d.thinking };
       } else if (d.type === 'signature_delta') b.signature = ((b.signature as string) || '') + d.signature;
+      else if (d.type === 'input_json_delta') b._json = ((b._json as string) || '') + d.partial_json;
+    } else if (ev.type === 'content_block_stop') {
+      const b = blocks[ev.index];
+      if (b?.type === 'tool_use') {
+        try {
+          b.input = b._json ? JSON.parse(b._json as string) : (b.input ?? {});
+        } catch {
+          b.input = {};
+        }
+        delete b._json;
+      }
     } else if (ev.type === 'message_delta') {
       for (const [k, v] of Object.entries(ev.usage || {})) if (typeof v === 'number') usage[k] = v;
       if (ev.delta?.stop_reason) yield { type: 'stop', reason: ev.delta.stop_reason };

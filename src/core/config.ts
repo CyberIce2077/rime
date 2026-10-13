@@ -41,6 +41,7 @@ export type Config = {
   model?: string; // a model ref "provider/id"; "auto" arrives with the router
   effort?: Effort;
   reasoning?: boolean;
+  permissions?: { allow?: string[]; ask?: string[]; deny?: string[] }; // your rules (SPEC §17)
 };
 
 export const CONFIG_PATH = path.join(os.homedir(), '.rime', 'config');
@@ -52,7 +53,7 @@ export function loadConfig(file = CONFIG_PATH): Config {
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`Could not read ${file}: ${(e as Error).message}`);
   }
-  const cfg: Config = { providers: raw.providers ?? {}, models: raw.models ?? {}, model: raw.model, effort: raw.effort, reasoning: raw.reasoning };
+  const cfg: Config = { providers: raw.providers ?? {}, models: raw.models ?? {}, model: raw.model, effort: raw.effort, reasoning: raw.reasoning, ...(raw.permissions ? { permissions: raw.permissions } : {}) };
   // Old files: a top-level apiKey was Anthropic's.
   if (raw.apiKey && !cfg.providers.anthropic) cfg.providers.anthropic = { preset: 'anthropic', key: raw.apiKey };
   return cfg;

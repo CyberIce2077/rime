@@ -3,7 +3,8 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
-export type MockOpts = { started?: boolean; loaded?: boolean; busy?: boolean; unsafeTemplate?: boolean; key?: string };
+// xmlTools: answer tool calls as Qwen's text form, like a server without a tool template.
+export type MockOpts = { started?: boolean; loaded?: boolean; busy?: boolean; unsafeTemplate?: boolean; key?: string; xmlTools?: boolean };
 
 export async function startMock(o: MockOpts = {}) {
   const state = { started: o.started ?? true, loaded: o.loaded ?? true, busy: !!o.busy, requests: [] as { path: string; body: any }[], controls: [] as any[] };
@@ -52,6 +53,23 @@ export async function startMock(o: MockOpts = {}) {
       if (!body.stream) return send(res, 200, { id: 'cmpl-1', choices: [{ message: { content: 'ready' }, finish_reason: 'stop' }], timings });
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       const chunk = (delta: any, extra: any = {}) => res.write(`data: ${JSON.stringify({ id: 'cmpl-1', model: MODEL, choices: [{ index: 0, delta, finish_reason: null }], ...extra })}\n\n`);
+      const end = (reason: string) => {
+        res.write(`data: ${JSON.stringify({ id: 'cmpl-1', choices: [{ index: 0, delta: {}, finish_reason: reason }], timings })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      };
+      // With tools: "make a page" writes index.html, then a short answer.
+      const last = body.messages.at(-1);
+      if (body.tools && last.role === 'user' && /make a page/.test(JSON.stringify(last.content))) {
+        const args = { path: 'index.html', content: '<!doctype html>\n<h1>I love beb &lt;3</h1>' };
+        if (o.xmlTools) chunk({ content: `Writing it.\n<tool_call>\n<function=write>\n<parameter=path>\n${args.path}\n</parameter>\n<parameter=content>\n${args.content}\n</parameter>\n</function>\n</tool_call>` });
+        else chunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'write', arguments: JSON.stringify(args) } }] });
+        return end(o.xmlTools ? 'stop' : 'tool_calls');
+      }
+      if (body.tools && last.role === 'tool') {
+        chunk({ content: /declined/.test(last.content) ? 'Okay, I left it.' : 'Created index.html.' });
+        return end('stop');
+      }
       chunk({ reasoning_content: 'Let me ' });
       chunk({ reasoning_content: 'think.' });
       chunk({ content: 'Hello ' });

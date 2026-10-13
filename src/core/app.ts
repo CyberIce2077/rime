@@ -1,19 +1,23 @@
 // The single-pane Rime screen (SPEC §4, reference/rime-prototype.html).
 //
 // Full screen on the alternate screen: the transcript scrolls in the top part
-// (wheel, PgUp/PgDn), the boxes, prompt and status line are pinned to the bottom.
+// (wheel, ctrl+u / ctrl+d, esc back to the end), the boxes, prompt and status line
+// are pinned to the bottom.
 // Models come from connected providers (docs/providers.md); /setup connects them.
 
 import { type Chip, type Kind, LONG_PASTE, blocksFor, chipChar, chipFor, clipboardImage, fuzzy, isChip, label, listFiles, pastedPaths, textChip } from './attach.ts';
 import { copy } from './clipboard.ts';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
-import { createSettings, phrase } from './settings.ts';
+import { type Decision, MODE_HELP, MODES, type Mode, decide, projectRules, removeProjectRule, ruleList } from './permissions.ts';
+import { type ToolResult, TOOLS, bash as bashTool, diffOf, edit as editTool, planEdit, read as readTool, rel, write as writeTool } from './tools.ts';
+import { WHEN, createSettings, phrase } from './settings.ts';
 import { type Config, saveConfig } from './config.ts';
-import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader } from './header.ts';
+import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } from './header.ts';
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
 import { colorMode } from './theme.ts';
 import { previewBox, sendLine, sendList } from './preview.ts';
@@ -34,6 +38,7 @@ const CMDS: [string, string][] = [
   ['/setup', 'connect your server, this computer, or a provider'],
   ['/server', 'status and controls for your server'],
   ['/settings', 'every setting, applied right away'],
+  ['/permissions', 'permission mode and allow / ask / deny rules'],
   ['/connect', 'add a provider or URL: /connect <url>'],
   ['/clear', 'start a new conversation'],
   ['/usage', 'token, cost and savings breakdown'],
@@ -47,12 +52,15 @@ const KEYS: [string, string][] = [
   ['esc', 'stop Rime, go back one screen, or close a box'],
   ['ctrl+c', 'cancel what is open or running'],
   ['ctrl+c twice', 'quit (only when nothing is open)'],
-  ['↑', 'edit your last message'],
+  ['↑ ↓', 'your earlier prompts (esc goes back to what you typed)'],
+  ['option+⌫ ctrl+w', 'delete the word before the cursor'],
   ['tab', 'complete a command'],
   ['ctrl+v', 'paste an image from the clipboard (or drag in a file)'],
   ['@', 'mention a file or folder'],
   ['ctrl+r', 'search your earlier prompts'],
   ['tab  →', 'take the suggestion shown in dim text'],
+  ['shift+tab', 'permission mode: ask · auto-edit · plan'],
+  ['←', 'your conversations (on an empty prompt)'],
   ['ctrl+u ctrl+d', 'scroll the conversation up / down when the prompt is empty (also the mouse wheel)'],
   ['/', 'commands'],
   ['?', 'this list'],
@@ -65,10 +73,25 @@ const CLICK_KEYS: Record<string, Key> = {
 };
 
 // Frozen for the whole session: any byte change here would break the prompt cache.
-const system = (cwd: string) =>
+// The tools sit before the system prompt in the cached prefix; a stored prefix is
+// reused only with the same tools.
+const TOOLS_HASH = createHash('sha256').update(JSON.stringify(TOOLS)).digest('hex').slice(0, 16);
+
+// The only project file it includes is AGENTS.md, read once at the start.
+const system = (cwd: string, agents = '') =>
   `You are Rime, a coding assistant running in the user's terminal.\n` +
   `Working directory: ${cwd}\n` +
-  `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.`;
+  `Do the work with your tools: read files before you change them, create files with write, change them with edit, run commands with bash. Don't paste whole files into the chat; say in a line or two what you did.\n` +
+  `You run inside Rime. Use the rime tool to change Rime itself (tabs, panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
+  `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.` +
+  (agents ? `\n\nAGENTS.md:\n${agents}` : '');
+const agentsMd = (dir: string) => {
+  try {
+    return fs.readFileSync(path.join(dir, 'AGENTS.md'), 'utf8').trim().slice(0, 8000);
+  } catch {
+    return '';
+  }
+};
 
 const fmtP = (n: number) => (Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`);
 
@@ -95,8 +118,26 @@ export async function runApp(cfg: Config, version: string) {
     schedule();
   });
   let later: Model | null = null; // a model switch waiting for the next /clear
+  // Permissions (SPEC §17): the mode for this session, the open question, and
+  // the last decisions for /permissions.
+  let mode: Mode = 'ask';
+  let approval: { use: Block; decision: Decision; sel: number; done(a: 'yes' | 'always' | 'no' | 'stop'): void; diff?: ToolResult['diff'] } | null = null;
+  let declining: ((words: string | null) => void) | null = null; // "No, tell Rime instead": the next prompt is the reason
+  const decisions: { at: number; tool: string; what: string; verdict: string; why: string }[] = [];
+  let nextStep = ''; // suggested after a reply (tab takes it)
+  let example = ''; // `Try "…"` on an empty prompt, from this project
+  let lastUserSeq = 0; // the stored row of the last user message, while it has no reply
+  // "Don't ask again" rules belong to this conversation and are saved with it.
+  let convRules: { allow?: string[]; ask?: string[]; deny?: string[] } = {};
+  const addConvRule = (kind: 'allow' | 'ask' | 'deny', pattern: string) => {
+    convRules = { ...convRules, [kind]: [...new Set([...(convRules[kind] ?? []), pattern])] };
+    save((d) => d.setRules(conversation()!, convRules));
+  };
+  // ↑ / ↓ through earlier prompts, like a shell: `draft` is what you were typing.
+  let browsing: { list: string[]; i: number; draft: string } | null = null;
+  let navigated = false;
   const cwd = process.cwd();
-  let SYSTEM = system(cwd);
+  let SYSTEM = system(cwd, agentsMd(projectOf(cwd)));
 
   // ---- state ----
   let model: Model | undefined;
@@ -150,7 +191,7 @@ export async function runApp(cfg: Config, version: string) {
       if (!saveFailed) (saveFailed = true), note(`Rime couldn't save this conversation: ${(e as Error).message}`, 'dim');
     }
   };
-  const conversation = () => (convId ??= save((d) => d.create(project, SYSTEM, model?.ref)) ?? null);
+  const conversation = () => (convId ??= save((d) => d.create(project, SYSTEM, model?.ref, TOOLS_HASH)) ?? null);
   // An Anthropic effort-only system message is kept as one output_config block.
   const store = (m: Message) => save((d) => d.append(conversation()!, m.role, m.role === 'system' ? [{ type: 'output_config', ...(m.output_config as object) }] : m.content)) ?? 0;
   const prompts = () => [...history.slice().reverse(), ...(save((d) => d.prompts(project)) ?? [])].filter((p, i, a) => p.trim() && a.indexOf(p) === i);
@@ -166,7 +207,13 @@ export async function runApp(cfg: Config, version: string) {
 
   // Mouse selection, in screen cells. `rows` is what the last frame drew.
   let press: { x: number; y: number; hit?: string; prompt?: boolean } | null = null;
-  let selection: { a: { x: number; y: number }; b: { x: number; y: number } } | null = null;
+  // A selection in the transcript (`log`) is anchored to transcript lines, so it
+  // stays on its text while you scroll; elsewhere it is in screen cells.
+  let selection: { a: { x: number; y: number }; b: { x: number; y: number }; log: boolean } | null = null;
+  let pointer = { x: 0, y: 0 }; // where the mouse is during a drag
+  let edgeScroll: NodeJS.Timeout | null = null; // dragging past the top or bottom scrolls
+  let top = 0; // transcript line shown on the first row
+  let logLines: string[] = [];
   let copied: NodeJS.Timeout | null = null;
   let rows: string[] = [];
 
@@ -334,7 +381,7 @@ export async function runApp(cfg: Config, version: string) {
   const earlier = () => [...history].reverse().concat(past).filter((p, i, a) => !/[\ue000-\uf8ff]/.test(p) && a.indexOf(p) === i);
   // Dim ghost text completing the line from an earlier prompt.
   function ghost() {
-    if (panel || atPick || rsearch || boxKind || range() || cur !== buf.length || buf.length < 3 || buf.startsWith('/') || [...buf].some(isChip)) return '';
+    if (panel || atPick || rsearch || browsing || boxKind || range() || cur !== buf.length || buf.length < 3 || buf.startsWith('/') || [...buf].some(isChip)) return '';
     const low = buf.toLowerCase();
     const h = earlier().find((p) => p.length > buf.length && p.toLowerCase().startsWith(low));
     return h ? h.slice(buf.length) : '';
@@ -451,7 +498,7 @@ export async function runApp(cfg: Config, version: string) {
   function ui(width: number, height: number) {
     const lines: string[] = [];
     const rowHits: Hit[][] = [];
-    const b = currentBox(width) ?? chipBox(width);
+    const b = approvalBox(width) ?? currentBox(width) ?? chipBox(width);
     if (b && b.lines.length <= height - 5) {
       lines.push(...b.lines);
       rowHits.push(...b.hits);
@@ -461,7 +508,9 @@ export async function runApp(cfg: Config, version: string) {
     // The prompt grows to 10 rows (at most a third of the screen), then scrolls.
     const maxRows = Math.max(1, Math.min(10, Math.floor(height / 3), height - lines.length - 3 - (sent.length ? 1 : 0)));
     const p = prompt(buf, cur, width, maxRows, st, {
-      placeholder: panel?.placeholder?.() ?? (resumeOk ? 'enter continues the interrupted reply, or ask something new' : undefined),
+      placeholder: panel?.placeholder?.() ?? (declining ? 'tell Rime what to do instead' : resumeOk ? 'enter continues the interrupted reply, or ask something new' : nextStep ? nextStep : example ? `Try "${example}"` : undefined),
+      // A suggestion shows the key that takes it.
+      tabHint: !panel && !declining && !resumeOk && (buf ? !!ghost() : !!(nextStep || example)),
       masked: panel?.masked?.() ?? false,
       sel: range() ?? undefined,
       chip: chipView,
@@ -489,18 +538,37 @@ export async function runApp(cfg: Config, version: string) {
       leftHits = [{ x0: x, x1: x + 4, id: 'key:enter' }, { x0: x + 29, x1: x + 31, id: 'key:esc' }];
     } else if (ps) left = ps;
     else if (scrollOff > 0) {
-      left = [{ t: '↓', s: st.accentB }, { t: ` ${scrollOff} lines below · pgdn`, s: st.dim }];
+      // Keys every keyboard has (SPEC §5.1); page up/down still work where they exist.
+      left = [
+        { t: '↓', s: st.accentB }, { t: ` ${scrollOff} lines below · `, s: st.dim },
+        ...(buf ? [] : [{ t: 'ctrl+u ctrl+d', s: st.accentB }, { t: ' scroll · ', s: st.dim }]),
+        { t: 'esc', s: st.accentB }, { t: ' to the end', s: st.dim },
+      ];
       leftHits = [{ x0: 1, x1: lineWidth(left), id: 'bottom' }];
-    } else if (busy) left = [{ t: 'esc', s: st.accentB }, { t: ' to stop', s: st.dim }];
-    else if (range()) {
+    } else if (declining) left = [{ t: 'type what Rime should do instead · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' to stop', s: st.dim }];
+    else if (busy) left = [{ t: 'esc', s: st.accentB }, { t: ' to stop', s: st.dim }];
+    else if (browsing) {
+      left = [{ t: '↑', s: st.accentB }, { t: ' older · ', s: st.dim }, { t: '↓', s: st.accentB }, { t: ' newer · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' back to your text', s: st.dim }];
+      leftHits = [{ x0: 19, x1: 21, id: 'key:esc' }];
+    } else if (range()) {
       left = [{ t: 'backspace', s: st.accentB }, { t: ' delete selection · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' clear selection', s: st.dim }];
       leftHits = [{ x0: 1, x1: 9, id: 'key:backspace' }, { x0: 30, x1: 32, id: 'key:esc' }];
+    } else if (mode !== 'ask') {
+      // Like Claude Code: the mode shows while it isn't the default; a click cycles it.
+      const [icon, name, s] =
+        mode === 'auto-edit' ? ['⏵⏵', 'auto-edit on', st.accentB]
+        : mode === 'plan' ? ['⏸', 'plan mode on', st.accentB]
+        : mode === 'god' ? ['⏵⏵⏵⏵', 'god mode on · nothing asks', st.del]
+        : ['⏵⏵⏵', 'auto on · risky commands still ask', st.warn];
+      left = [{ t: `${icon} ${name}`, s }, { t: ' (shift+tab to cycle)', s: st.dim }];
+      leftHits = [{ x0: 1, x1: lineWidth(left), id: 'mode' }];
     } else {
       left = [
         { t: '/', s: st.accentB }, { t: ' for commands', s: st.dim }, { t: ' · ', s: st.dim },
-        { t: '?', s: st.accentB }, { t: ' for shortcuts', s: st.dim },
+        { t: '?', s: st.accentB }, { t: ' for shortcuts', s: st.dim }, { t: ' · ', s: st.dim },
+        { t: '←', s: st.accentB }, { t: ' conversations', s: st.dim },
       ];
-      leftHits = [{ x0: 1, x1: 14, id: '/' }, { x0: 18, x1: 32, id: '?' }];
+      leftHits = [{ x0: 1, x1: 14, id: '/' }, { x0: 18, x1: 32, id: '?' }, { x0: 36, x1: 50, id: 'conversations' }];
     }
     const s = status(left, meterLine(), width, st, leftHits);
     lines.push(s.line);
@@ -523,6 +591,14 @@ export async function runApp(cfg: Config, version: string) {
     lastTotal = lines.length;
     scrollOff = Math.max(0, Math.min(scrollOff, lines.length - viewH));
     const start = Math.max(0, lines.length - viewH - scrollOff);
+    top = start;
+    logLines = lines;
+    // While dragging in the transcript, the selection follows the pointer, also
+    // when the view scrolls under it (wheel or the edges).
+    if (press && selection?.log) {
+      const row = Math.max(1, Math.min(viewH, pointer.y));
+      selection.b = { x: pointer.y > viewH ? width : pointer.x, y: start + row - 1 };
+    }
     const view = lines.slice(start, start + viewH);
     const screen = [...view, ...new Array(viewH - view.length).fill(''), ...u.lines];
     headerRow = items[0] === headerItem ? 2 - start : -99;
@@ -549,28 +625,34 @@ export async function runApp(cfg: Config, version: string) {
     );
   }
 
-  // The selected cells per screen row, from the anchor to the pointer in reading
-  // order. The mascot is never part of it: on header rows only the info text beside
+  // The selected cells per line, from the anchor to the pointer in reading
+  // order: `y` is a transcript line for a transcript selection, else a screen row.
+  // The mascot is never part of it: on header lines only the info text beside
   // him counts, like the logo in Claude Code.
   const infoCol = 3 + SCENE.COLS;
-  function selectionSpans(width: number) {
+  function selected(width: number) {
     if (!selection) return [];
     let { a, b } = selection;
     if (b.y < a.y || (b.y === a.y && b.x < a.x)) [a, b] = [b, a];
-    const headerLines = items[0] === headerItem ? 3 : 0;
-    const spans: { y: number; x0: number; x1: number }[] = [];
+    const hasHeader = items[0] === headerItem;
+    const textOf = (y: number) => (selection!.log ? logLines[y] : rows[y - 1]) ?? '';
+    const spans: { y: number; x0: number; x1: number; text: string }[] = [];
     for (let y = a.y; y <= b.y; y++) {
-      const onHeader = y >= headerRow && y < headerRow + headerLines;
+      // Header lines: transcript lines 1–3, or their rows on screen.
+      const onHeader = hasHeader && (selection.log ? y >= 1 && y <= 3 : y >= headerRow && y < headerRow + 3);
       const x0 = Math.max(y === a.y ? a.x : 1, onHeader ? infoCol : 1);
       const x1 = y === b.y ? b.x : width;
-      if (onHeader && sliceCols(rows[y - 1] || '', infoCol, width).trim() === '') continue; // mascot-only row
-      if (x0 <= x1) spans.push({ y, x0, x1 });
+      if (onHeader && sliceCols(textOf(y), infoCol, width).trim() === '') continue; // mascot-only line
+      if (x0 <= x1) spans.push({ y, x0, x1, text: textOf(y) });
     }
     return spans;
   }
+  // The spans on screen now.
+  const selectionSpans = (width: number) =>
+    selected(width).map((sp) => ({ ...sp, y: selection!.log ? sp.y - top + 1 : sp.y })).filter((sp) => sp.y >= 1 && sp.y <= (selection!.log ? viewH : H()));
 
   function copySelection() {
-    const text = selectionSpans(W()).map(({ y, x0, x1 }) => sliceCols(rows[y - 1] || '', x0, x1).trimEnd()).join('\n')
+    const text = selected(W()).map(({ text: t, x0, x1 }) => sliceCols(t, x0, x1).trimEnd()).join('\n')
       .replace(/^\n+|\n+$/g, '');
     if (!text.trim()) return;
     copy(text, write);
@@ -579,6 +661,23 @@ export async function runApp(cfg: Config, version: string) {
       copied = null;
       schedule();
     }, 1500);
+  }
+
+  // Dragging on the top row or below the transcript scrolls it, a line at a time.
+  function edge() {
+    const dir = !press || !selection?.log ? 0 : pointer.y > viewH ? -1 : pointer.y <= 1 ? 1 : 0;
+    if (!dir) {
+      if (edgeScroll) clearInterval(edgeScroll);
+      edgeScroll = null;
+      return;
+    }
+    if (edgeScroll) return;
+    edgeScroll = setInterval(() => {
+      const d = !press || !selection?.log ? 0 : pointer.y > viewH ? -1 : pointer.y <= 1 ? 1 : 0;
+      if (!d) return edge();
+      scrollOff += d;
+      schedule();
+    }, 50);
   }
 
   const schedule = () => {
@@ -732,6 +831,21 @@ export async function runApp(cfg: Config, version: string) {
     if (i >= 0) items.splice(i, 1);
   };
 
+  // The user's message joins the history; when the last message is already the
+  // user's (a reply that never came, or tool results), the new words join it, so
+  // the turns keep alternating.
+  function pushUser(content: string | Block[]) {
+    const last = messages.at(-1);
+    if (last?.role === 'user' && lastUserSeq) {
+      const blocks = (c: string | Block[]): Block[] => (typeof c === 'string' ? [{ type: 'text', text: c }] : c);
+      last.content = [...blocks(last.content), ...blocks(content)];
+      save((d) => d.update(convId!, lastUserSeq, last.content, false));
+      return lastUserSeq;
+    }
+    messages.push({ role: 'user', content });
+    return (lastUserSeq = store(messages.at(-1)!));
+  }
+
   // `text` is the prompt as typed (chips included); `content` is what goes to the
   // model: the text, or content blocks with the attachments.
   async function send(text: string, held = false, content: string | Block[] | Promise<Block[]> = text) {
@@ -763,21 +877,50 @@ export async function runApp(cfg: Config, version: string) {
     const c = sentControls();
     // Anthropic keeps top-level effort fixed per task and takes changes as an
     // effort-only system message, so the cache survives.
-    if (conn.wire === 'anthropic' && c.effort !== (task.sentEffort ?? task.controls.effort) && messages.length) {
+    if (conn.wire === 'anthropic' && c.effort !== (task.sentEffort ?? task.controls.effort) && messages.length && messages.at(-1)?.role !== 'user') {
       messages.push({ role: 'system', content: [], output_config: { effort: c.effort ?? 'high' } });
       store(messages.at(-1)!);
       task.sentEffort = c.effort;
     }
-    messages.push({ role: 'user', content });
-    const userSeq = store(messages.at(-1)!);
+    const userSeq = pushUser(content);
     continuing = null;
     resumeOk = false;
-    let flush: NodeJS.Timeout | null = null;
-    const unsave = () => {
-      if (live) save((d) => d.remove(convId!, live!.seq));
-      save((d) => d.remove(convId!, userSeq));
-    };
+    nextStep = '';
 
+    const ac = new AbortController();
+    const m = model, cn = conn;
+    const did: Did = { wrote: [], ran: [] };
+    let esc = () => ac.abort();
+    const me = { abort: () => ac.abort(), esc: () => esc() };
+    busy = me;
+    schedule();
+    try {
+      // The loop: a reply, its tool calls (asked about first), their results back
+      // to the model, until it answers without tools or you stop it.
+      for (let step = 0; step < 200; step++) {
+        const r = await streamOnce(m, cn, c, ac, step === 0 ? userSeq : 0, (f) => (esc = f));
+        if (!r.ok) break;
+        const uses = r.blocks.filter((b) => b.type === 'tool_use');
+        if (!uses.length) break;
+        esc = () => ac.abort();
+        const results = await runTools(uses, ac.signal, did);
+        messages.push({ role: 'user', content: results });
+        lastUserSeq = store(messages.at(-1)!);
+        if (ac.signal.aborted) {
+          note('stopped', 'dim');
+          break;
+        }
+      }
+    } finally {
+      if (busy === me) busy = null;
+      nextStep = suggestNext(did);
+      schedule();
+    }
+  }
+
+  // One streamed reply. Returns its blocks, or ok: false when it was stopped or failed.
+  async function streamOnce(m: Model, cn: Conn, c: Controls, ac: AbortController, userSeq: number, setEsc: (f: () => void) => void): Promise<{ ok: boolean; blocks: Block[] }> {
+    const root = llama.rootOf(cn.base);
     const thinking: Item = { kind: 'tool', verb: 'Thinking' };
     items.push(thinking);
     let dots = 0;
@@ -785,28 +928,23 @@ export async function runApp(cfg: Config, version: string) {
       if (thinking.kind === 'tool') thinking.verb = 'Thinking' + '.'.repeat(++dots % 4);
       schedule();
     }, 200);
-    const ac = new AbortController();
     let completionId = '';
     let thinkingNow = true, ended = false;
-    const me = {
-      abort: () => ac.abort(),
-      // esc while a local model is thinking ends the thinking instead of the reply.
-      esc: () => {
-        if (conn?.llamacpp && thinkingNow && completionId && !ended) {
-          ended = true;
-          llama.endReasoning(root, completionId);
-          if (thinking.kind === 'tool') thinking.rest = '· wrapping up (esc again stops)';
-        } else ac.abort();
-      },
-    };
-    busy = me;
+    // esc while a local model is thinking ends the thinking instead of the reply.
+    setEsc(() => {
+      if (cn.llamacpp && thinkingNow && completionId && !ended) {
+        ended = true;
+        llama.endReasoning(root, completionId);
+        if (thinking.kind === 'tool') thinking.rest = '· wrapping up (esc again stops)';
+      } else ac.abort();
+    });
     schedule();
 
     let reply: Extract<Item, { kind: 'reply' }> | null = null;
     let blocks: Block[] = [];
     let usage: Usage | null = null;
     let stop = '';
-    const m = model, cn = conn;
+    let flush: NodeJS.Timeout | null = null;
     const charge = () => {
       if (!usage) return;
       const turn = meter.charge(usage, m.price, cn.local);
@@ -824,11 +962,17 @@ export async function runApp(cfg: Config, version: string) {
       }
       if (task) Object.assign(task, { lastPrompt: prompt, lastControls: c });
     };
+    // Only the user's own message is taken back when nothing came of it; tool
+    // results stay, so every tool call keeps its answer.
     const forget = () => {
+      if (!userSeq) return;
       if (messages.at(-1)?.role === 'user') messages.pop();
+      if (live) save((d) => d.remove(convId!, live!.seq));
+      save((d) => d.remove(convId!, userSeq));
+      lastUserSeq = 0;
     };
     try {
-      for await (const ev of streamFor(cn)({ conn: cn, model: m, system: SYSTEM, messages, controls: cn.wire === 'anthropic' ? task.controls : c, signal: ac.signal, slot: cn.llamacpp ? 0 : undefined })) {
+      for await (const ev of streamFor(cn)({ conn: cn, model: m, system: SYSTEM, tools: TOOLS, messages, controls: cn.wire === 'anthropic' ? task!.controls : c, signal: ac.signal, slot: cn.llamacpp ? 0 : undefined })) {
         if (ev.type === 'id') completionId = ev.id;
         else if (ev.type === 'blocks') blocks = ev.blocks;
         else if (ev.type === 'usage') usage = ev.usage;
@@ -853,19 +997,22 @@ export async function runApp(cfg: Config, version: string) {
           schedule();
         }
       }
-      if (reply) reply.done = true;
+      if (reply) {
+        reply.done = true;
+        if (!reply.text.trim() || !splitToolCalls(reply.text).text.trim()) drop(reply);
+      }
       if (flush) clearInterval(flush);
+      drop(thinking);
       if (blocks.length) {
         messages.push({ role: 'assistant', content: blocks });
+        lastUserSeq = 0;
         if (live) save((d) => d.update(convId!, live!.seq, blocks, false));
         else store(messages.at(-1)!);
-      } else forget(), unsave();
-      drop(thinking);
-      const tc = reply ? splitToolCalls(reply.text).calls : [];
-      if (tc.length) note(`${m.label.split(/[\s\d.]/)[0] || m.label} wanted to run ${tc.join(' and ')}. Rime can't run tools until Phase 4.`, 'dim');
+      } else forget();
       charge();
       if (stop === 'refusal') note('The model declined this request. Rephrase it, or /clear to start over.');
       else if (stop === 'max_tokens') note('The reply hit the output limit and was cut off.');
+      return { ok: blocks.length > 0, blocks };
     } catch (e) {
       drop(thinking);
       if (reply) reply.done = true;
@@ -873,14 +1020,14 @@ export async function runApp(cfg: Config, version: string) {
       if (ac.signal.aborted) {
         if (reply?.text.trim()) {
           messages.push({ role: 'assistant', content: [{ type: 'text', text: reply.text.trimEnd() }] });
+          lastUserSeq = 0;
           if (live) save((d) => d.update(convId!, live!.seq, messages.at(-1)!.content, false));
-        } else forget(), unsave();
+        } else forget();
         charge();
         note('stopped', 'dim');
       } else {
-        if (messages.at(-1)?.role === 'assistant') messages.pop();
+        if (live) save((d) => d.remove(convId!, live!.seq));
         forget();
-        unsave();
         const err = e as Error;
         note(
           err instanceof ApiError && (err.status === 401 || err.status === 403)
@@ -890,13 +1037,439 @@ export async function runApp(cfg: Config, version: string) {
         );
         if (cfg.providers[cn.name]?.ssh) conn = undefined; // bring it up again next time
       }
+      return { ok: false, blocks: [] };
     } finally {
       clearInterval(spin);
       if (flush) clearInterval(flush);
       live = null;
-      if (busy === me) busy = null;
       schedule();
     }
+  }
+
+  // ---- tools (Phase 4) and permissions (SPEC §17) ----
+
+  type Did = { wrote: string[]; ran: { cmd: string; ok: boolean }[] };
+  const result = (id: unknown, content: string, error = false): Block => ({ type: 'tool_result', tool_use_id: id, content, ...(error ? { is_error: true } : {}) });
+  const permCtx = () => ({ mode, project, rules: ruleList(cfg.permissions, projectRules(project), convRules), granted: (p: string) => [...chips.values()].some((c) => c.path && (p === c.path || p.startsWith(c.path + path.sep))) });
+  const describe = (u: Block) => {
+    const i = (u.input ?? {}) as Record<string, any>;
+    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime' }[String(u.name)] ?? String(u.name);
+    const rest = u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
+    return { verb, rest };
+  };
+  const toolLine = (u: Block): Item => ({ kind: 'tool', ...describe(u) });
+  const detail = (lines: Line[]) => items.push({ kind: 'lines', hug: true, lines: lines.map((l) => [{ t: '  ⎿ ', s: st.dim }, ...l]).map((l, i) => (i ? [{ t: '    ', s: '' }, ...l.slice(1)] : l)) });
+
+  // Runs each tool call in order. Every call gets a result, also when it's
+  // refused, declined or stopped, so the history stays valid.
+  async function runTools(uses: Block[], signal: AbortSignal, did: Did): Promise<Block[]> {
+    const out: Block[] = [];
+    let skip = '';
+    for (const u of uses) {
+      const input = (u.input ?? {}) as Record<string, any>;
+      if (signal.aborted) {
+        out.push(result(u.id, 'Not run: the user stopped Rime.', true));
+        continue;
+      }
+      if (skip) {
+        out.push(result(u.id, skip, true));
+        continue;
+      }
+      const d = decide(String(u.name), input, permCtx());
+      decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why });
+      decisions.length = Math.min(decisions.length, 50);
+      if (d.verdict === 'deny') {
+        items.push({ ...toolLine(u), extra: [{ t: ` · not run: ${d.why}`, s: st.warn }] } as Item);
+        out.push(result(u.id, `Not run: ${d.why}.${mode === 'plan' ? ' Rime is in plan mode (read-only): answer with a plan instead. The user switches modes with shift+tab.' : ''}`, true));
+        continue;
+      }
+      if (d.verdict === 'ask') {
+        const answer = await ask(u, d, signal);
+        if (answer === 'stop') {
+          out.push(result(u.id, 'Not run: the user stopped Rime.', true));
+          continue;
+        }
+        if (answer === 'no') {
+          items.push({ kind: 'lines', lines: [[{ t: '✗ ', s: st.del }, { t: 'declined ', s: st.dim }, { t: `${describe(u).verb} ${describe(u).rest}`, s: st.title }, { t: ' · tell Rime what to do instead', s: st.dim }]] });
+          schedule();
+          // Your next words are the reason; esc (or ctrl+c) stops the whole turn instead.
+          const words = await new Promise<string | null>((res) => {
+            declining = res;
+            signal.addEventListener('abort', () => res(null), { once: true });
+          });
+          declining = null;
+          if (words === null) {
+            out.push(result(u.id, 'Not run: the user stopped Rime.', true));
+            skip = 'Not run: the user stopped Rime.';
+            continue;
+          }
+          out.push(result(u.id, words ? `The user declined this and said: ${words}` : 'The user declined this.', true));
+          skip = 'Not run: the user declined an earlier step.';
+          continue;
+        }
+        if (answer === 'always') {
+          if (u.name === 'write' || u.name === 'edit') setMode('auto-edit');
+          else if (d.rule) {
+            addConvRule('allow', d.rule);
+            items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${d.label} commands in this conversation · /permissions`, s: st.dim }]] });
+          }
+        }
+      }
+      items.push({ ...toolLine(u), ...(d.verdict === 'allow' && u.name === 'bash' ? { extra: [{ t: ` · ${d.why}`, s: st.dim }] } : {}) } as Item);
+      schedule();
+      let r: ToolResult;
+      try {
+        r = await runTool(String(u.name), input, signal);
+      } catch (e) {
+        r = { content: (e as Error).message, error: true, summary: (e as Error).message };
+      }
+      if (u.name === 'write' || u.name === 'edit') !r.error && did.wrote.push(rel(cwd, path.resolve(cwd, String(input.path))));
+      if (u.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error });
+      // What it did, short: the diff of an edit, the end of a command's output.
+      if (r.diff) detail(r.diff.map((x) => [{ t: x.n ? `${String(x.n).padStart(4)} ` : '     ', s: st.dim }, { t: x.sign === ' ' ? x.text : `${x.sign} ${x.text}`, s: x.sign === '+' ? st.ok : x.sign === '-' ? st.del : st.dim }]));
+      else if (r.output?.length) {
+        const tail = r.output.slice(-6);
+        detail([...(r.output.length > 6 ? [[{ t: `… ${r.output.length - 6} more lines`, s: st.dim }]] : []), ...tail.map((l) => [{ t: l, s: st.dim }]), [{ t: r.summary, s: r.error ? st.warn : st.dim }]]);
+      } else detail([[{ t: r.summary, s: r.error ? st.warn : st.dim }]]);
+      out.push(result(u.id, r.content, !!r.error));
+      schedule();
+    }
+    return out;
+  }
+
+  function runTool(name: string, input: Record<string, any>, signal: AbortSignal): ToolResult | Promise<ToolResult> {
+    if (name === 'read') return readTool(cwd, input as { path: string });
+    if (name === 'write') return writeTool(cwd, input as { path: string; content: string });
+    if (name === 'edit') return editTool(cwd, input as { path: string; old: string; new: string });
+    if (name === 'bash') return bashTool(cwd, input as { command: string }, signal);
+    if (name === 'rime') {
+      const text = rimeTool(String(input.action ?? ''), (input.args ?? {}) as Record<string, any>);
+      return { content: text, summary: text.split('\n')[0] };
+    }
+    return { content: `Unknown tool ${name}.`, error: true, summary: 'unknown tool' };
+  }
+
+  // The rime tool (SPEC §15): Rime acting on itself. It never reads or writes API
+  // keys, and it can't change permission modes or rules (it opens /permissions).
+  function rimeTool(action: string, args: Record<string, any>): string {
+    const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open · tab.close · tab.focus · panel.show · panel.hide · panel.split';
+    if (action === 'help') return `Actions: ${ACTIONS}\nSettings: ${settings.list().map((d) => `${d.key} (${d.values.join(' | ')}; applies ${WHEN[d.applies]})`).join(', ')}`;
+    if (action === 'settings.list') return settings.list().map((d) => `${d.key} = ${d.get(cfg)} · ${d.help} · applies ${WHEN[d.applies]}`).join('\n');
+    if (action === 'settings.get') return `${args.key} = ${settings.get(String(args.key)) ?? '(no such setting)'}`;
+    if (action === 'settings.set') {
+      const d = settings.list().find((x) => x.key === args.key);
+      if (!d) return `No setting ${args.key}. settings.list shows them.`;
+      if (!d.values.includes(String(args.value))) return `${args.key} takes ${d.values.join(' | ')}.`;
+      const ch = settings.set(d.key, String(args.value));
+      if (ch) items.push({ kind: 'gear', change: ch });
+      return ch ? `Done: ${d.label.toLowerCase()} ${ch.to} (was ${ch.from}), ${WHEN[d.applies]}.` : `${d.label.toLowerCase()} was already ${args.value}.`;
+    }
+    if (action === 'command') {
+      const name = String(args.name ?? '').replace(/^\/?/, '/');
+      const open: Record<string, () => void> = {
+        '/model': () => (panel = createModelPicker(host)),
+        '/setup': () => (panel = createSetup(host)),
+        '/settings': () => (panel = createSettingsPanel(host)),
+        '/permissions': () => (panel = createPermissions()),
+        '/usage': () => (boxKind = 'usage'),
+        '/server': () => {
+          const n = model && cfg.providers[model.provider]?.ssh ? model.provider : Object.keys(cfg.providers).find((k) => cfg.providers[k].ssh);
+          if (n) panel = createServer(host, n);
+        },
+      };
+      if (!open[name]) return `Rime has no box ${name}. Boxes: ${Object.keys(open).join(', ')}.`;
+      open[name]();
+      schedule();
+      return `Opened ${name} for the user; they answer it there.`;
+    }
+    if (/^(tab|panel)\./.test(action)) return 'Rime has no side panel yet (split view comes in a later version), so this did nothing. Tell the user, and suggest a command they can run instead, such as `open index.html`.';
+    return `Unknown action ${action}. Actions: ${ACTIONS}`;
+  }
+
+  // Asks before a command or an edit: Yes · Yes, don't ask again · No, tell Rime
+  // instead. While Rime waits, the turn is paused.
+  function ask(u: Block, d: Decision, signal: AbortSignal): Promise<'yes' | 'always' | 'no' | 'stop'> {
+    return new Promise((resolve) => {
+      const done = (a: 'yes' | 'always' | 'no' | 'stop') => {
+        signal.removeEventListener('abort', stop);
+        approval = null;
+        schedule();
+        resolve(a);
+      };
+      const stop = () => done('stop');
+      signal.addEventListener('abort', stop, { once: true });
+      const input = (u.input ?? {}) as Record<string, any>;
+      let diff: ToolResult['diff'];
+      if (u.name === 'edit') {
+        const e = planEdit(cwd, input as { path: string; old: string; new: string });
+        if (!('error' in e)) diff = diffOf(e.before, e.at, input.old, input.new, 8);
+      } else if (u.name === 'write') diff = String(input.content ?? '').split('\n').slice(0, 8).map((t, i) => ({ sign: '+' as const, n: i + 1, text: t }));
+      approval = { use: u, decision: d, sel: 0, done, diff };
+      schedule();
+    });
+  }
+
+  // /permissions (SPEC §17): the mode (auto only from here), the rules with where
+  // each came from, adding and removing them, and the last decisions.
+  function createPermissions(): Panel {
+    const PRESETS: [Mode, string, string][] = [
+      ['ask', 'Ask every time', 'before each command and edit (the default)'],
+      ['auto-edit', 'Auto-edit', 'edits without asking, commands still ask'],
+      ['plan', 'Plan', 'read-only: no edits, only read-only commands'],
+      ['auto', 'Auto', 'runs everything; deny rules and risky commands still ask'],
+      ['god', 'God mode', 'runs every command and edit without asking, even sudo and rm -rf'],
+    ];
+    let pick = 0;
+    let sure = false; // asked "turn on god mode?"
+    let adding = false;
+    let error = '';
+    type Row = { kind: 'mode' | 'rule' | 'add'; m?: Mode; rule?: ReturnType<typeof ruleList>[number] };
+    const rowsOf = (): Row[] => [
+      ...PRESETS.map(([m]): Row => ({ kind: 'mode', m })),
+      ...ruleList(cfg.permissions, projectRules(project), convRules).map((rule): Row => ({ kind: 'rule', rule })),
+      { kind: 'add' },
+    ];
+    const remove = (r: ReturnType<typeof ruleList>[number]) => {
+      if (r.from === 'conversation') {
+        convRules = { ...convRules, [r.kind]: (convRules[r.kind] ?? []).filter((x) => x !== r.pattern) };
+        save((d) => d.setRules(conversation()!, convRules));
+      } else if (r.from === 'project') removeProjectRule(project, r.kind, r.pattern);
+      else {
+        cfg.permissions = { ...cfg.permissions, [r.kind]: (cfg.permissions?.[r.kind] ?? []).filter((x) => x !== r.pattern) };
+        settings.save();
+      }
+    };
+    const dim = (t: string) => ({ t, s: st.dim });
+    return {
+      view() {
+        const rows = rowsOf();
+        pick = Math.min(pick, rows.length - 1);
+        const out: BoxRow[] = [{ line: [dim('Mode')] }];
+        rows.forEach((r, i) => {
+          if (r.kind === 'mode') {
+            const p = PRESETS.find((x) => x[0] === r.m)!;
+            out.push(listRow(p[1], [{ t: r.m === mode ? '● ' : '', s: r.m === 'god' ? st.del : r.m === 'auto' ? st.warn : st.ok }, dim(p[2])], i === pick, st, `pick:${i}`, 22));
+            if (r.m === 'god' && sure) {
+              out.push(
+                { line: [{ t: '  Turn on god mode? Rime will run every command and edit the model asks for, without asking you:', s: st.del }] },
+                { line: [{ t: '  sudo, rm -rf, force push, writes outside the project. Only your deny rules still block.', s: st.del }] },
+                { line: [{ t: '  It lasts until you quit or switch modes. ', s: st.dim }, { t: 'enter', s: st.accentB }, { t: ' turn it on · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' keep things as they are', s: st.dim }] },
+              );
+            }
+            if (r.m === 'god') out.push({ line: [] }, { line: [dim('Rules · deny wins over ask, ask over allow')] });
+          } else if (r.kind === 'rule') {
+            const k = r.rule!;
+            out.push(listRow(`${k.kind} ${k.pattern}`, `${k.from === 'conversation' ? 'this conversation' : k.from === 'project' ? 'this project (.rime/permissions.json)' : 'you (~/.rime/config)'} · d removes`, i === pick, st, `pick:${i}`, 40));
+          } else out.push(listRow(adding ? 'Type the rule below' : '+ Add a rule', adding ? 'e.g. allow bash(npm run build *) · deny edit(.env)' : 'allow / ask / deny bash(…), edit(…), read(…)', i === pick, st, `pick:${i}`, 22));
+        });
+        if (error) out.push({ line: [{ t: error, s: st.warn }] });
+        out.push({ line: [] }, { line: [dim('Recent decisions')] });
+        if (!decisions.length) out.push({ line: [dim('  none yet')] });
+        for (const d of decisions.slice(0, 6)) out.push({ line: [{ t: d.verdict === 'allow' ? '  ✓ ' : d.verdict === 'deny' ? '  ✗ ' : '  ? ', s: d.verdict === 'deny' ? st.del : d.verdict === 'allow' ? st.ok : st.warn }, { t: d.what, s: st.fg }, dim(` · ${d.why}`)] });
+        return { legend: [{ t: 'permissions', s: st.accent }, dim(` · ${MODE_HELP[mode]}`)], rows: out, foot: adding ? ['enter', ' add · ', 'esc', ' back'] : ['↑ ↓', ' choose · ', 'enter', ' pick · ', 'd', ' remove a rule · ', 'esc', ' close'] };
+      },
+      placeholder: () => (adding ? 'allow bash(npm test *)' : 'Pick a mode or a rule'),
+      typing: () => adding,
+      key(k) {
+        const rows = rowsOf();
+        if (adding) {
+          if (k.name === 'escape') return (adding = false), (error = ''), host.setBuffer(''), true;
+          return false;
+        }
+        if (sure) {
+          // The god mode confirm: enter turns it on, anything else keeps things as they are.
+          sure = false;
+          if (k.name === 'enter') setMode('god');
+          return true;
+        }
+        if (k.name === 'escape') return host.close(), true;
+        if (k.name === 'up') return (pick = (pick + rows.length - 1) % rows.length), true;
+        if (k.name === 'down') return (pick = (pick + 1) % rows.length), true;
+        const r = rows[pick];
+        if (k.name === 'char' && k.ch === 'd' && r.kind === 'rule') return remove(r.rule!), true;
+        if (k.name === 'enter') {
+          if (r.kind === 'mode' && r.m === 'god' && mode !== 'god') sure = true;
+          else if (r.kind === 'mode') setMode(r.m!);
+          else if (r.kind === 'add') (adding = true), host.setBuffer('allow bash(');
+          return true;
+        }
+        return true;
+      },
+      submit(v) {
+        const m = /^(allow|ask|deny)\s+((?:bash|edit|read|fetch)\(.+\))$/.exec(v.trim());
+        if (!m) return void (error = 'A rule looks like: allow bash(npm test *), ask edit(src/**), deny read(.env)');
+        addConvRule(m[1] as 'allow', m[2]);
+        adding = false;
+        error = '';
+        host.setBuffer('');
+      },
+      click(id) {
+        pick = Number(id.split(':')[1]);
+      },
+    };
+  }
+
+  // Which of the three answers this question offers (0 yes, 1 don't ask again, 2 no).
+  function approvalOptions() {
+    const a = approval!;
+    const again = a.use.name === 'bash' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/outside/.test(a.decision.why);
+    return again ? [0, 1, 2] : [0, 2];
+  }
+  function answer(n: number) {
+    if (!approval || !approvalOptions().includes(n - 1)) return;
+    approval.done(n === 1 ? 'yes' : n === 2 ? 'always' : 'no');
+  }
+  function cycleMode() {
+    setMode(mode === 'auto' || mode === 'god' ? 'ask' : MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
+  }
+
+  // The question above the prompt: the exact command (or the change), where it
+  // runs, why it asks, and the three answers.
+  function approvalBox(width: number) {
+    if (!approval) return null;
+    const { use: u, decision: d, diff } = approval;
+    const i = (u.input ?? {}) as Record<string, any>;
+    const dim = (t: string) => ({ t, s: st.dim });
+    const rows: BoxRow[] = [];
+    const title = u.name === 'bash' ? 'run a command?' : u.name === 'write' ? (fs.existsSync(path.resolve(cwd, String(i.path))) ? 'replace a file?' : 'create a file?') : u.name === 'edit' ? 'edit a file?' : 'read a file?';
+    if (u.name === 'bash') {
+      for (const l of String(i.command ?? '').split('\n').slice(0, 6)) rows.push({ line: [{ t: '$ ', s: st.dim }, { t: l, s: st.titleB }], bg: st.panelBg });
+      rows.push({ line: [dim(`in ${tildify(cwd)}`), ...(i.reason ? [dim(' · '), { t: 'Rime: ', s: st.fg }, dim(String(i.reason))] : [])] });
+      if (d.parts && d.parts.length > 1)
+        rows.push({ line: d.parts.flatMap((p, j) => [...(j ? [dim(' · ')] : []), { t: `${p.state === 'ok' ? '✓' : p.state === 'guard' ? '✗' : '?'} ${p.text}`, s: p.state === 'ok' ? st.ok : p.state === 'guard' ? st.del : st.warn }, ...(p.why ? [dim(` ${p.why}`)] : [])]) });
+    } else {
+      rows.push({ line: [{ t: rel(cwd, path.resolve(cwd, String(i.path ?? ''))), s: st.titleB }] });
+      for (const x of diff ?? []) rows.push({ line: [{ t: x.n ? `${String(x.n).padStart(4)} ` : '     ', s: st.dim }, { t: x.sign === ' ' ? x.text : `${x.sign} ${x.text}`, s: x.sign === '+' ? st.ok : x.sign === '-' ? st.del : st.dim }] });
+    }
+    if (d.why && !/in this mode$/.test(d.why)) rows.push({ line: [{ t: d.why, s: st.warn }] });
+    rows.push({ line: [] });
+    const labels = [
+      'Yes',
+      u.name === 'bash' ? `Yes, and don't ask again for ${d.label} commands in this conversation` : 'Yes, and allow edits for the rest of this conversation',
+      'No, and tell Rime what to do instead (esc)',
+    ];
+    for (const n of approvalOptions()) {
+      const on = approval.sel === n;
+      rows.push({ line: [{ t: on ? '› ' : '  ', s: st.accent }, { t: `${n + 1} `, s: st.dim }, { t: labels[n], s: on ? st.accent : st.fg }], bg: on ? st.panelBg : undefined, hit: `dec:${n + 1}` });
+    }
+    rows.push(...footRows(['↑ ↓', ' choose · ', 'enter', ' or ', approvalOptions().length === 3 ? '1 2 3' : '1 3', ' · ', 'esc', ' no · ', 'shift+tab', ' mode'], st));
+    return box([{ t: title, s: st.warn }, dim(` · ${MODE_HELP[mode]}`)], rows, width, st, st.warn);
+  }
+
+  // Starts a new conversation; the current one stays in the list.
+  function newConversation() {
+    busy?.abort();
+    if (convId) save((d) => d.unlock(convId!));
+    convId = null;
+    continuing = null;
+    resumeOk = false;
+    lastUserSeq = 0;
+    nextStep = '';
+    example = tryExample();
+    convRules = {};
+    messages = [];
+    task = null;
+    items = [headerItem];
+    scrollOff = 0;
+  }
+
+  // ← on an empty prompt: this project's conversations, newest first (SPEC §16).
+  // Search, the timeline, rename, fork and delete come in Phase 4b.
+  function createConversations(): Panel {
+    let pick = 0;
+    let filter = '';
+    const all = save((d) => d.list(project)) ?? [];
+    const dim = (t: string) => ({ t, s: st.dim });
+    const shown = () => all.filter((c) => c.n > 0 && (!filter || c.title.toLowerCase().includes(filter.toLowerCase())));
+    const group = (t: number) => {
+      const day = 86400000, start = new Date().setHours(0, 0, 0, 0);
+      return t >= start ? 'Today' : t >= start - day ? 'Yesterday' : t >= start - 6 * day ? 'This week' : 'Older';
+    };
+    const open = (id: number) => {
+      if (id === convId) return host.close();
+      const c = save((d) => d.take(id));
+      if (!c) return void note('That conversation is open in another Rime window.', 'dim');
+      newConversation();
+      reopen(c);
+      host.close();
+    };
+    return {
+      view(width) {
+        const list = shown();
+        pick = Math.min(pick, Math.max(0, list.length - 1));
+        const rows: BoxRow[] = [];
+        let g = '';
+        list.slice(Math.max(0, pick - 12), Math.max(0, pick - 12) + 16).forEach((c) => {
+          const i = list.indexOf(c);
+          if (group(c.updated) !== g) rows.push({ line: [dim((g = group(c.updated)))] });
+          const model = c.model ? c.model.split('/').pop() : '';
+          rows.push(listRow(c.title || 'untitled', [{ t: c.id === convId ? '● ' : '', s: st.ok }, dim([ago(c.updated), model, `${c.n} messages`].filter(Boolean).join(' · '))], i === pick, st, `pick:${i}`, Math.min(48, Math.floor(width / 2))));
+        });
+        if (!list.length) rows.push({ line: [dim(filter ? `no conversation matches ${filter}` : 'No conversations in this project yet.')] });
+        return { legend: [{ t: 'conversations', s: st.accent }, dim(` · ${tildify(project)}`)], rows, foot: ['↑ ↓', ' choose · ', 'enter', ' open · ', 'n', ' new · type to filter · ', 'esc', ' back'] };
+      },
+      placeholder: () => 'Type to filter your conversations',
+      typing: () => true,
+      key(k) {
+        const list = shown();
+        if (k.name === 'escape' || (k.name === 'right' && !filter)) return host.close(), true;
+        if (k.name === 'up') return (pick = (pick + list.length - 1) % Math.max(1, list.length)), true;
+        if (k.name === 'down') return (pick = (pick + 1) % Math.max(1, list.length)), true;
+        if (k.name === 'enter') return list[pick] && open(list[pick].id), true;
+        if (k.name === 'char' && k.ch === 'n' && !filter) return newConversation(), host.close(), true;
+        return false;
+      },
+      changed(v) {
+        filter = v;
+        pick = 0;
+      },
+      click(id) {
+        pick = Number(id.split(':')[1]);
+      },
+    };
+  }
+
+  function setMode(m: Mode) {
+    mode = m;
+    say(`permission mode: ${MODE_HELP[m]}`);
+    schedule();
+  }
+
+  // After a reply, one suggestion for what to do next, from what just happened
+  // (SPEC §5.4). No AI call.
+  function suggestNext(did: Did): string {
+    const tests = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?test\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+test\b|\bvitest\b|\bjest\b|\bnode\s+--test\b/;
+    const lastTest = [...did.ran].reverse().find((r) => tests.test(r.cmd));
+    if (lastTest && !lastTest.ok) return 'fix the failing tests';
+    const html = did.wrote.find((f) => /\.html?$/i.test(f));
+    if (html) return `open ${html} in the browser`;
+    if (did.wrote.length && !lastTest && hasTests()) return 'run the tests';
+    if ((did.wrote.length || lastTest?.ok) && gitDirty()) return 'commit this';
+    return '';
+  }
+  const hasTests = () => {
+    try {
+      return !!JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).scripts?.test;
+    } catch {
+      return fs.existsSync(path.join(project, 'pytest.ini')) || fs.existsSync(path.join(project, 'go.mod')) || fs.existsSync(path.join(project, 'Cargo.toml'));
+    }
+  };
+  const gitDirty = () => {
+    const r = spawnSync('git', ['-C', project, 'status', '--porcelain'], { encoding: 'utf8' });
+    return r.status === 0 && r.stdout.trim().length > 0;
+  };
+
+  // An example for the empty prompt, from this project (`Try "…"`, like Claude Code).
+  function tryExample() {
+    const files = listFiles(project, 2000).filter((f) => /\.(ts|tsx|js|jsx|py|go|rs|rb|java|c|cpp|swift|kt|php|html|css|md)$/.test(f) && !/(^|\/)(dist|build|vendor)\//.test(f));
+    const pick = <T,>(a: T[]) => a[Math.floor(Math.random() * a.length)];
+    if (!files.length) return pick(['build a small static page that says hello', 'start a new project: a CLI that counts words', 'make a simple todo app in one html file']);
+    const code = files.filter((f) => !/\.(md|html|css)$/.test(f));
+    const f = pick(code.length ? code : files);
+    const ideas = [`explain what ${f} does`, `find bugs in ${f}`, `add tests for ${f}`, `make ${f} easier to read`];
+    if (!files.some((x) => /^readme/i.test(x))) ideas.push('write a README for this project');
+    if (hasTests()) ideas.push('run the tests and fix what fails');
+    return pick(ideas);
   }
 
   // ---- panels ----
@@ -992,6 +1565,14 @@ export async function runApp(cfg: Config, version: string) {
 
   function submit() {
     const v = buf.trim();
+    // "No, and tell Rime what to do instead": these words go back as the reason.
+    if (declining && !v.startsWith('/')) {
+      if (v) items.push({ kind: 'user', text: v }), history.push(v);
+      buf = '';
+      cur = 0;
+      anchor = null;
+      return declining(v);
+    }
     if (!v && resumeOk && !busy) return void send('continue');
     if (!v) return;
     if (busy && !v.startsWith('/')) return; // one reply at a time; esc stops it
@@ -1030,16 +1611,10 @@ export async function runApp(cfg: Config, version: string) {
       if (name) panel = createServer(host, name);
       else note('No own server is set up. /setup connects one.', 'dim');
     } else if (c === '/settings') panel = createSettingsPanel(host);
+    else if (c === '/permissions') panel = createPermissions();
+    else if (c === '/conversations') panel = createConversations();
     else if (c === '/clear') {
-      busy?.abort();
-      if (convId) save((d) => d.unlock(convId!));
-      convId = null;
-      continuing = null;
-      resumeOk = false;
-      messages = [];
-      task = null;
-      items = [headerItem];
-      scrollOff = 0;
+      newConversation();
       if (later) host.choose(later);
     } else if (c === '/usage') boxKind = 'usage';
     else if (c === '/exit') quit();
@@ -1177,6 +1752,9 @@ export async function runApp(cfg: Config, version: string) {
       return;
     }
     if (id === 'stop') return stopBg();
+    if (id === 'mode') return cycleMode();
+    if (id === 'conversations') return void (panel = createConversations());
+    if (id.startsWith('dec:') && approval) return void answer(+id.slice(4));
     if (id.startsWith('undo:')) {
       const it = items[+id.slice(5)];
       if (it?.kind === 'gear') settings.undo(it.change);
@@ -1207,6 +1785,22 @@ export async function runApp(cfg: Config, version: string) {
       boxKind = null; // any key closes the sheet
       return;
     }
+    // The permission question takes the keys while it's open.
+    if (approval) {
+      const opts = approvalOptions();
+      if (k.name === 'up' || k.name === 'down') {
+        const i = opts.indexOf(approval.sel);
+        approval.sel = opts[(i + (k.name === 'up' ? opts.length - 1 : 1)) % opts.length];
+      } else if (k.name === 'enter') answer(approval.sel + 1);
+      else if (k.name === 'char' && /^[123]$/.test(k.ch ?? '') && opts.includes(+k.ch! - 1)) answer(+k.ch!);
+      else if (k.name === 'escape') answer(3);
+      else if (k.name === 'tab' && k.shift) cycleMode();
+      else if (k.ctrl && k.name === 'c') busy?.abort();
+      return;
+    }
+    if (k.name === 'tab' && k.shift && !panel) return cycleMode();
+    // ← on an empty prompt opens your conversations.
+    if (k.name === 'left' && !k.shift && !buf && !panel && !boxKind && !busy && !rsearch) return void (panel = createConversations());
     // ctrl+c cancels what's open or running; twice quits, but only when nothing
     // is open or running, so one press never loses work (SPEC §5.2).
     if (k.ctrl && k.name === 'c') {
@@ -1269,6 +1863,8 @@ export async function runApp(cfg: Config, version: string) {
       const n = Math.max(1, knownModels().filter((r) => r.toLowerCase().includes(buf.split(/\s+/)[1].toLowerCase())).length);
       return void (sel = (sel + (k.name === 'down' ? 1 : n - 1)) % n);
     }
+    // On an empty prompt, tab or → takes the suggestion (the next step, or the example).
+    if (!buf && !panel && !declining && (k.name === 'tab' || (k.name === 'right' && !k.shift)) && (nextStep || example)) return insert(nextStep || example);
     // tab, or → at the end, takes the ghost text.
     const g = ghost();
     if (g && (k.name === 'tab' || (k.name === 'right' && !k.shift && !k.ctrl))) return insert(g);
@@ -1297,11 +1893,18 @@ export async function runApp(cfg: Config, version: string) {
     // "what gets sent" list, a box; then it stops Rime.
     if (k.name === 'escape') {
       if (big) big = null;
-      else if (range()) anchor = null;
+      else if (browsing) {
+        // Back to what you were typing before ↑.
+        buf = browsing.draft;
+        cur = buf.length;
+        browsing = null;
+        navigated = true;
+      } else if (range()) anchor = null;
       else if (listPinned) listPinned = listOpen = false;
       else if (blindAsk) blindAsk = false;
       else if (boxKind) boxKind = null;
-      else busy?.esc();
+      else if (busy) busy.esc();
+      else if (scrollOff > 0) scrollOff = 0; // back to the end of the conversation
       return;
     }
     const r = range();
@@ -1315,7 +1918,9 @@ export async function runApp(cfg: Config, version: string) {
         } else submit();
         break;
       case 'char':
-        if (k.ch === '?' && !buf && !panel) boxKind = 'keys';
+        // option+← / → arrive as esc b / esc f in many terminals: a word left or right.
+        if (k.alt && (k.ch === 'b' || k.ch === 'f')) (anchor = null), (cur = k.ch === 'b' ? wordLeft(cur) : wordRight(cur));
+        else if (k.ch === '?' && !buf && !panel) boxKind = 'keys';
         else if (!k.alt && k.ch) {
           insert(k.ch);
           // @ at the start or after a space opens the file picker (ana@larch.dev stays text).
@@ -1327,11 +1932,12 @@ export async function runApp(cfg: Config, version: string) {
         break;
       case 'backspace':
         if (r) cut(...r);
-        else if (k.ctrl) cut(wordLeft(cur), cur);
+        else if (k.ctrl || k.alt) cut(wordLeft(cur), cur); // option+backspace deletes a word, as in Claude Code
         else if (cur > 0) cut(prevCp(cur), cur);
         break;
       case 'delete':
         if (r) cut(...r);
+        else if (k.alt) cut(cur, wordRight(cur));
         else if (cur < buf.length) cut(cur, nextCp(cur));
         break;
       case 'left':
@@ -1343,18 +1949,29 @@ export async function runApp(cfg: Config, version: string) {
         } else if (r) {
           cur = left ? r[0] : r[1];
           anchor = null;
-        } else cur = k.ctrl ? (left ? wordLeft(cur) : wordRight(cur)) : left ? prevCp(cur) : nextCp(cur);
+        } else cur = k.ctrl || k.alt ? (left ? wordLeft(cur) : wordRight(cur)) : left ? prevCp(cur) : nextCp(cur);
         break;
       }
       case 'up':
-      case 'down':
+      case 'down': {
+        const up = k.name === 'up';
         if (k.shift) anchor ??= cur;
         else anchor = null;
-        if (!vertical(k.name === 'up' ? -1 : 1) && k.name === 'up' && !buf && history.length) {
-          buf = history.at(-1)!;
-          cur = buf.length;
-        }
+        if (vertical(up ? -1 : 1) || k.shift) break;
+        // On the first line ↑ goes to older prompts; on the last line ↓ comes back
+        // to newer ones and finally to what you were typing.
+        if (up) {
+          browsing ??= { list: [...history].reverse().concat(past).filter((p, i, a) => p.trim() && a.indexOf(p) === i), i: -1, draft: buf };
+          if (browsing.i + 1 >= browsing.list.length) break;
+          buf = browsing.list[++browsing.i];
+        } else if (browsing) {
+          buf = --browsing.i < 0 ? browsing.draft : browsing.list[browsing.i];
+          if (browsing.i < 0) browsing = null;
+        } else break;
+        cur = buf.length;
+        navigated = true;
         break;
+      }
       case 'home': case 'end':
         anchor = null;
         cur = k.name === 'home' ? lineStart() : lineEnd();
@@ -1379,9 +1996,11 @@ export async function runApp(cfg: Config, version: string) {
     if (ev.type === 'mouse') {
       const at = { x: ev.x, y: ev.y };
       const onPrompt = !panel?.masked?.() && promptOffset(ev.x, ev.y) !== null;
-      if (ev.button === 64 || ev.button === 65) {
-        scrollOff += ev.button === 64 ? 3 : -3; // wheel
-        selection = null;
+      if (ev.button === 64 || ev.button === 65 || ev.button === 96 || ev.button === 97) {
+        // The wheel scrolls; a transcript selection stays on its text (and grows
+        // with the view while the button is held).
+        scrollOff += ev.button % 2 === 0 ? 3 : -3;
+        if (!selection?.log) selection = null;
       } else if (ev.button === 35) {
         // Motion with no button (any-motion reporting): hovering a chip previews
         // it, hovering the "what gets sent" line lists the parts.
@@ -1393,6 +2012,7 @@ export async function runApp(cfg: Config, version: string) {
         listOpen = open;
       } else if (ev.button === 0 && !ev.release) {
         selection = null;
+        pointer = at;
         press = { ...at, hit: hits.find((h) => h.row === ev.y && ev.x >= h.x0 && ev.x <= h.x1)?.id };
         const now = Date.now();
         const double = now - lastClick.t < 400 && lastClick.x === ev.x && lastClick.y === ev.y;
@@ -1417,8 +2037,14 @@ export async function runApp(cfg: Config, version: string) {
         if (onCube && ev.y <= viewH) header.blink();
       } else if (ev.button === 32 && press) {
         // Drag with the left button held: prompt text, or screen cells elsewhere.
+        pointer = at;
         if (press.prompt) cur = promptOffset(ev.x, ev.y, true)!;
-        else if (at.x !== press.x || at.y !== press.y || selection) selection = { a: press, b: at };
+        else if (at.x !== press.x || at.y !== press.y || selection) {
+          const log = press.y <= viewH;
+          selection ??= { a: log ? { x: press.x, y: top + press.y - 1 } : { x: press.x, y: press.y }, b: at, log };
+          if (!log) selection.b = at; // in the transcript, the frame places b (it may scroll)
+          edge();
+        }
       } else if (ev.button === 0 && ev.release && press) {
         if (press.prompt) {
           const r = range();
@@ -1429,7 +2055,12 @@ export async function runApp(cfg: Config, version: string) {
             anchor = null;
             if (press.hit?.startsWith('chip:')) big = big === press.hit.slice(5) ? null : press.hit.slice(5);
           }
-        } else if (selection) copySelection();
+        } else if (selection) {
+          if (selection.log) selection.b = { x: pointer.y > viewH ? W() : pointer.x, y: top + Math.max(1, Math.min(viewH, pointer.y)) - 1 };
+          press = null;
+          edge();
+          copySelection();
+        }
         else if (chipAt(ev.x, ev.y)) {
           const ch = chipAt(ev.x, ev.y)!;
           big = big === ch ? null : ch; // a click opens a chip full size
@@ -1445,7 +2076,11 @@ export async function runApp(cfg: Config, version: string) {
       if (ev.name === 'pageup' || ev.name === 'pagedown') scrollOff += (ev.name === 'pageup' ? 1 : -1) * Math.max(1, viewH - 2);
       else onKey(ev);
     }
-    if (buf !== before) blindAsk = false;
+    if (buf !== before) {
+      blindAsk = false;
+      if (!navigated) browsing = null; // typing keeps the text you brought back
+    }
+    navigated = false;
     if (panel && buf !== before) panel.changed?.(buf);
     schedule();
   }
@@ -1487,8 +2122,14 @@ export async function runApp(cfg: Config, version: string) {
   // the frozen prefix it was sent with when it's recent enough for the cache to hit.
   function reopen(c: Conversation) {
     convId = c.id;
-    if (c.prefix && Date.now() - c.updated < 86400000) SYSTEM = c.prefix;
-    else save((d) => d.setPrefix(c.id, SYSTEM));
+    try {
+      convRules = c.rules ? JSON.parse(c.rules) : {};
+    } catch {
+      convRules = {};
+    }
+    // The stored prefix is reused when it's recent and was sent with today's tools.
+    if (c.prefix && c.prefix_hash === TOOLS_HASH && Date.now() - c.updated < 86400000) SYSTEM = c.prefix;
+    else save((d) => d.setPrefix(c.id, SYSTEM, TOOLS_HASH));
     const stored: Stored[] = save((d) => d.messages(c.id)) ?? [];
     for (const m of stored) {
       const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;
@@ -1498,20 +2139,29 @@ export async function runApp(cfg: Config, version: string) {
         continue;
       }
       messages.push({ role: m.role, content: m.content });
+      const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join(m.role === 'user' ? '\n' : '');
       if (m.role === 'user') {
-        const t = String(blocks.find((b) => b.type === 'text')?.text ?? '');
-        items.push({ kind: 'user', text: t });
-        history.push(t);
-      } else items.push({ kind: 'reply', text: blocks.filter((b) => b.type === 'text').map((b) => b.text).join('') + (m.interrupted ? '…' : ''), done: true });
+        if (text) items.push({ kind: 'user', text }), history.push(text);
+      } else {
+        if (splitToolCalls(text).text.trim()) items.push({ kind: 'reply', text: text + (m.interrupted ? '…' : ''), done: true });
+        for (const u of blocks.filter((b) => b.type === 'tool_use')) items.push(toolLine(u));
+      }
     }
     if (!stored.length) return;
     continuing = { title: c.title || 'untitled', at: c.updated };
-    const last = stored.at(-1)!;
-    if (last.interrupted || last.role === 'user') {
+    // Tool calls left without results when Rime closed get them now.
+    const last = messages.at(-1);
+    const open = last?.role === 'assistant' && Array.isArray(last.content) ? last.content.filter((b) => b.type === 'tool_use') : [];
+    if (open.length) {
+      messages.push({ role: 'user', content: open.map((u) => result(u.id, 'Not run: Rime was closed before this ran.', true)) });
+      lastUserSeq = store(messages.at(-1)!);
+    } else if (stored.at(-1)!.role === 'user') lastUserSeq = stored.at(-1)!.seq;
+    if (stored.at(-1)!.interrupted || messages.at(-1)?.role === 'user') {
       resumeOk = true;
       items.push({ kind: 'lines', lines: [[{ t: '  ↻ ', s: st.warn }, { t: 'interrupted when you quit · nothing was lost · ', s: st.dim }, { t: 'enter', s: st.accentB }, { t: ' continue', s: st.dim }]] });
     }
   }
+
 
   const parse = createParser();
   inp.setRawMode(true);
@@ -1535,6 +2185,7 @@ export async function runApp(cfg: Config, version: string) {
     else if (conv) reopen(conv);
     past = save((d) => d.prompts(project)) ?? [];
   }
+  example = tryExample();
   if (!connected()) panel = createSetup(host);
   else if (cfg.model) useRef(cfg.model, true);
   frame();

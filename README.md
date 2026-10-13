@@ -4,11 +4,11 @@ A small, token-frugal AI coding CLI for the terminal. It runs on any provider yo
 connect, including your own llama.cpp server at home, and it treats the prompt
 cache as sacred so long sessions stay cheap and fast.
 
-Its mascot is a pixel ice cube that freezes while your server starts up.
+Rime reads and writes files and runs commands in your project, asking before each
+one, with whichever model you connect. Its mascot is a pixel ice cube that freezes
+while your server starts up.
 
-> **Status: early.** Rime can chat with any connected model and set up a remote
-> llama.cpp server end to end. File and shell tools, the code index and the
-> router come next (see the [roadmap](#roadmap)).
+> **Status: early.** Expect rough edges and changes between versions.
 
 ## Why
 
@@ -65,8 +65,15 @@ rime connect http://localhost:8080 --name local
 | `ctrl+j` | new line (`shift+enter` too, where the terminal reports it) |
 | `esc` | stop the reply, go back one screen, or close a box |
 | `ctrl+c` | cancel what is open or running |
-| `↑` | edit your last message |
+| `↑ ↓` | your earlier prompts (`esc` goes back to what you were typing) |
+| `tab` | take the suggestion shown in dim text |
+| `@` | attach a file or folder from the project |
+| `ctrl+r` | search your earlier prompts |
+| `option+⌫` `ctrl+w` | delete the word before the cursor |
+| `ctrl+u` `ctrl+d` | scroll the conversation (on an empty prompt); `esc` jumps to the end |
 | `ctrl+v` | paste an image from the clipboard |
+| `shift+tab` | permission mode: ask · auto-edit · plan |
+| `←` | your conversations (on an empty prompt) |
 | `/` | commands |
 | `?` | shortcuts |
 | `ctrl+c` twice | quit (only when nothing is open) |
@@ -78,6 +85,8 @@ rime connect http://localhost:8080 --name local
 | `/server` | status and controls for your server: load, restart, stop, power off |
 | `/connect` | add a provider or URL directly |
 | `/settings` | every setting, applied right away, with undo |
+| `/permissions` | permission mode and allow / ask / deny rules |
+| `/conversations` | this project's conversations |
 | `/usage` | tokens, cost and cache savings |
 | `/clear` | start a new conversation |
 | `/exit` | quit |
@@ -85,8 +94,10 @@ rime connect http://localhost:8080 --name local
 There are no sessions to manage: `rime` always reopens the project's last conversation,
 and everything is saved as it happens, so quitting is instant. `/clear` starts a new one.
 
-Type `@` to attach a project file, and earlier prompts come back as dim suggestions
-(`tab` takes one, `ctrl+r` searches them).
+Suggestions come from your project and your history, never from an extra AI call: an
+empty prompt shows `Try "…"` with a real file from the project, after a reply Rime
+suggests the next step ("run the tests", "open index.html in the browser", "commit
+this"), and as you type, earlier prompts complete in dim text. `tab` takes any of them.
 
 Drag a file, folder, screenshot or video onto the terminal, or paste a long log, and it
 becomes a chip in the prompt. Put the cursor on a chip or point at it to see exactly what
@@ -94,6 +105,24 @@ the model will get; the line under the prompt sums up the whole message.
 
 To copy text, drag to select it; Rime copies the selection when you let go.
 Set `NO_COLOR` to turn colour off, or `RIME_NO_ANIMATION=1` to skip the snowfall.
+
+## Asking first
+
+Rime asks before every command and every file edit, showing the exact command or
+change: **yes**, **yes and don't ask again** for that kind of command in this
+conversation, or **no, and tell Rime what to do instead**. Read-only commands like
+`ls` or `git diff` run without asking, and chained commands are checked part by part.
+
+| Mode | What asks |
+|---|---|
+| ask (default) | every command and every edit |
+| auto-edit | commands only |
+| plan | nothing runs: read-only, Rime answers with a plan |
+| auto | only risky commands (`sudo`, `rm -rf`, force push, writes outside the project) |
+| god mode | nothing; only your own deny rules still block |
+
+`shift+tab` cycles ask, auto-edit and plan. Auto and god mode are chosen in
+`/permissions`, which also lists the allow / ask / deny rules and recent decisions.
 
 ## Privacy and keys
 
@@ -113,25 +142,12 @@ npm run build       # bundles to dist/rime.js with tsup
 ```
 src/
   cli.ts           entry point and `rime connect`
-  core/            full-screen app, header and mascot, rendering, config
+  core/            full-screen app, tools, permissions, prompt, conversations (rime.db)
   providers/       Anthropic and OpenAI wire formats, presets, llama.cpp, probe
   setup/           /setup, /server, ssh, tunnel, Wake-on-LAN, the loader
   plugins/         token meter (more plug-ins to come)
 test/              node:test suites, a mock llama.cpp server and a fake ssh
 ```
-
-## Roadmap
-
-- [x] Header, chat loop, full-screen UI
-- [x] Providers and in-app setup
-- [ ] Core tools (`read`, `write`, `edit`, `bash`) with capped output
-- [ ] Code index (`node:sqlite` FTS5) and `search`
-- [ ] Compaction, saved llama.cpp slots, session history
-- [ ] Router (`model: auto`)
-- [ ] `/diff` and `/undo`
-- [ ] Self-update
-- [ ] Split view with shell panel
-- [ ] Browser and design plug-ins
 
 ## License
 

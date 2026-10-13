@@ -59,6 +59,7 @@ export type Request = {
   signal?: AbortSignal;
   maxTokens?: number;
   slot?: number; // llama.cpp: pin to this slot
+  tools?: { name: string; description: string; input_schema: Record<string, unknown> }[]; // frozen for the session
 };
 
 export class ApiError extends Error {

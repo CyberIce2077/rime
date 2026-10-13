@@ -29,6 +29,8 @@ test('a conversation is saved as it happens and reopens as it was', async () => 
   assert.deepEqual(again.messages(id)[1].content, [{ type: 'text', text: 'Looking at signup.ts' }]);
   assert.deepEqual(again.prompts('/p'), ['Fix the signup crash\nit throws on submit']);
   assert.deepEqual(again.prompts('/elsewhere'), []);
+  assert.deepEqual(again.list('/p').map((c) => [c.title, c.n]), [['Fix the signup crash', 2]], 'the ← list');
+  assert.equal(again.take(id)?.id, id);
   again.close();
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });

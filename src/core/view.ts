@@ -39,7 +39,7 @@ export type Item =
   | { kind: 'tool'; verb: string; rest?: string; extra?: Line }
   | { kind: 'cost'; turn: Turn }
   | { kind: 'note'; text: string; tone: 'warn' | 'dim' }
-  | { kind: 'lines'; lines: Line[] } // already styled, e.g. "● gpubox is ready"
+  | { kind: 'lines'; lines: Line[]; hug?: boolean } // already styled, e.g. "● gpubox is ready"; hug: no gap above
   | { kind: 'gear'; change: Change; note?: string }; // a setting Rime changed, with undo
 
 // Messages are capped at 76ch like the prototype's .msg.
@@ -48,7 +48,7 @@ const MSG = 76;
 // One blank line between items; tool steps stack, and a cost line hugs its reply.
 // (The prototype's half-line gaps round to a full line in a terminal.)
 export const spaced = (prev: Item | undefined, next: Item) =>
-  !!prev && prev.kind !== 'header' && next.kind !== 'cost' && !(prev.kind === 'tool' && next.kind === 'tool');
+  !!prev && prev.kind !== 'header' && next.kind !== 'cost' && !(next.kind === 'lines' && next.hug) && !(prev.kind === 'tool' && next.kind === 'tool');
 
 // Light markdown for replies: headings, bold, `code`, lists, fences.
 export function markdown(text: string, st: Styles): Line[] {
@@ -162,8 +162,11 @@ export type BoxRow = { line: Line; bg?: string; rule?: 'inner' | 'full'; hit?: s
 // (`segs`, relative to the row's text) and the ✕ on the frame (`closeId`).
 export function box(legend: string | Line, rows: BoxRow[], width: number, st: Styles, color = st.accent, closeId?: string): { lines: string[]; hits: Hit[][] } {
   const inner = width - 2;
-  const lg: Line = typeof legend === 'string' ? [run(legend, color)] : legend;
   const x = closeId ? [run(' ✕ ', st.dim), run('─', color)] : [];
+  // A long legend is cut so the corner and the ✕ stay in place.
+  const room = inner - 4 - lineWidth(x);
+  const lg0: Line = typeof legend === 'string' ? [run(legend, color)] : legend;
+  const lg = lineWidth(lg0) > room ? fit(lg0, Math.max(1, room)) : lg0;
   const top = [run('╭─ ', color), ...lg, run(' ' + '─'.repeat(Math.max(0, inner - lineWidth(lg) - 3 - lineWidth(x))), color), ...x, run('╮', color)];
   const lines: string[] = [str(fit(top, width, false), st)];
   const hits: Hit[][] = [closeId ? [{ x0: width - 4, x1: width - 2, id: closeId }] : []];
@@ -268,6 +271,7 @@ export type PromptOpts = {
   chip?: (ch: string) => { label: string; warn?: boolean } | undefined;
   near?: string; // the chip the caret is on
   ghost?: string; // a suggestion shown dim after the text (tab or → takes it)
+  tabHint?: boolean; // show "tab to accept" after the suggestion
 };
 
 export type PromptView = { lines: string[]; cursor: { row: number; col: number }; rows: { start: number; text: string }[]; first: number; hits: Hit[] };
@@ -288,6 +292,8 @@ export function prompt(buf: string, cursor: number, width: number, maxRows: numb
     const lead = first + i === 0 ? run('› ', st.accentB) : run('  ');
     const text: Line = [];
     if (!buf) text.push(run(placeholder, st.placeholder));
+    const hint = o.tabHint && first + i === rows.length - 1 ? [run('  '), run('tab', st.accentB), run(' to accept', st.dim)] : [];
+    if (!buf) text.push(...hint);
     let at = r.start;
     for (const ch of r.text) {
       const selected = !!o.sel && at >= o.sel[0] && at < o.sel[1];
@@ -296,7 +302,7 @@ export function prompt(buf: string, cursor: number, width: number, maxRows: numb
       else text.push(run(ch, selected ? st.selection : st.title));
       at += ch.length;
     }
-    if (o.ghost && buf && first + i === rows.length - 1) text.push(run(o.ghost, st.placeholder));
+    if (o.ghost && buf && first + i === rows.length - 1) text.push(run(o.ghost, st.placeholder), ...hint);
     lines.push(str([run('│ ', border), ...fit([lead, ...text], inner, !buf || !!o.ghost), run(' │', border)], st));
   });
   // With more than one line the frame shows the count and the keys (clickable).

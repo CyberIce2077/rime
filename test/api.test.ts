@@ -60,3 +60,33 @@ test('Anthropic adapter: blocks with signatures, normalized usage, cache markers
     srv.close();
   }
 });
+
+test('Anthropic adapter: tools go first in the cached prefix, tool_use input streams in', async () => {
+  let sent: any;
+  const srv = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    sent = JSON.parse(raw);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const ev = (o: unknown) => res.write(`event: x\ndata: ${JSON.stringify(o)}\n\n`);
+    ev({ type: 'message_start', message: { usage: { input_tokens: 3, output_tokens: 1 } } });
+    ev({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tu_1', name: 'write', input: {} } });
+    ev({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"path":"index.html",' } });
+    ev({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '"content":"<h1>hi</h1>"}' } });
+    ev({ type: 'content_block_stop', index: 0 });
+    ev({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } });
+    res.end();
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const conn = connOf('anthropic', { preset: 'anthropic', key: 'k' }, `http://127.0.0.1:${(srv.address() as AddressInfo).port}`, {});
+    const tools = [{ name: 'write', description: 'w', input_schema: { type: 'object' } }];
+    const evs: Event[] = [];
+    for await (const e of anthropic.stream({ conn, model: modelOf({ providers: {}, models: {} }, conn, 'claude-x'), system: 'S', tools, messages: [{ role: 'user', content: 'make a page' }], controls: { reasoning: true } })) evs.push(e);
+    assert.deepEqual(sent.tools, tools);
+    assert.deepEqual(evs.find((e) => e.type === 'blocks'), { type: 'blocks', blocks: [{ type: 'tool_use', id: 'tu_1', name: 'write', input: { path: 'index.html', content: '<h1>hi</h1>' } }] });
+    assert.deepEqual(evs.find((e) => e.type === 'stop'), { type: 'stop', reason: 'tool_use' });
+  } finally {
+    srv.close();
+  }
+});

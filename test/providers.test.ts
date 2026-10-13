@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as openai from '../src/providers/openai.ts';
+import { body, textToolCalls } from '../src/providers/openai.ts';
 import * as llama from '../src/providers/llamacpp.ts';
 import { findLocal, probe } from '../src/providers/probe.ts';
 import { connOf, modelOf, prettyLabel } from '../src/providers/registry.ts';
@@ -148,4 +149,17 @@ test('"This computer" finds servers on the given local ports', async () => {
   } finally {
     await mock.close();
   }
+});
+
+test('tools on the OpenAI wire, and Qwen tool calls written as text', () => {
+  const conn = connOf('gpubox', { preset: 'llamacpp' }, 'http://127.0.0.1:1/v1');
+  const tools = [{ name: 'bash', description: 'run', input_schema: { type: 'object', properties: { command: { type: 'string' } } } }];
+  const b = body({ conn, model: modelOf({ providers: {}, models: {} }, conn, 'qwen3.8-27b'), system: 'S', messages: [], controls: { reasoning: true }, tools });
+  assert.deepEqual(b.tools, [{ type: 'function', function: { name: 'bash', description: 'run', parameters: tools[0].input_schema } }]);
+  const x = textToolCalls('Let me look.\n<tool_call>\n<function=Bash>\n<parameter=command>\nls -la\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>', ['bash', 'write']);
+  assert.equal(x.text, 'Let me look.');
+  assert.deepEqual([x.calls[0].name, x.calls[0].input], ['bash', { command: 'ls -la', timeout: 30 }]);
+  const j = textToolCalls('<tool_call>\n{"name": "write", "arguments": {"path": "a.txt", "content": "x"}}\n</tool_call>', ['bash', 'write']);
+  assert.deepEqual(j.calls[0].input, { path: 'a.txt', content: 'x' });
+  assert.deepEqual(textToolCalls('<tool_call><function=launch_rockets></function></tool_call>', ['bash']).calls, [], 'only tools Rime has');
 });
