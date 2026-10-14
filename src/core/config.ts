@@ -46,7 +46,7 @@ export type Config = {
   trustedRules?: Record<string, string>; // project folder -> hash of the .rime/permissions.json you accepted
   passEnv?: string[]; // secret-looking variables you let commands see
   updates?: 'on' | 'off'; // check npm for a new version at startup
-  plugins?: { browser?: boolean }; // opt-in plug-ins that add a model tool (Phase 11)
+  plugins?: { browser?: boolean; design?: boolean }; // opt-in plug-ins that add a model tool (Phases 11, 12)
 };
 
 export const CONFIG_PATH = path.join(os.homedir(), '.rime', 'config');

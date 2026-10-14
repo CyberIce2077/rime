@@ -100,19 +100,30 @@ const withScheme = (url: string) => (/^[a-z]+:\/\//i.test(url) ? url : (/^(local
 
 export type BrowserHost = { st: Styles; color: (rgb: RGB, bg: boolean) => string; redraw(): void; onClose(): void; log(line: string): void };
 
-// A browser session and its tab. One per Rime window.
-export async function openBrowser(h: BrowserHost) {
+// One Chrome per Rime window, shared by the browser and design tabs (a page each).
+type PW = { chromium: { launch(o: object): Promise<any> } };
+let shared: Promise<any> | null = null;
+const libs = () => {
   const req = createRequire(path.join(DIR, 'package.json'));
-  const { chromium } = req('playwright-core');
-  const { PNG } = req('pngjs');
+  return { pw: req('playwright-core') as PW, PNG: req('pngjs').PNG };
+};
+const chromeNow = () => (shared ??= libs().pw.chromium.launch({ headless: true, ...(choice().channel ? { channel: choice().channel } : {}) }));
+export const closeChrome = () => void shared?.then((b) => b.close()).catch(() => {});
+
+// A page drawn into a tab: Chrome's screencast, sized to the tab (or to a fixed
+// CSS width, scaled down: the design tab's viewports), as half-blocks or images.
+export async function openEngine(h: BrowserHost) {
+  const { PNG } = libs();
   const gfx = gfxMode();
-  const browser = await chromium.launch({ headless: true, ...(choice().channel ? { channel: choice().channel } : {}) });
+  const browser = await chromeNow();
   let size = { cols: 60, rows: 20 };
-  const page = await browser.newPage({ viewport: { width: size.cols * CELL.w, height: size.rows * CELL.h } });
+  let css: number | null = null; // a fixed page width in CSS pixels
+  const viewport = () => (css ? { width: css, height: Math.max(200, Math.round((css * size.rows * CELL.h) / (size.cols * CELL.w))) } : { width: size.cols * CELL.w, height: size.rows * CELL.h });
+  const page = await browser.newPage({ viewport: viewport() });
   const cdp = await page.context().newCDPSession(page);
   const logs: string[] = [];
   let frame: string | null = null, decoded: { width: number; height: number; data: Buffer } | null = null, fresh = false;
-  let typing = false, closed = false;
+  let closed = false;
   page.on('console', (m: { type(): string; text(): string }) => {
     logs.push(`${m.type()}: ${m.text()}`);
     if (logs.length > 100) logs.shift();
@@ -137,45 +148,75 @@ export async function openBrowser(h: BrowserHost) {
   await cast();
   // A layout change resizes the page and restarts the screencast (debounced).
   let resizing: NodeJS.Timeout | undefined;
-  const fitTo = (cols: number, rows: number) => {
-    if (cols === size.cols && rows === size.rows) return;
-    size = { cols, rows };
+  const refit = () => {
     clearTimeout(resizing);
-    resizing = setTimeout(() => void page.setViewportSize({ width: cols * CELL.w, height: rows * CELL.h }).then(cast).catch(() => {}), 150);
+    resizing = setTimeout(() => void page.setViewportSize(viewport()).then(cast).catch(() => {}), 150);
   };
-  const toPage = (x: number, y: number) => ({ x: (x + 0.5) * CELL.w, y: (y + 0.5) * CELL.h });
-  const url = () => (closed ? '' : page.url());
+  return {
+    page,
+    gfx,
+    logs,
+    url: () => (closed ? '' : page.url()),
+    // The picture in `rows` rows of `w` cells (half-blocks), or nothing when an
+    // image protocol draws it (overlay).
+    draw(w: number, rows: number): Line[] {
+      if (w !== size.cols || rows !== size.rows) (size = { cols: w, rows }), refit();
+      if (gfx !== 'blocks') return frame ? [] : [[{ t: 'loading…', s: h.st.dim }]];
+      if (!frame) return [[{ t: 'loading…', s: h.st.dim }]];
+      decoded ??= PNG.sync.read(Buffer.from(frame, 'base64'));
+      return blocks(decoded!, w, rows, h.color);
+    },
+    // Kitty and iTerm2 draw the picture after the text at (col, row); Kitty keeps
+    // image 1, so a new frame replaces the last. null: no picture; '': unchanged.
+    overlay(col: number, row: number, w: number, rows: number): string | null {
+      if (gfx === 'blocks' || !frame) return null;
+      if (!fresh && gfx === 'kitty') return ''; // iTerm2 images are cells, so they're drawn again
+      fresh = false;
+      const at = `\x1b[${row};${col}H`;
+      // ponytail: iTerm2 gets the whole frame again after every repaint (correct, not cheap).
+      if (gfx === 'iterm') return `${at}\x1b]1337;File=inline=1;width=${w};height=${rows};preserveAspectRatio=0;size=${Math.floor((frame.length * 3) / 4)}:${frame}\x07`;
+      let s = at;
+      for (let i = 0; i < frame.length; i += 4096) {
+        const more = i + 4096 < frame.length ? 1 : 0;
+        s += `\x1b_G${i === 0 ? `a=T,f=100,i=1,p=1,q=2,C=1,c=${w},r=${rows},m=${more}` : `m=${more}`};${frame.slice(i, i + 4096)}\x1b\\`;
+      }
+      return s;
+    },
+    hide: () => (gfx === 'kitty' ? '\x1b_Ga=d,d=I,i=1,q=2\x1b\\' : ''),
+    width(px: number | null) {
+      css = px;
+      refit();
+    },
+    // A cell of the picture as a point on the page.
+    toPage(x: number, y: number) {
+      const v = viewport();
+      return { x: ((x + 0.5) * v.width) / size.cols, y: ((y + 0.5) * v.height) / size.rows };
+    },
+    close() {
+      closed = true;
+      void page.close().catch(() => {});
+    },
+  };
+}
+export type Engine = Awaited<ReturnType<typeof openEngine>>;
 
+// The browser tab and the model's actions on it. One per Rime window.
+export async function openBrowser(h: BrowserHost) {
+  const e = await openEngine(h);
+  const { page, logs } = e;
+  let typing = false;
   const tab: Omit<CustomTab, 'id' | 'kind'> = {
     title: 'browser',
     byRime: true,
     render(w, rows) {
       const { st } = h;
-      const host = url().replace(/^https?:\/\//, '').replace(/\/$/, '') || 'blank';
+      const host = e.url().replace(/^https?:\/\//, '').replace(/\/$/, '') || 'blank';
       tab.title = `browser · ${host.length > 20 ? host.slice(0, 19) + '…' : host}`;
-      const bar: Line = [{ t: '◍ ', s: st.accent }, { t: url() || 'about:blank', s: st.title }, ...(typing ? [{ t: '  typing into the page · esc stops', s: st.warn }] : [])];
-      fitTo(w, rows - 1);
-      if (gfx !== 'blocks' || !frame) return [bar, ...(frame ? [] : [[{ t: 'loading…', s: st.dim }] as Line])];
-      decoded ??= PNG.sync.read(Buffer.from(frame, 'base64'));
-      return [bar, ...blocks(decoded!, w, rows - 1, h.color)];
+      const bar: Line = [{ t: '◍ ', s: st.accent }, { t: e.url() || 'about:blank', s: st.title }, ...(typing ? [{ t: '  typing into the page · esc stops', s: st.warn }] : [])];
+      return [bar, ...e.draw(w, rows - 1)];
     },
-    // Kitty and iTerm2 draw the picture after the text, at the tab's content
-    // corner; Kitty reuses image 1 so a frame replaces the last.
-    overlay(col: number, row: number, w: number, rows: number) {
-      if (gfx === 'blocks' || !frame) return null;
-      if (!fresh && gfx === 'kitty') return ''; // Kitty keeps the last frame up; iTerm2 images are cells, so they're drawn again
-      // ponytail: iTerm2 gets the whole frame again after every repaint (correct, not cheap).
-      fresh = false;
-      const at = `\x1b[${row + 1};${col}H`;
-      if (gfx === 'iterm') return `${at}\x1b]1337;File=inline=1;width=${w};height=${rows - 1};preserveAspectRatio=0;size=${Math.floor((frame.length * 3) / 4)}:${frame}\x07`;
-      let s = at;
-      for (let i = 0; i < frame.length; i += 4096) {
-        const more = i + 4096 < frame.length ? 1 : 0;
-        s += `\x1b_G${i === 0 ? `a=T,f=100,i=1,p=1,q=2,C=1,c=${w},r=${rows - 1},m=${more}` : `m=${more}`};${frame.slice(i, i + 4096)}\x1b\\`;
-      }
-      return s;
-    },
-    hide: () => (gfx === 'kitty' ? '\x1b_Ga=d,d=I,i=1,q=2\x1b\\' : ''),
+    overlay: (col, row, w, rows) => e.overlay(col, row + 1, w, rows - 1),
+    hide: e.hide,
     key(k: Key) {
       if (typing) {
         if (k.name === 'escape') return (typing = false), true;
@@ -185,7 +226,7 @@ export async function openBrowser(h: BrowserHost) {
       }
       const ch = k.name === 'char' ? k.ch : '';
       if (ch === 'r') return void page.reload().catch(() => {}), true;
-      if (ch === 'o') return void spawn(process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open', [url()], { detached: true, stdio: 'ignore' }).unref(), true;
+      if (ch === 'o') return void spawn(process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open', [e.url()], { detached: true, stdio: 'ignore' }).unref(), true;
       if (ch === 'j' || k.name === 'down') return void page.mouse.wheel(0, 120).catch(() => {}), true;
       if (ch === 'k' || k.name === 'up') return void page.mouse.wheel(0, -120).catch(() => {}), true;
       if (ch === 'b') return void page.goBack().catch(() => {}), true;
@@ -193,15 +234,14 @@ export async function openBrowser(h: BrowserHost) {
     },
     click(x: number, y: number) {
       if (y < 1) return;
-      const p = toPage(x, y - 1);
+      const p = e.toPage(x, y - 1);
       typing = true;
       void page.mouse.click(p.x, p.y).catch(() => {});
     },
     wheel: (d: number) => void page.mouse.wheel(0, d * 40).catch(() => {}),
     foot: (): Hint[] => (typing ? [['', 'keys go to the page · '], ['esc', ' stop typing']] : [['click', ' the page · '], ['r', ' reload · '], ['o', ' open in your browser · '], ['b', ' back · '], ['j k', ' scroll · ']]),
     close() {
-      closed = true;
-      void browser.close().catch(() => {});
+      e.close();
       h.onClose();
     },
   };
@@ -217,12 +257,8 @@ export async function openBrowser(h: BrowserHost) {
         const r = await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 20000 });
         return `Opened ${page.url()} (${r?.status() ?? 'no status'}): ${(await page.title()) || 'no title'}. Use snapshot to read it.`;
       }
-      case 'snapshot': {
-        const p = page as unknown as { _snapshotForAI?: () => Promise<string | { full?: string }> };
-        const raw = p._snapshotForAI ? await p._snapshotForAI() : await page.locator('body').ariaSnapshot();
-        const text = typeof raw === 'string' ? raw : (raw.full ?? JSON.stringify(raw));
-        return `${page.url()}\n${text.length > 8000 ? text.slice(0, 8000) + '\n… (cut; scroll or open a narrower part)' : text}`;
-      }
+      case 'snapshot':
+        return `${page.url()}\n${await snapshot(page)}`;
       case 'click':
         await target().click({ timeout: 5000 });
         return `Clicked ${input.ref ? `[ref=${input.ref}]` : input.selector ?? `"${input.text}"`}. Now at ${page.url()}.`;
@@ -245,9 +281,16 @@ export async function openBrowser(h: BrowserHost) {
     }
   }
 
-  return { tab, act, url, close: () => tab.close?.() };
+  return { tab, act, url: e.url, close: () => tab.close?.() };
 }
 export type BrowserSession = Awaited<ReturnType<typeof openBrowser>>;
+
+// Playwright's AI snapshot (the accessibility tree with [ref=…] ids), cut to size.
+export async function snapshot(page: any, max = 8000) {
+  const raw = page._snapshotForAI ? await page._snapshotForAI() : await page.locator('body').ariaSnapshot();
+  const text = typeof raw === 'string' ? raw : (raw.full ?? JSON.stringify(raw));
+  return text.length > max ? text.slice(0, max) + '\n… (cut)' : text;
+}
 
 export const BROWSER_TOOL = {
   name: 'browser',

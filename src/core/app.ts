@@ -33,7 +33,8 @@ import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor }
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
 import { createSide } from '../plugins/shell-panel/panel.ts';
-import { BROWSER_TOOL, type BrowserSession, chrome as hasChrome, install as installBrowser, installed as browserInstalled, openBrowser } from '../plugins/browser/browser.ts';
+import { BROWSER_TOOL, type BrowserSession, chrome as hasChrome, closeChrome, install as installBrowser, installed as browserInstalled, openBrowser } from '../plugins/browser/browser.ts';
+import { DESIGN_TOOL, type DesignSession, type Pick, designFile, openDesign, overflow, slug as designSlug, starter } from '../plugins/design/design.ts';
 import { compare as compareVersions, install as installVersion, latest as latestVersion, newest as newestVersion } from '../plugins/updater/update.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
 import { recheck } from '../providers/probe.ts';
@@ -56,6 +57,7 @@ const CMDS: [string, string][] = [
   ['/compact', 'summarise the earlier conversation to free context'],
   ['/diff', 'what the last change did, file by file'],
   ['/browser', 'your web app in a tab: /browser <url>'],
+  ['/design', 'build a page by chatting: /design new <what>'],
   ['/undo', 'put the files back as they were before the last change'],
   ['/usage', 'token, cost and savings breakdown'],
   ['/update', 'install the newest Rime and restart into it'],
@@ -166,7 +168,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let navigated = false;
   const cwd = process.cwd();
   // The tools a new conversation freezes: the core ones, plus enabled plug-ins'.
-  const toolsNow = (): ToolDef[] => (cfg.plugins?.browser ? [...TOOLS, BROWSER_TOOL] : TOOLS);
+  const toolsNow = (): ToolDef[] => [...TOOLS, ...(cfg.plugins?.browser ? [BROWSER_TOOL] : []), ...(cfg.plugins?.design ? [DESIGN_TOOL] : [])];
   let SYSTEM = system(cwd, agentsMd(projectOf(cwd))); // the prefix for new conversations (the repo map joins once the index is ready)
 
   // ---- state ----
@@ -1260,6 +1262,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       }
       content = [...results, ...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content)];
     }
+    // A part picked in a design tab (@Headline) goes along as its selector and HTML.
+    if (!held && picks.size) {
+      const named = [...picks.values()].filter((p) => text.includes(`@${p.name}`));
+      if (named.length) content = [...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content), ...named.map((p): Block => ({ type: 'text', text: `[Rime: @${p.name} is ${p.selector} in ${p.file}]\n${p.html}` }))];
+    }
     // What Rime did meanwhile (an /undo) goes to the model with this message.
     if (C.tell.length) content = [...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content), ...C.tell.splice(0).map((t): Block => ({ type: 'text', text: t }))];
     // Plan mode is told to the model in the message (the system prompt stays frozen).
@@ -1527,21 +1534,21 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       .finally(() => (opening = null));
     return opening;
   }
-  // /browser [url]: turns the plug-in on the first time (Playwright into
-  // ~/.rime/plugins/browser; your Chrome, or Chromium), then opens the tab.
-  function browserCmd(url?: string) {
-    const go = async () => {
-      try {
-        const b = await browserNow();
-        if (url) note((await b.act({ action: 'open', url })).split('.')[0], 'dim');
-      } catch (e) {
-        note(`The browser didn't start: ${(e as Error).message.split('\n')[0]}`);
+  // The browser and design plug-ins share Playwright in ~/.rime/plugins/browser:
+  // asked about once, then each is turned on (its tool joins new conversations).
+  function withPlaywright(plugin: 'browser' | 'design', then: () => void) {
+    const on = () => {
+      if (!cfg.plugins?.[plugin]) {
+        cfg.plugins = { ...cfg.plugins, [plugin]: true };
+        settings.save();
+        note(`${plugin} plug-in on · its tool joins your next conversation (/clear starts one)`, 'dim');
       }
+      then();
     };
-    if (cfg.plugins?.browser && browserInstalled()) return void go();
+    if (browserInstalled()) return on();
     const chromeHere = hasChrome();
     S.question = {
-      q: 'Turn on the browser plug-in? It opens your web app in a tab here, and the model can click through it. Playwright goes into ~/.rime/plugins/browser, not into your project.',
+      q: `Turn on the ${plugin} plug-in? It shows ${plugin === 'browser' ? 'your web app' : 'the page you design'} in a tab here, rendered by Chrome. Playwright goes into ~/.rime/plugins/browser, not into your project.`,
       options: [
         ...(chromeHere ? [{ label: 'Use my Chrome', detail: 'downloads Playwright only (~10 MB)' }] : []),
         { label: 'Download Chromium', detail: '~150 MB, once' },
@@ -1551,20 +1558,73 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       done: (a) => {
         S.question = null;
         if (!a || a === 'Not now') return schedule();
-        const row: Extract<Item, { kind: 'lines' }> = { kind: 'lines', lines: [[{ t: '  ⟳ ', s: st.accent }, { t: 'setting up the browser plug-in…', s: st.dim }]] };
+        const row: Extract<Item, { kind: 'lines' }> = { kind: 'lines', lines: [[{ t: '  ⟳ ', s: st.accent }, { t: 'setting up Playwright…', s: st.dim }]] };
         S.items.push(row);
         const show = (t: string) => ((row.lines = [[{ t: '  ⟳ ', s: st.accent }, { t, s: st.dim }]]), cache.delete(row), schedule());
         void installBrowser(a === 'Use my Chrome', (step) => show(`${step}…`)).then((r) => {
-          if (!r.ok) return show(`couldn't set up the browser: ${r.error}`);
-          cfg.plugins = { ...cfg.plugins, browser: true };
-          settings.save();
-          show('browser plug-in on · the browser tool joins your next conversation (/clear starts one)');
-          void go();
+          if (!r.ok) return show(`couldn't set up Playwright: ${r.error}`);
+          show('Playwright is ready');
+          on();
         });
         schedule();
       },
     };
     schedule();
+  }
+  // /browser [url]: the page in a tab.
+  function browserCmd(url?: string) {
+    withPlaywright('browser', async () => {
+      try {
+        const b = await browserNow();
+        if (url) note((await b.act({ action: 'open', url })).split('.')[0], 'dim');
+      } catch (e) {
+        note(`The browser didn't start: ${(e as Error).message.split('\n')[0]}`);
+      }
+    });
+  }
+
+  // ---- design plug-in (Phase 12) ----
+  const designs = new Map<string, DesignSession>();
+  const picks = new Map<string, Pick>(); // @Name in the prompt -> what was picked
+  const designHost = () => ({
+    st, color: (rgb: [number, number, number], bg: boolean) => sgr(rgb, bg, st.mode), redraw: () => schedule(), onClose: () => {}, log: (l: string) => note(l, 'dim'), project,
+    insert: (t: string) => ((buf = buf.slice(0, cur) + t + buf.slice(cur)), (cur += t.length), (sideFocus = false), schedule()),
+    pick: (p: Pick) => void picks.set(p.name, p),
+    exportDesign: (file: string, version: number) => void ((sideFocus = false), send(`Turn ${file} (version ${version}) into components in this project's stack (for example src/pages/${file.replace(/^design\/|\.html$/g, '').replace(/(^|-)(\w)/g, (_, _d, c) => c.toUpperCase())}.tsx), following its conventions, and start the dev server if it isn't running.`)),
+    credit: () => void credit(),
+  });
+  async function designTab(name: string) {
+    const open = designs.get(name);
+    if (open && side.tabs.some((t) => t.title === open.tab.title)) return side.go(side.tabs.findIndex((t) => t.title === open.tab.title)), open;
+    const d = await openDesign(designHost(), name);
+    designs.set(name, d);
+    const close = d.tab.close;
+    side.custom({ ...d.tab, close: () => (close?.(), designs.delete(name)) }, true);
+    return d;
+  }
+  // /design new <what> · /design <name> · /design (the last one)
+  function designCmd(args: string[]) {
+    withPlaywright('design', async () => {
+      try {
+        let name = args[0] === 'new' ? designSlug(args.slice(1).join(' ') || 'page') : args[0] ? designSlug(args[0]) : '';
+        if (!name) {
+          const dir = path.join(project, 'design');
+          const last = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.html')).sort((a, b) => fs.statSync(path.join(dir, b)).mtimeMs - fs.statSync(path.join(dir, a)).mtimeMs)[0] : '';
+          if (!last) return note('No design yet. /design new <what> starts one, e.g. /design new landing page for a notes app', 'dim');
+          name = last.replace(/\.html$/, '');
+        }
+        const abs = path.join(project, designFile(name));
+        if (!fs.existsSync(abs)) {
+          if (args[0] !== 'new') return note(`There's no ${designFile(name)}. /design new ${args.join(' ')} starts it.`, 'dim');
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, starter(args.slice(1).join(' ') || name));
+          S.tell.push(`[Rime: the user started a design in ${designFile(name)}. Change it with the design tool (name "${name}").]`);
+        }
+        await designTab(name);
+      } catch (e) {
+        note(`The design tab didn't open: ${(e as Error).message.split('\n')[0]}`);
+      }
+    });
   }
 
   // ---- code-index (Phase 5) ----
@@ -1734,11 +1794,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     let cp: ReturnType<Checkpoints['begin']> | null = null;
     const checkpoint = (u: Block, d: Decision) => {
       const cps = checkpointsOf();
-      const writes = u.name === 'write' || u.name === 'edit';
+      const writes = u.name === 'write' || u.name === 'edit' || u.name === 'design';
       if (!cps || !(writes || (u.name === 'bash' && !d.parts?.every((p) => p.why === 'read-only')))) return;
       try {
         cp ??= cps.begin(label || 'a turn');
-        if (writes) cps.touch(cp, rel(project, path.resolve(cwd, String((u.input as Record<string, unknown>)?.path ?? ''))));
+        if (writes) cps.touch(cp, u.name === 'design' ? designFile(designSlug(String((u.input as Record<string, unknown>)?.name ?? 'page'))) : rel(project, path.resolve(cwd, String((u.input as Record<string, unknown>)?.path ?? ''))));
       } catch {} // no git binary, unreadable file: the change still runs
     };
     const root = llama.rootOf(cn.base);
@@ -1880,7 +1940,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       },
       emit: on,
       decide: (u) => {
-        const d = decide(String(u.name), (u.input ?? {}) as Record<string, any>, permCtx(C));
+        const inp = (u.input ?? {}) as Record<string, any>;
+        // The design tool writes design/<name>.html: the same check as a write.
+        const d = u.name === 'design' ? decide('write', { path: designFile(designSlug(String(inp.name ?? 'page'))), content: inp.html }, permCtx(C)) : decide(String(u.name), inp, permCtx(C));
         decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why });
         decisions.length = Math.min(decisions.length, 50);
         return d;
@@ -2004,8 +2066,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   };
   const describe = (u: Block) => {
     const i = (u.input ?? {}) as Record<string, any>;
-    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime', ask: 'Asked', search: 'Search', browser: 'Browser' }[String(u.name)] ?? String(u.name);
-    const rest = u.name === 'browser' ? [i.action, i.url ?? (i.ref ? `[ref=${i.ref}]` : ''), i.text ? `"${i.text}"` : ''].filter(Boolean).join(' ') : u.name === 'search' ? String(i.query ?? '') : u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'ask' ? String(i.question ?? '') : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
+    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime', ask: 'Asked', search: 'Search', browser: 'Browser', design: 'Design' }[String(u.name)] ?? String(u.name);
+    const rest = u.name === 'design' ? designFile(designSlug(String(i.name ?? 'page'))) : u.name === 'browser' ? [i.action, i.url ?? (i.ref ? `[ref=${i.ref}]` : ''), i.text ? `"${i.text}"` : ''].filter(Boolean).join(' ') : u.name === 'search' ? String(i.query ?? '') : u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'ask' ? String(i.question ?? '') : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
     return { verb, rest };
   };
   const toolLine = (u: Block): Item => ({ kind: 'tool', ...describe(u) });
@@ -2023,6 +2085,19 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         .then((b) => b.act(input))
         .then((text) => ({ content: text, summary: text.split('\n')[0].slice(0, 80) }))
         .catch((e) => ({ content: (e as Error).message.split('\n').slice(0, 3).join('\n'), error: true, summary: (e as Error).message.split('\n')[0].slice(0, 80) }));
+    }
+    if (name === 'design') {
+      const n = designSlug(String(input.name ?? 'page'));
+      const abs = path.join(project, designFile(n));
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, textOf(input.html));
+      index?.put(designFile(n));
+      return designTab(n)
+        .then(async (d) => {
+          const fits = await overflow(designHost(), abs).catch((e) => `couldn't check the sizes: ${(e as Error).message.split('\n')[0]}`);
+          return { content: `Saved ${designFile(n)} as version ${d.version()}. ${fits}.`, summary: `version ${d.version()} · ${/overflows/.test(fits) ? 'overflows' : 'fits'}` };
+        })
+        .catch((e) => ({ content: `Saved ${designFile(n)}; the tab didn't open: ${(e as Error).message.split('\n')[0]}`, summary: 'saved' }));
     }
     if (name === 'search') {
       if (!index) return { content: 'The code index is still being built; use bash with rg or grep for now.', error: true, summary: 'index not ready' };
@@ -2938,10 +3013,15 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   }
   // The ↳ line, and the turn it saved on the meter: the context re-read from cache
   // plus a short reply, at this model's price. Local models cost nothing anyway.
-  function handled() {
+  // What a turn would have cost: the context re-read from cache plus a short reply.
+  function credit() {
     const p = model?.price;
     const d = p && !conn?.local ? (Math.max(S.task?.lastPrompt ?? 0, 1000) * p.read + 50 * p.out) / 1e6 : 0;
     if (d) S.meter.credit(d);
+    return d;
+  }
+  function handled() {
+    const d = credit();
     S.items.push({ kind: 'lines', lines: [[{ t: `  ↳ handled in Rime · no API call${d ? ` · saved ~${fmt$(d)}` : ''}`, s: st.dim }]] });
   }
 
@@ -3022,6 +3102,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     else if (c === '/permissions') panel = createPermissions();
     else if (c === '/conversations') openList();
     else if (c === '/browser') browserCmd(args[0]);
+    else if (c === '/design') designCmd(args);
     else if (c === '/clear') {
       newConversation();
       if (later) host.choose(later);
@@ -3600,6 +3681,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     quitting = 'bye';
     finishDelete(); // a delete waiting for undo is done now
     side.killAll(); // commands in tabs stop with Rime
+    closeChrome();
     // Every open conversation: a reply being streamed is kept as interrupted.
     for (const x of sessions) {
       if (x.live && x.convId) save((d) => d.update(x.convId!, x.live!.seq, [{ type: 'text', text: x.live!.text() }], true));
