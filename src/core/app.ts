@@ -20,7 +20,7 @@ import { WHEN, createSettings, phrase } from './settings.ts';
 import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
 import { toolEvents } from './timeline.ts';
 import { parse as parseQuery, rank, suggestions } from './rank.ts';
-import { type Config, saveConfig } from './config.ts';
+import { type Config, rimeDir, saveConfig } from './config.ts';
 import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } from './header.ts';
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
 import { colorMode } from './theme.ts';
@@ -30,6 +30,7 @@ import { type Turn, addTurns, createMeter, fmt$, fmtS, fmtT } from '../plugins/t
 import * as llama from '../providers/llamacpp.ts';
 import { PRESETS } from '../providers/presets.ts';
 import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
+import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
 import { recheck } from '../providers/probe.ts';
 import { ApiError, type Block, type Conn, type Controls, type Effort, type Message, type Model, type Usage } from '../providers/types.ts';
@@ -49,6 +50,8 @@ const CMDS: [string, string][] = [
   ['/clear', 'start a new conversation'],
   ['/conversations', 'search, open, fork or delete your conversations'],
   ['/compact', 'summarise the earlier conversation to free context'],
+  ['/diff', 'what the last change did, file by file'],
+  ['/undo', 'put the files back as they were before the last change'],
   ['/usage', 'token, cost and savings breakdown'],
   ['/exit', 'quit Rime'],
 ];
@@ -281,12 +284,13 @@ export async function runApp(cfg: Config, version: string) {
     mark: string; // the model and effort last put on the timeline
     planSaid: boolean; // the model was told plan mode is on
     slot?: number; // its llama.cpp slot when the server has several
+    tell: string[]; // notes for the model, sent with the next message (an /undo)
     costItem: Item | null; // this turn's ↳ line, kept last as its requests add up
     system: string; // its frozen system prompt: the stored one when reopened while the cache is warm
   };
   const newSession = (): Session => ({
     convId: null, messages: [], items: [headerItem], task: null, busy: null, waiting: null, live: null, lastUserSeq: 0,
-    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, costItem: null, system: SYSTEM,
+    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, tell: [], costItem: null, system: SYSTEM,
   });
   let S = newSession();
   const sessions: Session[] = [S]; // open in this window; the ones not on screen keep working
@@ -1144,7 +1148,7 @@ export async function runApp(cfg: Config, version: string) {
     // Tool calls still waiting for your answer when Rime closed are asked again
     // first (SPEC §17); their results go ahead of your words.
     let esc = () => ac.abort();
-    const h = turnHost(C, m, cn, c, ac, did, (f) => (esc = f));
+    const h = turnHost(C, m, cn, c, ac, did, (f) => (esc = f), text.split('\n')[0]);
     const pending = pendingUses(C);
     if (pending.length) {
       const me = { abort: () => ac.abort(), esc: () => ac.abort() };
@@ -1160,6 +1164,8 @@ export async function runApp(cfg: Config, version: string) {
       }
       content = [...results, ...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content)];
     }
+    // What Rime did meanwhile (an /undo) goes to the model with this message.
+    if (C.tell.length) content = [...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content), ...C.tell.splice(0).map((t): Block => ({ type: 'text', text: t }))];
     // Plan mode is told to the model in the message (the system prompt stays frozen).
     if ((mode === 'plan') !== C.planSaid) {
       C.planSaid = mode === 'plan';
@@ -1298,7 +1304,7 @@ export async function runApp(cfg: Config, version: string) {
     if (!model || !conn) return readTool(cwd, { path: file });
     const lines = text.split('\n').length;
     const key = createHash('sha256').update(text).digest('hex').slice(0, 16);
-    const dir = path.join(project, '.rime', 'cache');
+    const dir = rimeDir(project, 'cache');
     const hit = path.join(dir, `${key}-${model.ref.replace(/[^\w.-]+/g, '_')}.md`);
     if (fs.existsSync(hit)) return { content: fs.readFileSync(hit, 'utf8'), summary: `summary · ${lines} lines (cached)` };
     const size = contextOf(model) ?? 32000;
@@ -1313,6 +1319,50 @@ export async function runApp(cfg: Config, version: string) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(hit, content);
     return { content, summary: `summary · ${lines} lines` };
+  }
+
+  // ---- diff-undo (Phase 8) ----
+  let cpsMade: Checkpoints | null | undefined;
+  const checkpointsOf = () => {
+    if (cpsMade === undefined)
+      try {
+        cpsMade = createCheckpoints(project);
+      } catch {
+        cpsMade = null;
+      }
+    return cpsMade;
+  };
+  const changeLine = (ch: { file: string; how: string }[]) => ch.map((c) => `${c.file} ${c.how === 'added' ? 'created' : c.how}`).join(' · ');
+  // /diff: what changed since the last checkpoint, coloured, at most 400 lines.
+  function showDiff() {
+    S.items.push({ kind: 'user', text: '/diff' });
+    const cps = checkpointsOf(), cp = cps?.last();
+    if (!cps || !cp) return void (note('No changes to show: Rime takes a checkpoint before it changes a file.', 'dim'), handled());
+    const ch = cps.changes(cp);
+    if (!ch.length) return void (note(`Nothing changed since before "${cp.label}".`, 'dim'), handled());
+    const lines = cps.diff(cp).split('\n').filter((l) => !/^(index |diff --git|new file mode|deleted file mode|similarity)/.test(l));
+    const show = lines.slice(0, 400).map((l): Line => [{ t: '  ' + l, s: l.startsWith('+++') || l.startsWith('---') ? st.titleB : l.startsWith('+') ? st.ok : l.startsWith('-') ? st.del : l.startsWith('@@') ? st.accent : st.dim }]);
+    S.items.push({ kind: 'lines', lines: [[{ t: '± ', s: st.accent }, { t: `since before "${cp.label}" · ${ago(cp.at)} · `, s: st.dim }, { t: changeLine(ch), s: st.title }], ...show, ...(lines.length > 400 ? [[{ t: `  … ${lines.length - 400} more lines`, s: st.dim }]] : []), [{ t: '  /undo', s: st.accent }, { t: ' puts them back', s: st.dim }]] });
+    handled();
+  }
+  // /undo: the files go back to the last checkpoint, and the model hears about it
+  // with the next message. Again goes one change further back.
+  function undo() {
+    S.items.push({ kind: 'user', text: '/undo' });
+    if (S.busy) return void note('Rime is working; /undo after this reply.', 'dim');
+    const cps = checkpointsOf(), cp = cps?.last();
+    if (!cps || !cp) return void (note('Nothing to undo: no change by Rime is on record here.', 'dim'), handled());
+    let ch: { file: string; how: string }[];
+    try {
+      ch = cps.undo(cp);
+    } catch (e) {
+      return void note(`Couldn't undo: ${(e as Error).message}`);
+    }
+    const what = ch.length ? ch.map((c) => `${c.file} ${c.how === 'added' ? 'removed' : 'restored'}`).join(', ') : 'nothing had changed';
+    S.items.push({ kind: 'lines', lines: [[{ t: '↶ ', s: st.accent }, { t: `undid "${cp.label}" · `, s: st.dim }, { t: what, s: st.title }]] });
+    S.tell.push(`[Rime: the user undid your changes from "${cp.label}": ${what}. Those files are as they were before that.]`);
+    if (S.convId) bound(S).event('edit', `undid "${cp.label}"`);
+    handled();
   }
 
   // /compact: now, between replies.
@@ -1391,8 +1441,19 @@ export async function runApp(cfg: Config, version: string) {
   // The turn loop lives in agent.ts; this is its host for one conversation: the
   // request, storage, permissions and questions, and the screen built from its
   // events (thinking, the reply, the live "writing…" row, tool rows, cost).
-  function turnHost(C: Session, m: Model, cn: Conn, c: Controls, ac: AbortController, did: Did, setEsc: (f: () => void) => void): TurnHost {
+  function turnHost(C: Session, m: Model, cn: Conn, c: Controls, ac: AbortController, did: Did, setEsc: (f: () => void) => void, label = ''): TurnHost {
     const { store, note, drop, addConvRule, detail, event } = bound(C);
+    // diff-undo: a checkpoint before this turn's first change.
+    let cp: ReturnType<Checkpoints['begin']> | null = null;
+    const checkpoint = (u: Block, d: Decision) => {
+      const cps = checkpointsOf();
+      const writes = u.name === 'write' || u.name === 'edit';
+      if (!cps || !(writes || (u.name === 'bash' && !d.parts?.every((p) => p.why === 'read-only')))) return;
+      try {
+        cp ??= cps.begin(label || 'a turn');
+        if (writes) cps.touch(cp, rel(project, path.resolve(cwd, String((u.input as Record<string, unknown>)?.path ?? ''))));
+      } catch {} // no git binary, unreadable file: the change still runs
+    };
     const root = llama.rootOf(cn.base);
     // Per reply: its thinking row, its text row, the live tool-call row.
     let thinking: Extract<Item, { kind: 'think' }> = { kind: 'think', text: '', start: 0, open: false };
@@ -1567,7 +1628,7 @@ export async function runApp(cfg: Config, version: string) {
         }),
       // Auto mode's unasked commands run in the sandbox; read-only ones get git
       // hardened. Asked-and-approved commands run as you approved them.
-      run: async (u, d, signal) => runTool(String(u.name), (u.input ?? {}) as Record<string, any>, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv }),
+      run: async (u, d, signal) => (checkpoint(u, d), runTool(String(u.name), (u.input ?? {}) as Record<string, any>, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv })),
       optionsOf,
       queued: () => takeQueued(C),
       afterRound: (signal) => makeRoom(C, m, cn, signal),
@@ -2585,6 +2646,8 @@ export async function runApp(cfg: Config, version: string) {
     } else if (c === '/usage') boxKind = 'usage';
     else if (c === '/exit') quit();
     else if (c === '/compact') void compactNow();
+    else if (c === '/diff') showDiff();
+    else if (c === '/undo') undo();
     else {
       S.items.push({ kind: 'user', text: v });
       S.items.push({ kind: 'reply', text: `Unknown command ${c}. Press / to see the commands.`, done: true });

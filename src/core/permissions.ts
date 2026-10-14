@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { rimeDir } from './config.ts';
 
 // god: nothing asks, not even guard's list (only your deny rules still block).
 export type Mode = 'ask' | 'auto-edit' | 'plan' | 'auto' | 'god';
@@ -349,7 +350,7 @@ export function trustedProjectRules(project: string, trusted?: string): Rules {
 export function addProjectRule(project: string, kind: Kind, pattern: string) {
   const r = projectRules(project);
   r[kind] = [...new Set([...(r[kind] ?? []), pattern])];
-  fs.mkdirSync(path.join(project, '.rime'), { recursive: true });
+  rimeDir(project);
   fs.writeFileSync(path.join(project, '.rime', 'permissions.json'), JSON.stringify(r, null, 2) + '\n');
 }
 export function removeProjectRule(project: string, kind: Kind, pattern: string) {

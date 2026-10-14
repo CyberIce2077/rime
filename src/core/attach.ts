@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { rimeDir } from './config.ts';
 import type { Block } from '../providers/types.ts';
 import type { RGB } from './theme.ts';
 
@@ -140,8 +141,7 @@ export function pastedPaths(text: string, cwd = process.cwd()): string[] | null 
 }
 
 export const attachDir = (cwd: string) => {
-  const d = path.join(cwd, '.rime', 'attachments');
-  fs.mkdirSync(d, { recursive: true });
+  const d = rimeDir(cwd, 'attachments');
   return d;
 };
 

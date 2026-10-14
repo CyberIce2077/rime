@@ -65,6 +65,17 @@ export function loadConfig(file = CONFIG_PATH): Config {
   return cfg;
 }
 
+// A folder under the project's .rime/, which gets a .gitignore so Rime's own
+// files (checkpoints, attachments, cache) stay out of git; permissions.json, the
+// team's rules, can still be committed.
+export function rimeDir(root: string, ...sub: string[]) {
+  const base = path.join(root, '.rime'), dir = path.join(base, ...sub);
+  fs.mkdirSync(dir, { recursive: true });
+  const ignore = path.join(base, '.gitignore');
+  if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '*\n!.gitignore\n!permissions.json\n');
+  return dir;
+}
+
 export function saveConfig(cfg: Config, file = CONFIG_PATH) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
