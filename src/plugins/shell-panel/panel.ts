@@ -181,11 +181,14 @@ export function createSide(h: SideHost) {
     return t.lines.slice(t.scroll, t.scroll + room).map((l, i) => (t.mark && t.scroll + i + 1 === t.mark ? l.map((r) => ({ t: r.t, s: st.panelBg + r.s })) : l));
   }
 
+  // A tab's own keys before the panel's: its last group has to end, or the two
+  // would run together ("esc stop typingctrl-w n p tabs").
+  const ended = (h: Hint[]): Hint[] => h.map(([k, l, s], i) => [k, i === h.length - 1 && !l.endsWith(' · ') ? `${l} · ` : l, s]);
   function foot(t: Tab | undefined): Hint[] {
     if (!t) return [['ctrl-t', ' new shell · '], ['esc', ' chat']];
     const tabs: Hint[] = [['ctrl-w n p', ' tabs · '], ['ctrl-w q', ' close · '], ['ctrl-w h', ' chat · '], ['?', ' all keys']];
     if (asking !== null) return [['', 'it is still running · ', st.warn], ['ctrl-w q', ' stop it and close · '], ['esc', ' keep it']];
-    if (t.kind === 'custom') return [...t.foot(), ...tabs];
+    if (t.kind === 'custom') return [...ended(t.foot()), ...tabs];
     if (t.kind === 'shell')
       return t.state === 'running' ? [['ctrl+c', ' stop · '], ['j k', ' scroll · '], ...tabs] : [['enter', t.input || !t.cmd ? ' run · ' : ' run again · '], ['↑', ' last command · '], ...tabs];
     if (t.kind === 'files') return t.filtering ? [['', 'type to filter · '], ['enter', ' done · '], ['esc', ' clear']] : [['↑ ↓', ' choose · '], ['enter', ' open · '], ['← →', ' fold · '], ['/', ' filter · '], ...tabs];
@@ -332,6 +335,11 @@ export function createSide(h: SideHost) {
       ratio = by === 0 ? 0.5 : Math.min(0.75, Math.max(0.25, ratio + by));
       h.redraw();
     },
+    // Dragging the divider: the panel's share of the width, kept between a quarter and three quarters.
+    setRatio(r: number) {
+      ratio = Math.min(0.75, Math.max(0.25, r));
+      h.redraw();
+    },
     go(i: number) {
       if (tabs[i]) (active = i), (visible = true), (asking = null), h.redraw();
     },
@@ -431,6 +439,10 @@ export function createSide(h: SideHost) {
       return t.overlay(col + lead, 3, shown.w, shown.rows);
     },
     hideImages: () => tabs.map((t) => (t.kind === 'custom' ? (t.hide?.() ?? '') : '')).join(''),
+    // Closes every plug-in tab (the browser and design share one Chrome).
+    closePlugins() {
+      for (let i = tabs.length - 1; i >= 0; i--) if (tabs[i].kind === 'custom') (active = i), this.close(true);
+    },
     running: () => tabs.filter((t) => t.kind === 'shell' && t.state === 'running').length,
     killAll: () => tabs.forEach((t) => (t.kind === 'shell' ? stop(t) : t.kind === 'custom' ? t.close?.() : null)),
     key,

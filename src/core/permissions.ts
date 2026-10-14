@@ -269,6 +269,8 @@ export type Decision = {
 export type Ctx = { mode: Mode; project: string; rules: Rule[]; granted?: (p: string) => boolean };
 
 export function decide(tool: string, input: Record<string, any>, c: Ctx): Decision {
+  // Opening a page through the rime tool is checked like the browser tool's open.
+  if (tool === 'rime' && input.action === 'browser.open') return decide('browser', { action: 'open', url: (input.args as Record<string, unknown> | undefined)?.url }, c);
   if (tool === 'rime') return { verdict: 'allow', why: "Rime's own settings" };
   if (tool === 'search') return { verdict: 'allow', why: 'searching the project' };
   // The browser plug-in: a page on this computer opens without asking; a site
@@ -277,6 +279,8 @@ export function decide(tool: string, input: Record<string, any>, c: Ctx): Decisi
     const a = String(input.action ?? '');
     if (c.mode === 'plan' && /^(click|fill|press)$/.test(a)) return { verdict: 'deny', why: 'plan mode is read-only' };
     if (a !== 'open') return { verdict: 'allow', why: 'the page Rime has open' };
+    // A path (index.html, ./site/a.html, ~/x.html) is a file on this computer.
+    if (!/^[a-z]+:\/\//i.test(String(input.url ?? '')) && (/^[./~]/.test(String(input.url)) || /\.html?$/i.test(String(input.url)))) return { verdict: 'allow', why: 'a file on this computer' };
     let host = '';
     try {
       const u = new URL(/^[a-z]+:\/\//i.test(String(input.url)) ? String(input.url) : `http://${input.url}`);

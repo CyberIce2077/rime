@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import type { Key, Line } from '../../core/term.ts';
+import { type Key, type Line, wrap } from '../../core/term.ts';
 import type { RGB } from '../../core/theme.ts';
 import type { Hint, Styles } from '../../core/view.ts';
 import type { CustomTab } from '../shell-panel/panel.ts';
@@ -76,9 +76,11 @@ export function install(useChrome: boolean, onProgress: (p: Progress) => void, s
       });
     });
   return (async () => {
-    onProgress({ step: 'Installing Playwright (npm)' });
-    const a = await run(npm, ['install', '--prefix', DIR, '--no-audit', '--no-fund', '--loglevel=error', ...PACKAGES]);
-    if (!a.ok) return a;
+    if (!installed()) {
+      onProgress({ step: 'Installing Playwright (npm)' });
+      const a = await run(npm, ['install', '--prefix', DIR, '--no-audit', '--no-fund', '--loglevel=error', ...PACKAGES]);
+      if (!a.ok) return a;
+    }
     if (!useChrome) {
       const preload = path.join(DIR, 'tty-preload.cjs');
       fs.writeFileSync(preload, PRELOAD);
@@ -139,8 +141,31 @@ const libs = () => {
   const req = createRequire(path.join(DIR, 'package.json'));
   return { pw: req('playwright-core') as PW, PNG: req('pngjs').PNG };
 };
-const chromeNow = () => (shared ??= libs().pw.chromium.launch({ headless: true, ...(choice().channel ? { channel: choice().channel } : {}) }));
-export const closeChrome = () => void shared?.then((b) => b.close()).catch(() => {});
+// A failed start isn't kept: the next try launches again.
+const chromeNow = () => (shared ??= libs().pw.chromium.launch({ headless: true, ...(choice().channel ? { channel: choice().channel } : {}) }).catch((e: Error) => ((shared = null), Promise.reject(e))));
+export const closeChrome = () => {
+  void shared?.then((b) => b.close()).catch(() => {});
+  shared = null;
+};
+// Which browser the plug-in runs: your Chrome, or the Chromium it downloaded.
+export const usesChrome = () => choice().channel === 'chrome';
+// Takes it all away: the Chromium it downloaded (Playwright's own uninstall, which
+// keeps browsers other Playwright installs still use) and ~/.rime/plugins/browser.
+export async function uninstall(): Promise<{ ok: boolean; error?: string }> {
+  closeChrome();
+  if (installed() && !usesChrome())
+    await new Promise<void>((resolve) => {
+      const p = spawn(process.execPath, [path.join(DIR, 'node_modules', 'playwright-core', 'cli.js'), 'uninstall'], { stdio: 'ignore' });
+      p.on('close', () => resolve());
+      p.on('error', () => resolve());
+    });
+  try {
+    fs.rmSync(DIR, { recursive: true, force: true });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
 
 // A page drawn into a tab: Chrome's screencast, sized to the tab (or to a fixed
 // CSS width, scaled down: the design tab's viewports), as half-blocks or images.
@@ -245,9 +270,14 @@ export async function openBrowser(h: BrowserHost) {
       const host = e.url().replace(/^https?:\/\//, '').replace(/\/$/, '') || 'blank';
       tab.title = `browser · ${host.length > 20 ? host.slice(0, 19) + '…' : host}`;
       const bar: Line = [{ t: '◍ ', s: st.accent }, { t: e.url() || 'about:blank', s: st.title }, ...(typing ? [{ t: '  typing into the page · esc stops', s: st.warn }] : [])];
+      // No page yet: say how to open one, not a white page.
+      if (!e.url() || e.url() === 'about:blank') {
+        const help: Line[] = [[{ t: 'No page open yet.', s: st.title }], [], [{ t: '/browser <url>', s: st.accentB }, { t: '  a web address, localhost:5173, or a file like index.html', s: st.dim }], [{ t: '/browser use chrome', s: st.accentB }, { t: ' · ', s: st.dim }, { t: '/browser use chromium', s: st.accentB }, { t: '  switch browsers', s: st.dim }], [{ t: '/browser uninstall', s: st.accentB }, { t: '  remove the plug-in', s: st.dim }], [], [{ t: 'Or ask Rime to open a page.', s: st.dim }], [{ t: `Using ${usesChrome() ? 'your Chrome' : 'Chromium'}.`, s: st.dim }]];
+        return [bar, [], ...help.flatMap((l) => (l.length ? wrap(l, w, w - 2).map((x, i) => (i ? [{ t: '  ', s: '' }, ...x] : x)) : [l]))];
+      }
       return [bar, ...e.draw(w, rows - 1)];
     },
-    overlay: (col, row, w, rows) => e.overlay(col, row + 1, w, rows - 1),
+    overlay: (col, row, w, rows) => (!e.url() || e.url() === 'about:blank' ? null : e.overlay(col, row + 1, w, rows - 1)),
     hide: e.hide,
     key(k: Key) {
       if (typing) {

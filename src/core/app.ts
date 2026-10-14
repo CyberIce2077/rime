@@ -12,6 +12,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
 import { type Decision, MODE_HELP, MODES, type Mode, addProjectRule, decide, projectRules, removeProjectRule, ruleList, rulesHash, trustedProjectRules } from './permissions.ts';
 import { type RunAs, type ToolDef, type ToolResult, TOOLS, bash as bashTool, commandEnv, sandboxed, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
@@ -33,7 +34,7 @@ import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor }
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
 import { createSide } from '../plugins/shell-panel/panel.ts';
-import { BROWSER_TOOL, type BrowserSession, type Progress, chrome as hasChrome, closeChrome, install as installBrowser, installed as browserInstalled, openBrowser } from '../plugins/browser/browser.ts';
+import { BROWSER_TOOL, type BrowserSession, type Progress, chrome as hasChrome, closeChrome, install as installBrowser, installed as browserInstalled, openBrowser, uninstall as uninstallBrowser, usesChrome } from '../plugins/browser/browser.ts';
 import { DESIGN_TOOL, type DesignSession, type Pick, designFile, openDesign, overflow, slug as designSlug, starter } from '../plugins/design/design.ts';
 import { compare as compareVersions, install as installVersion, latest as latestVersion, newest as newestVersion } from '../plugins/updater/update.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
@@ -56,7 +57,7 @@ const CMDS: [string, string][] = [
   ['/conversations', 'search, open, fork or delete your conversations'],
   ['/compact', 'summarise the earlier conversation to free context'],
   ['/diff', 'what the last change did, file by file'],
-  ['/browser', 'your web app in a tab: /browser <url>'],
+  ['/browser', 'a page in a tab: /browser <url or file> · use chrome | chromium · uninstall'],
   ['/design', 'build a page by chatting: /design new <what>'],
   ['/undo', 'put the files back as they were before the last change'],
   ['/usage', 'token, cost and savings breakdown'],
@@ -70,7 +71,7 @@ const PANEL_KEYS: [string, string][] = [
   ['ctrl-w v', 'split / bring the panel back'],
   ['ctrl-w h  l', 'focus the chat / the panel'],
   ['ctrl-w q', 'close the tab (asks first if its command still runs)'],
-  ['ctrl-w ← →', 'panel wider / narrower · ctrl-w e evenly'],
+  ['ctrl-w ← →', 'panel wider / narrower · ctrl-w e evenly · or drag the divider'],
   ['ctrl-w 1…9', 'go to a tab · ctrl-w n p next / previous · ctrl-w u reopen'],
   ['ctrl-w z', 'hide or show the panel (commands keep running)'],
   ['ctrl-w ctrl-w', 'ctrl-w itself (delete the word before the cursor)'],
@@ -119,6 +120,7 @@ const system = (cwd: string, agents = '', map = '') =>
   `Do the work with your tools: read files before you change them, create files with write, change them with edit, run commands with bash. Don't paste whole files into the chat; say in a line or two what you did.\n` +
   `When you need the user to choose before you go on, use the ask tool and stop there; never ask in text and then carry on in the same reply.\n` +
   `You run inside Rime. Use the rime tool to change Rime itself (tabs, panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
+  `Rime can show things next to the chat in a split view with tabs: the project's files, a file at a line, the diff of your last change, command output (each command you run gets a tab while it's open), a browser tab with a web page or local HTML file (rime tool browser.open {url}; the browser tool, when on, clicks and reads pages), and design tabs where the user builds a page by chatting (/design new <what>, the design tool). The user can /diff and /undo your last change and /compact a long conversation. Offer these instead of saying Rime can't.\n` +
   `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.` +
   (agents ? `\n\nAGENTS.md:\n${agents}` : '') +
   (map ? `\n\n${map}` : '');
@@ -215,7 +217,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     env: () => commandEnv(process.env, cfg.passEnv),
     open: (p, line) => void side.file(p, line),
   });
-  let sideFocus = false, prefix = false;
+  let sideFocus = false, prefix = false, dragging = false; // dragging: the divider, with the mouse
   // The chat's width and where the panel starts (0: no panel). Under 72 columns
   // there's room for one pane, so the one with focus takes the screen.
   const layout = () => {
@@ -641,6 +643,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         ...footRows(['↑ ↓', ' choose · ', 'enter', ' use it · ', 'esc', ' close'], st),
       ], width, st, st.accent, 'key:esc');
     }
+    if (/^\/browser\s+$/.test(buf))
+      return box('/browser', [
+        { line: [{ t: '<url or file>', s: st.title }, dim('  a web address, localhost:5173, or a file like index.html')] },
+        { line: [{ t: 'use chrome', s: st.title }, dim(' · '), { t: 'use chromium', s: st.title }, dim(`  switch browsers${browserInstalled() ? ` (now ${usesChrome() ? 'your Chrome' : 'Chromium'})` : ''}`)] },
+        { line: [{ t: 'uninstall', s: st.title }, dim('  remove the plug-in and the Chromium it downloaded')] },
+      ], width, st);
     if (/^\/connect\s+$/.test(buf)) return box('/connect', [{ line: [{ t: '<url> [name]', s: st.title }, dim('  a llama.cpp, Ollama, LM Studio or OpenAI-compatible server')] }], width, st);
     return null;
   }
@@ -1579,12 +1587,18 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // or the first browser tool call, and closes with its tab or with Rime.
   let browser: BrowserSession | null = null;
   let opening: Promise<BrowserSession> | null = null;
+  let browserTab: object | null = null;
   function browserNow() {
-    if (browser) return Promise.resolve(browser);
+    if (browser) {
+      // Already open: bring its tab into view.
+      const i = side.tabs.indexOf(browserTab as never);
+      if (i >= 0) side.go(i);
+      return Promise.resolve(browser);
+    }
     opening ??= openBrowser({ st, color: (rgb, bg) => sgr(rgb, bg, st.mode), redraw: () => schedule(), onClose: () => (browser = null), log: (l) => note(l, 'dim') })
       .then((b) => {
         browser = b;
-        side.custom(b.tab, true); // you'll want to watch it, so it's the tab showing
+        browserTab = side.custom(b.tab, true); // you'll want to watch it, so it's the tab showing
         return b;
       })
       .finally(() => (opening = null));
@@ -1628,8 +1642,20 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     };
     schedule();
   }
-  // /browser [url]: the page in a tab.
-  function browserCmd(url?: string) {
+  // A local file (index.html, ./site/a.html, ~/x.html) as a file:// address.
+  const pageUrl = (raw: string) => {
+    const p = path.resolve(cwd, raw.replace(/^~(?=\/)/, os.homedir()));
+    return !/^[a-z]+:\/\//i.test(raw) && fs.existsSync(p) ? pathToFileURL(p).href : raw;
+  };
+  // /browser [url | file] · /browser use chrome | chromium · /browser uninstall
+  function browserCmd(args: string[] | string = []) {
+    const a = typeof args === 'string' ? [args] : args;
+    if (a[0] === 'uninstall') return browserUninstall();
+    if (a[0] === 'use') {
+      if (!/^(chrome|chromium)$/i.test(a[1] ?? '')) return void note('/browser use chrome, or /browser use chromium', 'dim');
+      return browserUse(a[1].toLowerCase() === 'chrome');
+    }
+    const url = a.join(' ').trim() ? pageUrl(a.join(' ').trim()) : '';
     withPlaywright('browser', async () => {
       try {
         const b = await browserNow();
@@ -1638,6 +1664,51 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         note(`The browser didn't start: ${(e as Error).message.split('\n')[0]}`);
       }
     });
+  }
+
+  // Switching browsers: the open browser and design tabs close (they share one
+  // Chrome), and the next /browser starts the other one. Chromium downloads with
+  // its progress the first time.
+  function browserUse(chrome: boolean) {
+    if (chrome && !hasChrome()) return void note("Google Chrome isn't installed on this computer; /browser use chromium downloads Chromium instead.", 'dim');
+    if (browserInstalled() && usesChrome() === chrome) return void note(`The browser plug-in already uses ${chrome ? 'your Chrome' : 'Chromium'}.`, 'dim');
+    side.closePlugins();
+    closeChrome();
+    browser = null;
+    const ac = new AbortController();
+    const pr = progressRow(() => ac.abort());
+    void installBrowser(chrome, (p) => pr.update(p), ac.signal).then((r) => {
+      if (r.stopped) return pr.finish('stopped · the browser plug-in is as it was', 'stopped');
+      if (!r.ok) return pr.finish(`couldn't switch: ${r.error}`, false);
+      if (!cfg.plugins?.browser) (cfg.plugins = { ...cfg.plugins, browser: true }), settings.save();
+      pr.finish(`the browser plug-in now uses ${chrome ? 'your Chrome' : 'Chromium'} · /browser opens it`, true);
+    });
+  }
+  // /browser uninstall: asks, then removes Playwright, the Chromium it downloaded
+  // and the plug-ins' settings; their tools leave new conversations.
+  function browserUninstall() {
+    if (!browserInstalled() && !cfg.plugins?.browser && !cfg.plugins?.design) return void note('The browser plug-in isn\'t installed.', 'dim');
+    S.question = {
+      q: `Remove the browser plug-in? It deletes ~/.rime/plugins/browser${usesChrome() ? '' : ' and the Chromium it downloaded'}; the browser and design tabs close. Your Chrome and your design files stay.`,
+      options: [{ label: 'Remove it' }, { label: 'Keep it' }],
+      sel: 1, tool: false,
+      done: (a) => {
+        S.question = null;
+        if (a !== 'Remove it') return schedule();
+        side.closePlugins();
+        browser = null;
+        const pr = progressRow(() => {});
+        pr.update({ step: 'Removing the browser plug-in' });
+        void uninstallBrowser().then((r) => {
+          if (!r.ok) return pr.finish(`couldn't remove it: ${r.error}`, false);
+          cfg.plugins = { ...cfg.plugins, browser: false, design: false };
+          settings.save();
+          pr.finish('the browser plug-in is removed · its tools leave your next conversation; /browser sets it up again', true);
+        });
+        schedule();
+      },
+    };
+    schedule();
   }
 
   // ---- design plug-in (Phase 12) ----
@@ -2172,7 +2243,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // keys, and it can't change permission modes or rules (it opens /permissions).
   function rimeTool(action: string, args: Record<string, any>, C: Session = S, signal?: AbortSignal): string | Promise<string> {
     const { conversation, store, note, drop, addConvRule, detail } = bound(C);
-    const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open {kind: files | file {path, line} | diff} · tab.close {n} · tab.focus {n} · panel.show · panel.hide';
+    const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open {kind: files | file {path, line} | diff} · tab.close {n} · tab.focus {n} · panel.show · panel.hide · browser.open {url: a web address or a local HTML file} · design.open {name} or {new: what to build}';
     if (action === 'help') return `Actions: ${ACTIONS}\nSettings: ${settings.list().map((d) => `${d.key} (${d.values.join(' | ')}; applies ${WHEN[d.applies]})`).join(', ')}`;
     if (action === 'settings.list') return settings.list().map((d) => `${d.key} = ${d.get(cfg)} · ${d.help} · applies ${WHEN[d.applies]}`).join('\n');
     if (action === 'settings.get') return `${args.key} = ${settings.get(String(args.key)) ?? '(no such setting)'}`;
@@ -2244,6 +2315,23 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (action === 'tab.focus') return `Showing tab ${n + 1}.`;
       if (side.asking() || (side.tabs[n].kind === 'shell' && (side.tabs[n] as { state: string }).state === 'running')) return 'That tab is still running a command; the user closes it with ctrl-w q.';
       return side.close(), `Closed tab ${n + 1}.`;
+    }
+    // The browser tab: a web address, or a local file shown as file://. The first
+    // time, the user is asked to turn the plug-in on (a one-time set-up).
+    if (action === 'browser.open') {
+      const raw = String(args.url ?? '').trim();
+      if (!raw) return 'browser.open needs {url}: a web address or a local HTML file.';
+      const local = !/^[a-z]+:\/\//i.test(raw) && fs.existsSync(path.resolve(cwd, raw.replace(/^~(?=\/)/, os.homedir())));
+      const url = local ? pathToFileURL(path.resolve(cwd, raw.replace(/^~(?=\/)/, os.homedir()))).href : raw;
+      if (!cfg.plugins?.browser || !browserInstalled()) return browserCmd(url), "The browser plug-in isn't on yet, so Rime asked the user to turn it on (a one-time set-up); the page opens in a tab when they do.";
+      return browserNow()
+        .then((b) => b.act({ action: 'open', url }))
+        .then((t) => `${t.split('. Use snapshot')[0]}. It shows in the browser tab next to the chat.`)
+        .catch((e) => `Couldn't open it: ${(e as Error).message.split('\n')[0]}`);
+    }
+    if (action === 'design.open') {
+      designCmd(args.new ? ['new', String(args.new)] : args.name ? [String(args.name)] : []);
+      return cfg.plugins?.design && browserInstalled() ? 'Opened the design tab.' : "The design plug-in isn't on yet, so Rime asked the user to turn it on; the tab opens when they do.";
     }
     if (action === 'panel.show' || action === 'panel.split') return side.tabs.length ? (side.show(true), 'The panel is showing.') : (side.files(), 'Opened the panel with the files tab.');
     if (action === 'panel.hide') return side.show(false), (sideFocus = false), 'The panel is hidden; its tabs keep running.';
@@ -3158,7 +3246,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     } else if (c === '/settings') panel = createSettingsPanel(host);
     else if (c === '/permissions') panel = createPermissions();
     else if (c === '/conversations') openList();
-    else if (c === '/browser') browserCmd(args[0]);
+    else if (c === '/browser') browserCmd(args);
     else if (c === '/design') designCmd(args);
     else if (c === '/clear') {
       newConversation();
@@ -3619,6 +3707,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const at = { x: ev.x, y: ev.y };
       // Split view: the wheel scrolls the pane it's over; a click there gives it focus.
       const Lo = layout();
+      // The divider (the panel's left border) drags to resize the split.
+      if (ev.button === 0 && !ev.release && Lo.px > 0 && ev.x === Lo.px && !panel) return void ((dragging = true), schedule());
+      if (dragging) {
+        if (ev.button === 32) side.setRatio((W() - ev.x + 1) / W());
+        if (ev.release) dragging = false;
+        return schedule();
+      }
       const overSide = Lo.full || (Lo.px > 0 && ev.x >= Lo.px);
       if (overSide && (ev.button === 64 || ev.button === 65)) return side.wheel(ev.button === 64 ? -3 : 3), schedule();
       if (ev.button === 0 && !ev.release && side.visible && !panel) {

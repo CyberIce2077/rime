@@ -45,7 +45,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: 'rime',
-    description: "Change Rime itself: settings, boxes, tabs, panel. action 'help' lists every action.",
+    description: "Change Rime itself: settings, boxes, split-view tabs (the files, a file at a line, the diff), the browser tab (a URL or a local HTML file) and design tabs. action 'help' lists every action.",
     input_schema: { type: 'object', properties: { action: { type: 'string' }, args: { type: 'object' } }, required: ['action'] },
   },
 ];
