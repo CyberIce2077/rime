@@ -177,5 +177,9 @@ export function phrase(text: string): { key: string; value: string } | null {
   // A model or provider by name; the app checks it's one it knows.
   m = /^(?:use|switch to|load) ([\w.:/@-]+)$/.exec(t);
   if (m) return { key: 'use', value: m[1] };
+  // Split view's tabs (SPEC §8): the files, the diff, the tests.
+  if (/^(?:open|show)(?: me)? (?:the )?(?:codebase|files|file tree|project)(?: in a (?:new )?tab)?$/.test(t)) return { key: 'tab', value: 'files' };
+  if (/^(?:open|show)(?: me)? (?:the )?diff(?: in a (?:new )?tab)?$/.test(t)) return { key: 'tab', value: 'diff' };
+  if (/^run (?:the )?tests in a (?:new )?tab$/.test(t)) return { key: 'tab', value: 'tests' };
   return null;
 }

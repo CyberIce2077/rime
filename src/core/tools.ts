@@ -188,7 +188,7 @@ export function sandboxed(cmd: string, project: string): [string, string[]] | nu
   return null;
 }
 
-export type RunAs = { project?: string; sandbox?: boolean; readOnly?: boolean; passEnv?: string[] };
+export type RunAs = { project?: string; sandbox?: boolean; readOnly?: boolean; passEnv?: string[]; onOutput?: (chunk: string) => void };
 
 export function bash(cwd: string, input: { command: string; timeout?: number }, signal?: AbortSignal, as: RunAs = {}): Promise<ToolResult> {
   return new Promise((resolve) => {
@@ -207,8 +207,9 @@ export function bash(cwd: string, input: { command: string; timeout?: number }, 
     const t = setTimeout(() => kill(`timed out after ${limit / 1000} s`), limit);
     const stop = () => kill('stopped');
     signal?.addEventListener('abort', stop, { once: true });
-    p.stdout.on('data', (d) => (out = keep(out + d)));
-    p.stderr.on('data', (d) => (out = keep(out + d)));
+    const take = (d: Buffer) => ((out = keep(out + d)), as.onOutput?.(d.toString('utf8')));
+    p.stdout.on('data', take);
+    p.stderr.on('data', take);
     p.on('error', (e) => (out += e.message));
     p.on('close', (code) => {
       clearTimeout(t);

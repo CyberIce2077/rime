@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
 import { type Decision, MODE_HELP, MODES, type Mode, addProjectRule, decide, projectRules, removeProjectRule, ruleList, rulesHash, trustedProjectRules } from './permissions.ts';
-import { type RunAs, type ToolResult, TOOLS, bash as bashTool, sandboxed, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
+import { type RunAs, type ToolResult, TOOLS, bash as bashTool, commandEnv, sandboxed, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
 import { type AgentEvent, type TurnHost, result, runTools, runTurn } from './agent.ts';
 import { WHEN, createSettings, phrase } from './settings.ts';
 import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
@@ -32,6 +32,7 @@ import { PRESETS } from '../providers/presets.ts';
 import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
+import { createSide } from '../plugins/shell-panel/panel.ts';
 import { compare as compareVersions, install as installVersion, latest as latestVersion, newest as newestVersion } from '../plugins/updater/update.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
 import { recheck } from '../providers/probe.ts';
@@ -60,6 +61,17 @@ const CMDS: [string, string][] = [
 ];
 
 // SPEC §5: only keys every keyboard has and every terminal passes on (§5.1).
+// Split view (SPEC §8), listed when it's in use; ctrl+t is always there.
+const PANEL_KEYS: [string, string][] = [
+  ['ctrl-w v', 'split / bring the panel back'],
+  ['ctrl-w h  l', 'focus the chat / the panel'],
+  ['ctrl-w q', 'close the tab (asks first if its command still runs)'],
+  ['ctrl-w ← →', 'panel wider / narrower · ctrl-w e evenly'],
+  ['ctrl-w 1…9', 'go to a tab · ctrl-w n p next / previous · ctrl-w u reopen'],
+  ['ctrl-w z', 'hide or show the panel (commands keep running)'],
+  ['ctrl-w ctrl-w', 'ctrl-w itself (delete the word before the cursor)'],
+  ['j k  g G', 'scroll, top and end (output, diff, a file)'],
+];
 const KEYS: [string, string][] = [
   ['enter', 'send'],
   ['ctrl+j', 'new line (shift+enter also works where the terminal reports it)'],
@@ -86,6 +98,7 @@ const CLICK_KEYS: Record<string, Key> = {
   esc: { name: 'escape' }, enter: { name: 'enter' }, tab: { name: 'tab' }, space: { name: 'space' }, backspace: { name: 'backspace' },
   'ctrl+c': { name: 'c', ctrl: true }, 'ctrl+j': { name: 'j', ctrl: true }, 'ctrl+v': { name: 'v', ctrl: true }, 'ctrl+o': { name: 'o', ctrl: true },
   'ctrl+r': { name: 'r', ctrl: true }, 'ctrl+d': { name: 'd', ctrl: true }, '→': { name: 'right' }, '←': { name: 'left' }, '↑': { name: 'up' }, '↓': { name: 'down' }, 'shift+tab': { name: 'tab', shift: true },
+  'ctrl-w': { name: 'w', ctrl: true }, 'ctrl-t': { name: 't', ctrl: true },
   'ctrl+p': { name: 'p', ctrl: true }, 'ctrl+f': { name: 'f', ctrl: true }, 'ctrl+e': { name: 'e', ctrl: true }, 'ctrl+s': { name: 's', ctrl: true }, 'ctrl+u': { name: 'u', ctrl: true },
 };
 
@@ -187,6 +200,25 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
 
   // ---- saving (SPEC §16): every message is written the moment it exists ----
   const project = projectOf(cwd);
+  // Split view (Phase 10): the tabbed panel on the right, whether it has the keys,
+  // and a pending ctrl-w (the panel prefix).
+  const side = createSide({
+    root: project, st, redraw: () => schedule(),
+    files: () => (index ? index.files().sort() : listFiles(project)),
+    env: () => commandEnv(process.env, cfg.passEnv),
+    open: (p, line) => void side.file(p, line),
+  });
+  let sideFocus = false, prefix = false;
+  // The chat's width and where the panel starts (0: no panel). Under 72 columns
+  // there's room for one pane, so the one with focus takes the screen.
+  const layout = () => {
+    const width = W();
+    if (!side.visible) return { cw: width, px: 0, full: false };
+    if (width < 72) return sideFocus ? { cw: 0, px: 1, full: true } : { cw: width, px: 0, full: false };
+    const pw = Math.max(30, Math.min(width - 40, Math.round(width * side.ratio)));
+    return { cw: width - pw, px: width - pw + 1, full: false };
+  };
+  const CW = () => layout().cw || W();
   const db: Db | null = await openDb().catch(() => null);
   let saveFailed = false;
   const save = <T>(fn: (d: Db) => T): T | undefined => {
@@ -458,7 +490,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       return box('commands', [...rows, ...footRows(['↑ ↓', ' choose · ', 'tab', ' complete · ', 'enter', ' run · ', 'esc', ' close'], st)], width, st, st.accent, 'key:esc');
     }
     if (boxKind === 'keys') {
-      return box('shortcuts', [...KEYS.map(([k, h]) => listRow(k, h, false, st, undefined, 16)), ...footRows('any key to close', st)], width, st, st.accent, 'key:esc');
+      return box('shortcuts', [...[...KEYS, ['ctrl+t', 'new shell tab (split view)'] as [string, string], ...(side.tabs.length ? PANEL_KEYS : [])].map(([k, h]) => listRow(k, h, false, st, undefined, 16)), ...footRows('any key to close', st)], width, st, st.accent, 'key:esc');
     }
     if (boxKind === 'usage') return box(`usage · this conversation${model ? ` · ${model.label}` : ''}`, usageRows(width), width, st, st.accent, 'key:esc');
     return null;
@@ -725,7 +757,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const key = (t: string) => ({ t, s: st.accentB });
       const parts: { line: Line; id?: string }[] = [];
       if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
+      if (prefix) parts.push({ line: [key('ctrl-w'), dim(' … v split · h l focus · q close · 1-9 tab · n p · z hide')] });
       if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
+      if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl-w z')], id: 'panel' });
+      else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl-w l'), dim(' panel')], id: 'panel' });
       if (upd.state === 'installing') parts.push({ line: [dim(`⟳ installing ${upd.version}…`)] });
       else if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
       if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
@@ -774,14 +809,23 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   function frame() {
     scheduled = false;
     Object.assign(headerOpts, headerInfo());
-    const width = W(), height = H();
+    const full = W(), height = H();
     // The conversations window fills the screen.
     if (list) {
-      const v = frameList(width, height);
+      const v = frameList(full, height);
       hits = v.rowHits;
-      rows = v.lines.map((l) => truncAnsi(l, width));
-      return paint(rows.map((l) => [l, '']), width, '');
+      rows = v.lines.map((l) => truncAnsi(l, full));
+      return paint(rows.map((l) => [l, '']), full, '');
     }
+    const L = layout();
+    // Narrow, with the panel focused: the panel is the screen.
+    if (L.full) {
+      const v = side.render(full, height, true, false);
+      hits = v.hits;
+      rows = v.lines;
+      return paint(rows.map((l) => [l, '']), full, '\x1b[?25l');
+    }
+    const width = L.cw;
     const { lines, gears, pins } = transcript(width);
     const u = ui(width, height);
     viewH = Math.max(0, height - u.lines.length);
@@ -830,7 +874,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (back >= 0) hits.push({ row: r2, x0: strWidth(l2.slice(0, back)) + 1, x1: strWidth(l2.slice(0, back)) + 15, id: 'conversations' });
     const marks = rows.map(() => '');
     for (const { y, x0, x1 } of selectionSpans(width)) marks[y - 1] += `\x1b[${y};${x0}H${st.selection}${sliceCols(rows[y - 1], x0, x1).padEnd(x1 - x0 + 1)}${st.reset}`;
-    paint(rows.map((l, i) => [l, marks[i]]), width, `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h`);
+    // Split: the panel takes the columns right of the chat, top to bottom.
+    if (L.px) {
+      const v = side.render(full - width, height, sideFocus);
+      rows = rows.map((r, i) => `${r}${st.reset}${' '.repeat(Math.max(0, width - strWidth(stripAnsi(r))))}${v.lines[i] ?? ''}`);
+      hits.push(...v.hits.map((h) => ({ ...h, x0: h.x0 + width, x1: h.x1 + width })));
+    }
+    paint(rows.map((l, i) => [l, marks[i]]), full, sideFocus ? '\x1b[?25l' : `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h`);
   }
 
   // Writes only the rows that changed since the last frame, each overwritten in
@@ -874,7 +924,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     selected(width).map((sp) => ({ ...sp, y: selection!.log ? sp.y - top + 1 : sp.y })).filter((sp) => sp.y >= 1 && sp.y <= (selection!.log ? viewH : H()));
 
   function copySelection() {
-    const text = selected(W()).map(({ text: t, x0, x1 }) => sliceCols(t, x0, x1).trimEnd()).join('\n')
+    const text = selected(CW()).map(({ text: t, x0, x1 }) => sliceCols(t, x0, x1).trimEnd()).join('\n')
       .replace(/^\n+|\n+$/g, '');
     if (!text.trim()) return;
     copy(text, write);
@@ -1490,6 +1540,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (!cps || !cp) return void (note('No changes to show: Rime takes a checkpoint before it changes a file.', 'dim'), handled());
     const ch = cps.changes(cp);
     if (!ch.length) return void (note(`Nothing changed since before "${cp.label}".`, 'dim'), handled());
+    if (side.visible) {
+      side.diff(cps.diff(cp), true);
+      S.items.push({ kind: 'lines', lines: [[{ t: '± ', s: st.accent }, { t: `since before "${cp.label}" · `, s: st.dim }, { t: changeLine(ch), s: st.title }, { t: ' → diff tab', s: st.accent }]] });
+      return void handled();
+    }
     const lines = cps.diff(cp).split('\n').filter((l) => !/^(index |diff --git|new file mode|deleted file mode|similarity)/.test(l));
     const show = lines.slice(0, 400).map((l): Line => [{ t: '  ' + l, s: l.startsWith('+++') || l.startsWith('---') ? st.titleB : l.startsWith('+') ? st.ok : l.startsWith('-') ? st.del : l.startsWith('@@') ? st.accent : st.dim }]);
     S.items.push({ kind: 'lines', lines: [[{ t: '± ', s: st.accent }, { t: `since before "${cp.label}" · ${ago(cp.at)} · `, s: st.dim }, { t: changeLine(ch), s: st.title }], ...show, ...(lines.length > 400 ? [[{ t: `  … ${lines.length - 400} more lines`, s: st.dim }]] : []), [{ t: '  /undo', s: st.accent }, { t: ' puts them back', s: st.dim }]] });
@@ -1592,6 +1647,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // request, storage, permissions and questions, and the screen built from its
   // events (thinking, the reply, the live "writing…" row, tool rows, cost).
   function turnHost(C: Session, m: Model, cn: Conn, c: Controls, ac: AbortController, did: Did, setEsc: (f: () => void) => void, label = ''): TurnHost {
+    // Commands mirrored into split view's tabs, by tool call; the tab learns how it ended.
+    const mirrors = new Map<unknown, { tab: number; write: (s: string) => void; done: (code: number) => void }>();
+    const tabbed = async (u: Block, r: ToolResult | Promise<ToolResult>) => {
+      const res = await r;
+      mirrors.get(u.id)?.done(res.error ? Number(/exit (\d+)/.exec(res.summary)?.[1] ?? 1) : 0);
+      return res;
+    };
     const { store, note, drop, addConvRule, detail, event } = bound(C);
     // diff-undo: a checkpoint before this turn's first change.
     let cp: ReturnType<Checkpoints['begin']> | null = null;
@@ -1708,7 +1770,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       else if (e.type === 'asked') {
         C.items.push(toolLine(e.use));
         detail([[e.answer === null ? { t: 'not answered', s: st.dim } : { t: e.answer, s: st.title }]]);
-      } else if (e.type === 'run') C.items.push({ ...toolLine(e.use), ...(e.decision.verdict === 'allow' && e.use.name === 'bash' ? { extra: [{ t: ` · ${e.decision.why}`, s: st.dim }] } : {}) } as Item);
+      } else if (e.type === 'run') {
+        // In split view a command's output streams into its own tab ("→ tab 4").
+        const tab = e.use.name === 'bash' && side.visible && C === S ? side.mirror(String((e.use.input as Record<string, unknown>)?.command ?? '')) : null;
+        if (tab) mirrors.set(e.use.id, tab);
+        const extra = [...(e.decision.verdict === 'allow' && e.use.name === 'bash' ? [{ t: ` · ${e.decision.why}`, s: st.dim }] : []), ...(tab ? [{ t: ` → tab ${tab.tab}`, s: st.accent }] : [])];
+        C.items.push({ ...toolLine(e.use), ...(extra.length ? { extra } : {}) } as Item);
+      }
       else if (e.type === 'ran') {
         const input = (e.use.input ?? {}) as Record<string, any>, r = e.result;
         const file = rel(cwd, path.resolve(cwd, String(input.path ?? '')));
@@ -1778,7 +1846,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         }),
       // Auto mode's unasked commands run in the sandbox; read-only ones get git
       // hardened. Asked-and-approved commands run as you approved them.
-      run: async (u, d, signal) => (checkpoint(u, d), runTool(String(u.name), (u.input ?? {}) as Record<string, any>, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv })),
+      run: async (u, d, signal) => (checkpoint(u, d), tabbed(u, runTool(String(u.name), (u.input ?? {}) as Record<string, any>, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv, onOutput: mirrors.get(u.id)?.write }))),
       optionsOf,
       queued: () => takeQueued(C),
       afterRound: (signal) => makeRoom(C, m, cn, signal),
@@ -1888,7 +1956,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // keys, and it can't change permission modes or rules (it opens /permissions).
   function rimeTool(action: string, args: Record<string, any>, C: Session = S, signal?: AbortSignal): string | Promise<string> {
     const { conversation, store, note, drop, addConvRule, detail } = bound(C);
-    const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open · tab.close · tab.focus · panel.show · panel.hide · panel.split';
+    const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open {kind: files | file {path, line} | diff} · tab.close {n} · tab.focus {n} · panel.show · panel.hide';
     if (action === 'help') return `Actions: ${ACTIONS}\nSettings: ${settings.list().map((d) => `${d.key} (${d.values.join(' | ')}; applies ${WHEN[d.applies]})`).join(', ')}`;
     if (action === 'settings.list') return settings.list().map((d) => `${d.key} = ${d.get(cfg)} · ${d.help} · applies ${WHEN[d.applies]}`).join('\n');
     if (action === 'settings.get') return `${args.key} = ${settings.get(String(args.key)) ?? '(no such setting)'}`;
@@ -1935,7 +2003,34 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       schedule();
       return `Opened ${name} for the user; they answer it there.`;
     }
-    if (/^(tab|panel)\./.test(action)) return 'Rime has no side panel yet (split view comes in a later version), so this did nothing. Tell the user, and suggest a command they can run instead, such as `open index.html`.';
+    // Split view's tabs (SPEC §8, §15). The model opens tabs without taking the
+    // keys from the chat; it never runs a command this way (that's bash, with its
+    // permission check, whose output shows in a tab while the panel is open).
+    if (action === 'tab.open') {
+      const kind = String(args.kind ?? (args.path ? 'file' : 'files'));
+      if (kind === 'files') return side.files(), 'Opened the files tab.';
+      if (kind === 'file') {
+        const rp = rel(project, path.resolve(cwd, String(args.path ?? '')));
+        return side.file(rp, Number(args.line) || undefined) ? `Opened ${rp}${args.line ? ` at line ${args.line}` : ''} in a tab.` : `Couldn't open ${rp}.`;
+      }
+      if (kind === 'diff') {
+        const cps = checkpointsOf(), cp = cps?.last();
+        if (!cps || !cp) return 'No change on record to diff.';
+        return side.diff(cps.diff(cp), true), 'Opened the diff of the last change in a tab.';
+      }
+      if (kind === 'shell') return 'Run commands with the bash tool; while the panel is open their output shows in a tab of its own.';
+      return `No tab kind ${kind}. Kinds: files, file {path, line}, diff.`;
+    }
+    if (action === 'tab.close' || action === 'tab.focus') {
+      const n = Number(args.n ?? args.tab) - 1;
+      if (!side.tabs[n]) return `No tab ${n + 1}; there are ${side.tabs.length}.`;
+      side.go(n);
+      if (action === 'tab.focus') return `Showing tab ${n + 1}.`;
+      if (side.asking() || (side.tabs[n].kind === 'shell' && (side.tabs[n] as { state: string }).state === 'running')) return 'That tab is still running a command; the user closes it with ctrl-w q.';
+      return side.close(), `Closed tab ${n + 1}.`;
+    }
+    if (action === 'panel.show' || action === 'panel.split') return side.tabs.length ? (side.show(true), 'The panel is showing.') : (side.files(), 'Opened the panel with the files tab.');
+    if (action === 'panel.hide') return side.show(false), (sideFocus = false), 'The panel is hidden; its tabs keep running.';
     return `Unknown action ${action}. Actions: ${ACTIONS}`;
   }
 
@@ -1958,6 +2053,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         const e = planEdit(cwd, input as { path: string; old: string; new: string });
         if (!('error' in e)) diff = diffOf(e.before, e.at, input.old, input.new, 8);
       } else if (u.name === 'write') diff = textOf(input.content).split('\n').slice(0, 8).map((t, i) => ({ sign: '+' as const, n: i + 1, text: t }));
+      // In split view the change also flashes into the diff tab (focus stays here).
+      if (diff && side.visible) side.diff(`--- ${input.path}\n+++ ${input.path}\n` + diff.map((x) => `${x.sign === ' ' ? ' ' : x.sign}${x.n ? String(x.n).padStart(5) : '     '} ${x.text}`).join('\n'));
       C.approval = { use: u, decision: d, sel: 0, done, diff };
       schedule();
     });
@@ -2082,6 +2179,30 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         pick = Number(id.split(':')[1]);
       },
     };
+  }
+
+  // The key after ctrl-w.
+  function panelKey(k: Key) {
+    const n = k.name === 'char' ? (k.ch ?? '') : '';
+    if (n === 'v') {
+      if (!side.tabs.length) side.files();
+      else side.show(true);
+      sideFocus = true;
+    } else if (n === 'h') sideFocus = false;
+    else if (n === 'l') sideFocus = side.visible;
+    else if (n === 'q') side.close(side.asking());
+    else if (k.name === 'left') side.resize(0.05);
+    else if (k.name === 'right') side.resize(-0.05);
+    else if (n === 'e') side.resize(0);
+    else if (/^[1-9]$/.test(n)) side.go(+n - 1), (sideFocus = true);
+    else if (n === 'n' || n === 'p') side.next(n === 'n' ? 1 : -1);
+    else if (n === 'u') side.reopen();
+    else if (n === 'z') side.show(), (sideFocus = sideFocus && side.visible);
+    else if (k.ctrl && k.name === 'w') {
+      if (sideFocus) side.key({ name: 'w', ctrl: true });
+      else if (buf) cut(wordLeft(cur), cur);
+    }
+    if (!side.visible) sideFocus = false;
   }
 
   // Which of the three answers this question offers (0 yes, 1 don't ask again, 2 no).
@@ -2687,6 +2808,25 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   const unloaded = () => (model && cfg.providers[model.provider]?.ssh && !conn && !(bg && !bg.run.state.done) ? model.id : '');
 
   function local(text: string, ph: { key: string; value: string }) {
+    if (ph.key === 'tab') {
+      // The test command comes from package.json; without one it's the model's job.
+      let tests = '';
+      try {
+        tests = JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).scripts?.test ? 'npm test' : '';
+      } catch {}
+      if (ph.value === 'tests' && !tests) return false;
+      S.items.push({ kind: 'user', text });
+      history.push(text);
+      if (ph.value === 'files') side.files();
+      else if (ph.value === 'tests') side.shell(tests);
+      else {
+        const cps = checkpointsOf(), cp = cps?.last();
+        if (cps && cp) side.diff(cps.diff(cp), true);
+        else note('No change on record to diff yet.', 'dim');
+      }
+      handled();
+      return;
+    }
     if (ph.key === 'use') {
       const v = ph.value.toLowerCase();
       const refs = knownModels();
@@ -2816,7 +2956,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // offsets that backspace/delete remove and typing replaces; chips are single
   // characters, so arrows step over them and backspace removes them whole.
 
-  const tw = () => Math.max(1, W() - 6);
+  const tw = () => Math.max(1, CW() - 6);
   const prevCp = (i: number) => (i >= 2 && /[\udc00-\udfff]/.test(buf[i - 1]) ? i - 2 : Math.max(0, i - 1));
   const nextCp = (i: number) => (/[\ud800-\udbff]/.test(buf[i] || '') ? i + 2 : Math.min(buf.length, i + 1));
   const range = (): [number, number] | null => (anchor === null || anchor === cur ? null : [Math.min(anchor, cur), Math.max(anchor, cur)]);
@@ -2866,7 +3006,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // The buffer offset under a screen cell of the prompt, or null when it isn't one.
   function promptOffset(x: number, y: number, clamp = false) {
     const i = promptAt.first + y - promptAt.row;
-    if (!promptAt.rows.length || (!clamp && (i < promptAt.first || i >= promptAt.first + promptAt.shown || x < 3 || x > W() - 2))) return null;
+    if (!promptAt.rows.length || (!clamp && (i < promptAt.first || i >= promptAt.first + promptAt.shown || x < 3 || x > CW() - 2))) return null;
     const r = promptAt.rows[Math.max(0, Math.min(promptAt.rows.length - 1, i))];
     return offsetAt(r, Math.max(0, x - 5), chipW);
   }
@@ -2943,6 +3083,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (id === 'stop') return stopBg();
     if (id === 'mode') return cycleMode();
+    if (id.startsWith('side:')) return (sideFocus = true), side.click(id);
+    if (id === 'panel') return void (side.show(true), (sideFocus = side.visible));
     if (id === 'update') return void updateNow();
     if (id === 'conversations') return openList();
     if (id.startsWith('conv:') && list) return openRow(listRows()[+id.slice(5)]);
@@ -3013,6 +3155,18 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (k.name === 'char' && /^[1-9]$/.test(k.ch ?? '') && +k.ch! <= n) return Q.done(Q.options[+k.ch! - 1].label);
       if (k.name === 'enter' && !k.shift) return Q.done(Q.options[Q.sel].label);
       if (k.name === 'escape') return void (Q.tool ? S.busy?.abort() : (S.question = null));
+    }
+    // Split view (SPEC §8): ctrl-w is the panel prefix once there are tabs (or on an
+    // empty prompt, so ctrl-w v opens the first); ctrl-w ctrl-w is ctrl-w itself.
+    if (prefix) return void ((prefix = false), panelKey(k));
+    if (k.ctrl && k.name === 'w' && !panel && (side.tabs.length > 0 || (!buf && !sideFocus))) return void (prefix = true);
+    if (k.ctrl && k.name === 't' && !panel) return void (side.shell(), (sideFocus = true));
+    if (sideFocus && side.visible && !panel) {
+      const t = side.tabs[side.active];
+      if (k.name === 'char' && k.ch === '?' && !(t?.kind === 'shell' && t.state !== 'running')) return void (boxKind = 'keys');
+      const r = side.key(k);
+      if (r === 'blur') sideFocus = false;
+      if (r) return;
     }
     if (k.name === 'tab' && k.shift && !panel) return cycleMode();
     // ← on an empty prompt opens your conversations.
@@ -3238,6 +3392,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (ev.type === 'mouse') {
       const at = { x: ev.x, y: ev.y };
+      // Split view: the wheel scrolls the pane it's over; a click there gives it focus.
+      const Lo = layout();
+      const overSide = Lo.full || (Lo.px > 0 && ev.x >= Lo.px);
+      if (overSide && (ev.button === 64 || ev.button === 65)) return side.wheel(ev.button === 64 ? -3 : 3), schedule();
+      if (ev.button === 0 && !ev.release && side.visible && !panel) sideFocus = overSide;
       const onPrompt = !panel?.masked?.() && promptOffset(ev.x, ev.y) !== null;
       if (ev.button === 64 || ev.button === 65 || ev.button === 96 || ev.button === 97) {
         // The wheel scrolls; a transcript selection stays on its text (and grows
@@ -3299,7 +3458,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
             if (press.hit?.startsWith('chip:')) big = big === press.hit.slice(5) ? null : press.hit.slice(5);
           }
         } else if (selection) {
-          if (selection.log) selection.b = { x: pointer.y > viewH ? W() : pointer.x, y: top + Math.max(1, Math.min(viewH, pointer.y)) - 1 };
+          if (selection.log) selection.b = { x: pointer.y > viewH ? CW() : pointer.x, y: top + Math.max(1, Math.min(viewH, pointer.y)) - 1 };
           press = null;
           edge();
           copySelection();
@@ -3351,6 +3510,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (quitting) return;
     quitting = 'bye';
     finishDelete(); // a delete waiting for undo is done now
+    side.killAll(); // commands in tabs stop with Rime
     // Every open conversation: a reply being streamed is kept as interrupted.
     for (const x of sessions) {
       if (x.live && x.convId) save((d) => d.update(x.convId!, x.live!.seq, [{ type: 'text', text: x.live!.text() }], true));
