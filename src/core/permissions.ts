@@ -270,6 +270,7 @@ export type Ctx = { mode: Mode; project: string; rules: Rule[]; granted?: (p: st
 
 export function decide(tool: string, input: Record<string, any>, c: Ctx): Decision {
   if (tool === 'rime') return { verdict: 'allow', why: "Rime's own settings" };
+  if (tool === 'search') return { verdict: 'allow', why: 'searching the project' };
   // God mode runs every command and edit without asking. Your deny rules still hold.
   if (c.mode === 'god') {
     const abs = path.resolve(c.project, String(input.path ?? ''));

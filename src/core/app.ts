@@ -31,6 +31,7 @@ import * as llama from '../providers/llamacpp.ts';
 import { PRESETS } from '../providers/presets.ts';
 import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
+import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
 import { recheck } from '../providers/probe.ts';
 import { ApiError, type Block, type Conn, type Controls, type Effort, type Message, type Model, type Usage } from '../providers/types.ts';
@@ -92,14 +93,15 @@ const CLICK_KEYS: Record<string, Key> = {
 const TOOLS_HASH = createHash('sha256').update(JSON.stringify(TOOLS)).digest('hex').slice(0, 16);
 
 // The only project file it includes is AGENTS.md, read once at the start.
-const system = (cwd: string, agents = '') =>
+const system = (cwd: string, agents = '', map = '') =>
   `You are Rime, a coding assistant running in the user's terminal.\n` +
   `Working directory: ${cwd}\n` +
   `Do the work with your tools: read files before you change them, create files with write, change them with edit, run commands with bash. Don't paste whole files into the chat; say in a line or two what you did.\n` +
   `When you need the user to choose before you go on, use the ask tool and stop there; never ask in text and then carry on in the same reply.\n` +
   `You run inside Rime. Use the rime tool to change Rime itself (tabs, panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
   `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.` +
-  (agents ? `\n\nAGENTS.md:\n${agents}` : '');
+  (agents ? `\n\nAGENTS.md:\n${agents}` : '') +
+  (map ? `\n\n${map}` : '');
 const agentsMd = (dir: string) => {
   try {
     return fs.readFileSync(path.join(dir, 'AGENTS.md'), 'utf8').trim().slice(0, 8000);
@@ -145,11 +147,12 @@ export async function runApp(cfg: Config, version: string) {
   let browsing: { list: string[]; i: number; draft: string; edited?: boolean } | null = null;
   let navigated = false;
   const cwd = process.cwd();
-  const SYSTEM = system(cwd, agentsMd(projectOf(cwd))); // the prefix for new conversations
+  let SYSTEM = system(cwd, agentsMd(projectOf(cwd))); // the prefix for new conversations (the repo map joins once the index is ready)
 
   // ---- state ----
   let model: Model | undefined;
   let conn: Conn | undefined; // set once the model's provider answers
+  let index: CodeIndex | null = null; // the code index, once it's open (Phase 5)
   let controls: Controls = { reasoning: cfg.reasoning !== false, effort: cfg.effort };
   // A task keeps one model; controls that would break its cache stay fixed for it.
   const unsafe = new Set<string>(); // models where changing controls was measured to reset the cache
@@ -526,23 +529,31 @@ export async function runApp(cfg: Config, version: string) {
     if (buf[atPick.start] !== '@' || cur <= atPick.start || /\s/.test(q) || [...q].some(isChip)) return (atPick = null), null;
     return q;
   }
-  function atMatches(): { f: string; marks: number[] }[] {
+  // Files by fuzzy name, and (from the code index) declarations whose name starts
+  // with what's typed: `@validate` finds validateEmail in src/signup.ts.
+  function atMatches(): { f: string; marks: number[]; sym?: string; lines?: [number, number] }[] {
     const q = atQuery();
     if (q === null) return [];
     const name = q.split(':')[0];
     const pf = projectFiles();
     if (!name) return [...new Set([...usedFiles, ...pf.recent])].slice(0, 8).map((f) => ({ f, marks: [] }));
-    return pf.list
-      .map((f) => ({ f, m: fuzzy(name, f) }))
-      .filter((x) => x.m)
-      .sort((a, b) => b.m!.score + (usedFiles.includes(b.f) ? 2 : 0) - a.m!.score - (usedFiles.includes(a.f) ? 2 : 0))
-      .slice(0, 8)
-      .map((x) => ({ f: x.f, marks: x.m!.marks }));
+    const syms = name.length >= 3 && /^[\w$]+$/.test(name) && index ? index.symbols(name, 3).map((s) => ({ f: s.path, marks: [], sym: `${s.kind} ${s.name}`, lines: [s.line, s.line + 59] as [number, number] })) : [];
+    return [
+      ...syms,
+      ...pf.list
+        .map((f) => ({ f, m: fuzzy(name, f) }))
+        .filter((x) => x.m)
+        .sort((a, b) => b.m!.score + (usedFiles.includes(b.f) ? 2 : 0) - a.m!.score - (usedFiles.includes(a.f) ? 2 : 0))
+        .slice(0, 8 - syms.length)
+        .map((x) => ({ f: x.f, marks: x.m!.marks })),
+    ];
   }
-  // Attaches the picked file or folder as a chip; `@file:30-60` keeps those lines.
-  function takeAt(f: string) {
+  // Attaches the picked file or folder as a chip; `@file:30-60` keeps those lines,
+  // a declaration keeps 60 lines from where it starts.
+  function takeAt(f: string, from?: [number, number]) {
     const q = atQuery() ?? '';
-    const lines = /:(\d+)(?:-(\d+))?$/.exec(q);
+    const typed = /:(\d+)(?:-(\d+))?$/.exec(q);
+    const lines = from ? (['', String(from[0]), String(from[1])] as unknown as RegExpExecArray) : typed;
     cut(atPick!.start, cur);
     atPick = null;
     try {
@@ -569,10 +580,10 @@ export async function runApp(cfg: Config, version: string) {
       const m = atMatches(), q = atQuery()!;
       const rows: BoxRow[] = m.map((x, i) => {
         const sel = i === atPick!.sel % m.length;
-        const name: Line = [...x.f].map((ch, j) => ({ t: ch, s: x.marks.includes(j) ? st.warn : sel ? st.accent : st.fg }));
+        const name: Line = x.sym ? [{ t: x.sym, s: sel ? st.accent : st.fg }, { t: `  ${x.f}:${x.lines![0]}`, s: st.dim }] : [...x.f].map((ch, j) => ({ t: ch, s: x.marks.includes(j) ? st.warn : sel ? st.accent : st.fg }));
         return { line: [{ t: sel ? '› ' : '  ', s: st.accent }, ...name], bg: sel ? st.panelBg : undefined, hit: `at:${i}` };
       });
-      return box([{ t: '@ files', s: st.accent }, dim(q ? ` · matching "${q}"` : ' · recent first')], [
+      return box([{ t: index ? '@ files and code' : '@ files', s: st.accent }, dim(q ? ` · matching "${q}"` : ' · recent first')], [
         ...(rows.length ? rows : [{ line: [dim('no file matches')] }]),
         ...footRows(['↑ ↓', ' choose · ', 'tab', ' or ', 'enter', ' attach · ', 'esc', ' keep typing'], st),
       ], width, st, st.accent, 'key:esc');
@@ -1124,6 +1135,18 @@ export async function runApp(cfg: Config, version: string) {
       return;
     }
     if (!conn.key && conn.wire === 'anthropic') return note(`No API key for ${conn.name}. /setup adds one, or set ${PRESETS.anthropic.keyEnv}.`);
+    // The index catches up with changes made outside Rime (and by commands).
+    await index?.refresh().catch(() => 0);
+    // A file or declaration the prompt names goes along up front, so the model
+    // doesn't spend a turn finding it.
+    if (!held && typeof content === 'string' && index) {
+      const extra = preattach(content);
+      if (extra.length) {
+        content = [{ type: 'text', text: content }, ...extra.map((x) => x.block)];
+        C.items.push({ kind: 'lines', hug: true, lines: [[{ t: '  + ', s: st.dim }, { t: extra.map((x) => x.label).join(', '), s: st.dim }, { t: ' · from the code index', s: st.dim }]] });
+        schedule();
+      }
+    }
     const root = llama.rootOf(conn.base);
     // Another of your conversations on the same server: the server queues this one.
     // With one slot they share it (and evict each other's cache); with several each has its own.
@@ -1319,6 +1342,35 @@ export async function runApp(cfg: Config, version: string) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(hit, content);
     return { content, summary: `summary · ${lines} lines` };
+  }
+
+  // ---- code-index (Phase 5) ----
+
+  // Names in the prompt that the index knows: a file path (or a unique file name),
+  // or a declaration that looks like code (validateEmail, parse_config, UserForm)
+  // with at most two definitions. At most two pieces, 80 lines of a file or 60
+  // from a declaration.
+  function preattach(text: string): { label: string; block: Block }[] {
+    const ix = index!, out: { label: string; block: Block }[] = [], seen = new Set<string>();
+    const all = ix.files();
+    for (const tok of text.match(/[\w$./-]+/g) ?? []) {
+      if (out.length >= 2) break;
+      let pick: { path: string; line: number } | null = null;
+      const t = tok.replace(/^\.\//, '').replace(/[.,:;]+$/, '');
+      if (/\.\w{1,5}$/.test(t) && /[a-z]/i.test(t)) {
+        const m = ix.has(t) ? [t] : all.filter((f) => f.endsWith('/' + t) || f === t);
+        if (m.length === 1) pick = { path: m[0], line: 1 };
+      } else if (/^[A-Za-z_$][\w$]{3,}$/.test(t) && /[a-z][A-Z]|[a-z]_[a-z]|^[A-Z][a-z]+[A-Z]/.test(t)) {
+        const d = ix.exact(t);
+        if (d.length && d.length <= 2) pick = { path: d[0].path, line: Math.max(1, d[0].line - 3) };
+      }
+      if (!pick || seen.has(pick.path)) continue;
+      seen.add(pick.path);
+      const r = readTool(cwd, { path: path.join(project, pick.path), offset: pick.line, limit: pick.line === 1 ? 80 : 60 } as { path: string });
+      if (r.error) continue;
+      out.push({ label: pick.line === 1 ? pick.path : `${pick.path}:${pick.line}`, block: { type: 'text', text: `[Rime: from the code index, likely relevant: ${pick.path}]\n${r.content}` } });
+    }
+    return out;
   }
 
   // ---- diff-undo (Phase 8) ----
@@ -1562,7 +1614,7 @@ export async function runApp(cfg: Config, version: string) {
       else if (e.type === 'ran') {
         const input = (e.use.input ?? {}) as Record<string, any>, r = e.result;
         const file = rel(cwd, path.resolve(cwd, String(input.path ?? '')));
-        if ((e.use.name === 'write' || e.use.name === 'edit') && !r.error) did.wrote.push(file);
+        if ((e.use.name === 'write' || e.use.name === 'edit') && !r.error) did.wrote.push(file), index?.put(rel(project, path.resolve(cwd, String(input.path ?? ''))));
         if (e.use.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error, out: r.output });
         if (e.use.name === 'read' && !r.error) (did.about ??= []).push(file);
         for (const x of toolEvents(String(e.use.name), input, r, file)) event(x.kind, x.text, x.ref);
@@ -1722,6 +1774,12 @@ export async function runApp(cfg: Config, version: string) {
     if (name === 'write') return writeTool(cwd, input as { path: string; content: string });
     if (name === 'edit') return editTool(cwd, input as { path: string; old: string; new: string });
     if (name === 'bash') return bashTool(cwd, input as { command: string }, signal, as);
+    if (name === 'search') {
+      if (!index) return { content: 'The code index is still being built; use bash with rg or grep for now.', error: true, summary: 'index not ready' };
+      const hits = index.search(String(input.query ?? ''), Math.min(20, Math.max(1, Number(input.limit) || 20)));
+      const content = hits.map((h) => `${h.path}:${h.line}: ${h.symbol ? `[${h.symbol}] ` : ''}${h.text.slice(0, 160)}`).join('\n');
+      return { content: content || 'No matches.', summary: `${hits.length} match${hits.length === 1 ? '' : 'es'}`, output: content ? content.split('\n') : [] };
+    }
     if (name === 'rime') {
       return Promise.resolve(rimeTool(String(input.action ?? ''), (input.args ?? {}) as Record<string, any>, C, signal)).then((text) => ({ content: text, summary: text.split('\n')[0] }));
     }
@@ -2805,7 +2863,10 @@ export async function runApp(cfg: Config, version: string) {
       return;
     }
     if (id === 'sendlist') return void ((listPinned = !listPinned), (listOpen = listPinned));
-    if (id.startsWith('at:')) return takeAt(atMatches()[+id.slice(3)].f);
+    if (id.startsWith('at:')) {
+      const x = atMatches()[+id.slice(3)];
+      return x && takeAt(x.f, x.lines);
+    }
     if (id.startsWith('arg:')) return void ((sel = +id.slice(4)), onKey({ type: 'key', name: 'enter' }));
     if (panel && (id.startsWith('pick:') || id.startsWith('step:'))) return panel.click?.(id);
     if (id.startsWith('cmd:')) {
@@ -2916,7 +2977,7 @@ export async function runApp(cfg: Config, version: string) {
     if (!panel && atPick && atQuery() !== null) {
       const m = atMatches();
       if (k.name === 'up' || k.name === 'down') return void (atPick.sel = (atPick.sel + (k.name === 'up' ? m.length - 1 : 1)) % Math.max(1, m.length));
-      if ((k.name === 'tab' || (k.name === 'enter' && !k.shift)) && m.length) return takeAt(m[atPick.sel % m.length].f);
+      if ((k.name === 'tab' || (k.name === 'enter' && !k.shift)) && m.length) return takeAt(m[atPick.sel % m.length].f, m[atPick.sel % m.length].lines);
       if (k.name === 'escape') return void (atPick = null);
     }
     // `/model ` lists models; ↑ ↓ choose one.
@@ -3304,6 +3365,18 @@ export async function runApp(cfg: Config, version: string) {
   }
   askTrust();
   example = exampleFor(project);
+  // The code index opens in the background (a first build yields often, so the
+  // screen stays live); then new conversations get the repo map in their frozen
+  // prompt, including this one if nothing was sent yet.
+  void openIndex(project)
+    .then(async (ix) => {
+      await ix.refresh(ix.files().length ? Infinity : 200);
+      index = ix;
+      SYSTEM = system(cwd, agentsMd(projectOf(cwd)), ix.map());
+      if (!S.convId && !S.messages.length) S.system = SYSTEM;
+      schedule();
+    })
+    .catch(() => {});
   if (!connected()) panel = createSetup(host);
   else if (cfg.model) useRef(cfg.model, true);
   frame();

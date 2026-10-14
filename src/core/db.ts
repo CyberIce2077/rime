@@ -62,7 +62,7 @@ const alive = (pid: number | null) => {
 
 // node:sqlite still prints an ExperimentalWarning when it loads; Rime owns the
 // screen, so it's loaded quietly and only when needed.
-async function sqlite() {
+export async function sqlite() {
   const emit = process.emitWarning;
   process.emitWarning = ((w: string | Error, ...rest: unknown[]) => {
     if (!String(w).includes('SQLite')) (emit as (...a: unknown[]) => void).call(process, w, ...rest);

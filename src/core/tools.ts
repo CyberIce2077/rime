@@ -19,6 +19,11 @@ export const TOOLS: ToolDef[] = [
     input_schema: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', description: 'first line, 1-based' }, limit: { type: 'integer' }, summary: { type: 'boolean' } }, required: ['path'] },
   },
   {
+    name: 'search',
+    description: "Search the project's code by words or a name. Returns up to 20 ranked path:line matches with the line (declarations first). Cheaper than grep.",
+    input_schema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'integer' } }, required: ['query'] },
+  },
+  {
     name: 'write',
     description: 'Create a file, or replace one, with this content. Makes folders as needed.',
     input_schema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] },
