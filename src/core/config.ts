@@ -72,7 +72,7 @@ export function rimeDir(root: string, ...sub: string[]) {
   const base = path.join(root, '.rime'), dir = path.join(base, ...sub);
   fs.mkdirSync(dir, { recursive: true });
   const ignore = path.join(base, '.gitignore');
-  if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '*\n!.gitignore\n!permissions.json\n');
+  if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '*\n!permissions.json\n');
   return dir;
 }
 
