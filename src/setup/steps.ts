@@ -6,7 +6,7 @@
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import type { Step } from '../core/config.ts';
-import { TOOLS } from '../core/tools.ts';
+import { TOOLS, type ToolDef } from '../core/tools.ts';
 import { call } from '../providers/http.ts';
 import * as llama from '../providers/llamacpp.ts';
 import type { Controls, Model } from '../providers/types.ts';
@@ -71,6 +71,7 @@ type Opts = {
   edited?: Partial<Record<Step, string>>;
   skip?: Step[];
   system: string; // the frozen system prompt, to warm the cache with
+  tools?: ToolDef[]; // and the conversation's tools (the core ones by default)
   model?: Model;
   controls: Controls;
   tunnel: { child: ChildProcess | null; port: number };
@@ -229,7 +230,7 @@ export function runSteps(s: Server, o: Opts): Run {
       // sends the frozen system prompt so the next real request reuses it.
       const r = await call(`${base()}/v1/chat/completions`, {
         // The same tools and system prompt as the chat, so its first message hits this cache.
-        body: { model: s.model, messages: [{ role: 'system', content: o.system }, { role: 'user', content: 'hi' }], tools: TOOLS.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } })), max_tokens: 1, id_slot: 0, cache_prompt: true },
+        body: { model: s.model, messages: [{ role: 'system', content: o.system }, { role: 'user', content: 'hi' }], tools: (o.tools ?? TOOLS).map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } })), max_tokens: 1, id_slot: 0, cache_prompt: true },
         timeout: 300000,
         signal,
       });

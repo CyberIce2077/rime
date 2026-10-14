@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
 import { type Decision, MODE_HELP, MODES, type Mode, addProjectRule, decide, projectRules, removeProjectRule, ruleList, rulesHash, trustedProjectRules } from './permissions.ts';
-import { type RunAs, type ToolResult, TOOLS, bash as bashTool, commandEnv, sandboxed, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
+import { type RunAs, type ToolDef, type ToolResult, TOOLS, bash as bashTool, commandEnv, sandboxed, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
 import { type AgentEvent, type TurnHost, result, runTools, runTurn } from './agent.ts';
 import { WHEN, createSettings, phrase } from './settings.ts';
 import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
@@ -23,7 +23,7 @@ import { parse as parseQuery, rank, suggestions } from './rank.ts';
 import { type Config, rimeDir, saveConfig } from './config.ts';
 import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } from './header.ts';
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
-import { colorMode } from './theme.ts';
+import { colorMode, sgr } from './theme.ts';
 import { previewBox, sendLine, sendList } from './preview.ts';
 import { type BoxRow, type Hint, type Hit, type Item, box, caretOf, footRows, hintLines, layoutInput, listRow, offsetAt, prompt, renderItem, spaced, splitToolCalls, status, str, styles } from './view.ts';
 import { type Turn, addTurns, createMeter, fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
@@ -33,6 +33,7 @@ import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor }
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
 import { createSide } from '../plugins/shell-panel/panel.ts';
+import { BROWSER_TOOL, type BrowserSession, chrome as hasChrome, install as installBrowser, installed as browserInstalled, openBrowser } from '../plugins/browser/browser.ts';
 import { compare as compareVersions, install as installVersion, latest as latestVersion, newest as newestVersion } from '../plugins/updater/update.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
 import { recheck } from '../providers/probe.ts';
@@ -54,6 +55,7 @@ const CMDS: [string, string][] = [
   ['/conversations', 'search, open, fork or delete your conversations'],
   ['/compact', 'summarise the earlier conversation to free context'],
   ['/diff', 'what the last change did, file by file'],
+  ['/browser', 'your web app in a tab: /browser <url>'],
   ['/undo', 'put the files back as they were before the last change'],
   ['/usage', 'token, cost and savings breakdown'],
   ['/update', 'install the newest Rime and restart into it'],
@@ -105,7 +107,8 @@ const CLICK_KEYS: Record<string, Key> = {
 // Frozen for the whole session: any byte change here would break the prompt cache.
 // The tools sit before the system prompt in the cached prefix; a stored prefix is
 // reused only with the same tools.
-const TOOLS_HASH = createHash('sha256').update(JSON.stringify(TOOLS)).digest('hex').slice(0, 16);
+// A tool list's fingerprint: a conversation's stored prefix is reused only with the same tools.
+const hashOf = (tools: ToolDef[]) => createHash('sha256').update(JSON.stringify(tools)).digest('hex').slice(0, 16);
 
 // The only project file it includes is AGENTS.md, read once at the start.
 const system = (cwd: string, agents = '', map = '') =>
@@ -162,6 +165,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let browsing: { list: string[]; i: number; draft: string; edited?: boolean } | null = null;
   let navigated = false;
   const cwd = process.cwd();
+  // The tools a new conversation freezes: the core ones, plus enabled plug-ins'.
+  const toolsNow = (): ToolDef[] => (cfg.plugins?.browser ? [...TOOLS, BROWSER_TOOL] : TOOLS);
   let SYSTEM = system(cwd, agentsMd(projectOf(cwd))); // the prefix for new conversations (the repo map joins once the index is ready)
 
   // ---- state ----
@@ -232,7 +237,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // Helpers bound to one conversation. Work that's running uses its own set, so it
   // keeps writing to its conversation after you switch to another one.
   function bound(x: Session) {
-    const conversation = () => (x.convId ??= save((d) => d.create(project, x.system, model?.ref, TOOLS_HASH)) ?? null);
+    const conversation = () => (x.convId ??= save((d) => d.create(project, x.system, model?.ref, hashOf(x.tools))) ?? null);
     return {
       conversation,
       // An Anthropic effort-only system message is kept as one output_config block.
@@ -324,10 +329,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     tell: string[]; // notes for the model, sent with the next message (an /undo)
     costItem: Item | null; // this turn's ↳ line, kept last as its requests add up
     system: string; // its frozen system prompt: the stored one when reopened while the cache is warm
+    tools: ToolDef[]; // its frozen tool list: the core tools, plus plug-ins' (browser) on when it started
   };
   const newSession = (): Session => ({
     convId: null, messages: [], items: [headerItem], task: null, busy: null, waiting: null, live: null, lastUserSeq: 0,
-    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, tell: [], costItem: null, system: SYSTEM,
+    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, tell: [], costItem: null, system: SYSTEM, tools: toolsNow(),
   });
   let S = newSession();
   const sessions: Session[] = [S]; // open in this window; the ones not on screen keep working
@@ -823,7 +829,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const v = side.render(full, height, true, false);
       hits = v.hits;
       rows = v.lines;
-      return paint(rows.map((l) => [l, '']), full, '\x1b[?25l');
+      paint(rows.map((l) => [l, '']), full, '\x1b[?25l');
+      return images(side.overlay(1));
     }
     const width = L.cw;
     const { lines, gears, pins } = transcript(width);
@@ -880,7 +887,18 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       rows = rows.map((r, i) => `${r}${st.reset}${' '.repeat(Math.max(0, width - strWidth(stripAnsi(r))))}${v.lines[i] ?? ''}`);
       hits.push(...v.hits.map((h) => ({ ...h, x0: h.x0 + width, x1: h.x1 + width })));
     }
-    paint(rows.map((l, i) => [l, marks[i]]), full, sideFocus ? '\x1b[?25l' : `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h`);
+    const cursor = sideFocus ? '\x1b[?25l' : `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h`;
+    paint(rows.map((l, i) => [l, marks[i]]), full, cursor);
+    images(L.px ? side.overlay(L.px) : null, cursor);
+  }
+
+  // A plug-in tab's picture (Kitty, iTerm2), drawn over its cells after the text;
+  // when it stops showing, Kitty is told to drop it.
+  let imaged = false;
+  function images(seq: string | null, cursor = '') {
+    if (seq) write(`\x1b[?25l${seq}${cursor}`);
+    else if (seq === null && imaged) write(side.hideImages());
+    imaged = seq !== null;
   }
 
   // Writes only the rows that changed since the last frame, each overwritten in
@@ -1001,6 +1019,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         edited: p.steps,
         skip: [...(p.skip ?? []), 'test'], // the test reply belongs to /setup
         system: S.system,
+        tools: S.tools,
         model: model?.provider === name ? model : undefined,
         controls,
         tunnel: tunnel(name),
@@ -1267,7 +1286,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       said = (await runTurn(h, ac.signal, userSeq)).said;
     } finally {
       if (C.busy === me) C.busy = null;
-      C.nextStep = nextFor(said, did, project);
+      C.nextStep = did.dev ? `/browser ${did.dev}` : nextFor(said, did, project);
       offerChoices(said, C);
       if (C === S) askTrust(); // the rules file changed during the reply
       if (upd.state === 'ready' && upd.folded && C === S) offerRestart();
@@ -1492,6 +1511,62 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     schedule();
   }
 
+  // ---- browser plug-in (Phase 11) ----
+  // One browser per window, in a split-view tab; it starts with the first /browser
+  // or the first browser tool call, and closes with its tab or with Rime.
+  let browser: BrowserSession | null = null;
+  let opening: Promise<BrowserSession> | null = null;
+  function browserNow() {
+    if (browser) return Promise.resolve(browser);
+    opening ??= openBrowser({ st, color: (rgb, bg) => sgr(rgb, bg, st.mode), redraw: () => schedule(), onClose: () => (browser = null), log: (l) => note(l, 'dim') })
+      .then((b) => {
+        browser = b;
+        side.custom(b.tab, true); // you'll want to watch it, so it's the tab showing
+        return b;
+      })
+      .finally(() => (opening = null));
+    return opening;
+  }
+  // /browser [url]: turns the plug-in on the first time (Playwright into
+  // ~/.rime/plugins/browser; your Chrome, or Chromium), then opens the tab.
+  function browserCmd(url?: string) {
+    const go = async () => {
+      try {
+        const b = await browserNow();
+        if (url) note((await b.act({ action: 'open', url })).split('.')[0], 'dim');
+      } catch (e) {
+        note(`The browser didn't start: ${(e as Error).message.split('\n')[0]}`);
+      }
+    };
+    if (cfg.plugins?.browser && browserInstalled()) return void go();
+    const chromeHere = hasChrome();
+    S.question = {
+      q: 'Turn on the browser plug-in? It opens your web app in a tab here, and the model can click through it. Playwright goes into ~/.rime/plugins/browser, not into your project.',
+      options: [
+        ...(chromeHere ? [{ label: 'Use my Chrome', detail: 'downloads Playwright only (~10 MB)' }] : []),
+        { label: 'Download Chromium', detail: '~150 MB, once' },
+        { label: 'Not now', detail: 'nothing is installed' },
+      ],
+      sel: 0, tool: false,
+      done: (a) => {
+        S.question = null;
+        if (!a || a === 'Not now') return schedule();
+        const row: Extract<Item, { kind: 'lines' }> = { kind: 'lines', lines: [[{ t: '  ⟳ ', s: st.accent }, { t: 'setting up the browser plug-in…', s: st.dim }]] };
+        S.items.push(row);
+        const show = (t: string) => ((row.lines = [[{ t: '  ⟳ ', s: st.accent }, { t, s: st.dim }]]), cache.delete(row), schedule());
+        void installBrowser(a === 'Use my Chrome', (step) => show(`${step}…`)).then((r) => {
+          if (!r.ok) return show(`couldn't set up the browser: ${r.error}`);
+          cfg.plugins = { ...cfg.plugins, browser: true };
+          settings.save();
+          show('browser plug-in on · the browser tool joins your next conversation (/clear starts one)');
+          void go();
+        });
+        schedule();
+      },
+    };
+    schedule();
+  }
+
   // ---- code-index (Phase 5) ----
 
   // Names in the prompt that the index knows: a file path (or a unique file name),
@@ -1613,7 +1688,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // open conversation's slot goes to a file on its disk; after the next start the
   // one on screen is restored, so it doesn't rebuild a long context. The file is
   // named by conversation and prefix, so a changed prompt never restores old state.
-  const slotFile = (C: Session) => `rime-${C.convId}-${createHash('sha256').update(TOOLS_HASH + C.system).digest('hex').slice(0, 8)}.bin`;
+  const slotFile = (C: Session) => `rime-${C.convId}-${createHash('sha256').update(hashOf(C.tools) + C.system).digest('hex').slice(0, 8)}.bin`;
   const cached = (name: string) => sessions.filter((x) => x.convId && x.messages.length && model?.provider === name);
   const routerModel = (name: string) => (cfg.providers[name]?.router ? (model?.provider === name ? model.id : cfg.providers[name].model) : undefined);
   async function saveCache(name: string) {
@@ -1782,6 +1857,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         const file = rel(cwd, path.resolve(cwd, String(input.path ?? '')));
         if ((e.use.name === 'write' || e.use.name === 'edit') && !r.error) did.wrote.push(file), index?.put(rel(project, path.resolve(cwd, String(input.path ?? ''))));
         if (e.use.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error, out: r.output });
+        // A dev server's address in a command's output: the next step offers it in the browser tab.
+        if (e.use.name === 'bash') did.dev = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d+[^\s'")]*/.exec(r.output?.join('\n') ?? r.content)?.[0] ?? did.dev;
         if (e.use.name === 'read' && !r.error) (did.about ??= []).push(file);
         for (const x of toolEvents(String(e.use.name), input, r, file)) event(x.kind, x.text, x.ref);
         // What it did, short: the diff of an edit, the end of a command's output.
@@ -1795,7 +1872,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     };
     return {
       messages: C.messages,
-      stream: (signal) => streamFor(cn)({ conn: cn, model: m, system: C.system, tools: TOOLS, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal, slot: cn.llamacpp ? slotOf(C, cn.name) : undefined }),
+      stream: (signal) => streamFor(cn)({ conn: cn, model: m, system: C.system, tools: C.tools, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal, slot: cn.llamacpp ? slotOf(C, cn.name) : undefined }),
       store: {
         append: (role, content, interrupted) => save((d) => d.append(bound(C).conversation()!, role, content, interrupted)) ?? 0,
         update: (seq, content, interrupted) => void save((d) => d.update(C.convId!, seq, content, interrupted)),
@@ -1826,7 +1903,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
           const edits = u.name === 'write' || u.name === 'edit';
           if (edits || d.rule) {
             for (const r of edits ? ['edit(**)'] : (d.rules ?? [d.rule!])) addConvRule('allow', r);
-            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${edits ? 'edits' : `${d.label} commands`} in this conversation · /permissions`, s: st.dim }]] });
+            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${edits ? 'edits' : u.name === 'browser' ? `pages on ${d.label}` : `${d.label} commands`} in this conversation · /permissions`, s: st.dim }]] });
           }
         }
         return 'yes';
@@ -1927,8 +2004,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   };
   const describe = (u: Block) => {
     const i = (u.input ?? {}) as Record<string, any>;
-    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime', ask: 'Asked' }[String(u.name)] ?? String(u.name);
-    const rest = u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'ask' ? String(i.question ?? '') : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
+    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime', ask: 'Asked', search: 'Search', browser: 'Browser' }[String(u.name)] ?? String(u.name);
+    const rest = u.name === 'browser' ? [i.action, i.url ?? (i.ref ? `[ref=${i.ref}]` : ''), i.text ? `"${i.text}"` : ''].filter(Boolean).join(' ') : u.name === 'search' ? String(i.query ?? '') : u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'ask' ? String(i.question ?? '') : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
     return { verb, rest };
   };
   const toolLine = (u: Block): Item => ({ kind: 'tool', ...describe(u) });
@@ -1940,6 +2017,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (name === 'write') return writeTool(cwd, input as { path: string; content: string });
     if (name === 'edit') return editTool(cwd, input as { path: string; old: string; new: string });
     if (name === 'bash') return bashTool(cwd, input as { command: string }, signal, as);
+    if (name === 'browser') {
+      if (!cfg.plugins?.browser || !browserInstalled()) return { content: 'The browser plug-in is off; the user turns it on with /browser.', error: true, summary: 'browser off' };
+      return browserNow()
+        .then((b) => b.act(input))
+        .then((text) => ({ content: text, summary: text.split('\n')[0].slice(0, 80) }))
+        .catch((e) => ({ content: (e as Error).message.split('\n').slice(0, 3).join('\n'), error: true, summary: (e as Error).message.split('\n')[0].slice(0, 80) }));
+    }
     if (name === 'search') {
       if (!index) return { content: 'The code index is still being built; use bash with rg or grep for now.', error: true, summary: 'index not ready' };
       const hits = index.search(String(input.query ?? ''), Math.min(20, Math.max(1, Number(input.limit) || 20)));
@@ -2208,7 +2292,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // Which of the three answers this question offers (0 yes, 1 don't ask again, 2 no).
   function approvalOptions() {
     const a = S.approval!;
-    const again = a.use.name === 'bash' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/always asks/.test(a.decision.why);
+    const again = a.use.name === 'bash' || a.use.name === 'browser' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/always asks/.test(a.decision.why);
     return again ? [0, 1, 2] : [0, 2];
   }
   // `o`: the option (0 yes, 1 don't ask again, 2 no). On screen they're numbered
@@ -2229,13 +2313,14 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const i = (u.input ?? {}) as Record<string, any>;
     const dim = (t: string) => ({ t, s: st.dim });
     const rows: BoxRow[] = [];
-    const title = u.name === 'bash' ? 'run a command?' : u.name === 'write' ? (fs.existsSync(path.resolve(cwd, String(i.path))) ? 'replace a file?' : 'create a file?') : u.name === 'edit' ? 'edit a file?' : 'read a file?';
+    const title = u.name === 'browser' ? 'open a web page?' : u.name === 'bash' ? 'run a command?' : u.name === 'write' ? (fs.existsSync(path.resolve(cwd, String(i.path))) ? 'replace a file?' : 'create a file?') : u.name === 'edit' ? 'edit a file?' : 'read a file?';
     if (u.name === 'bash') {
       for (const l of String(i.command ?? '').split('\n').slice(0, 6)) rows.push({ line: [{ t: '$ ', s: st.dim }, { t: l, s: st.titleB }], bg: st.panelBg });
       rows.push({ line: [dim(`in ${tildify(cwd)}`), ...(i.reason ? [dim(' · '), { t: 'Rime: ', s: st.fg }, dim(String(i.reason))] : [])] });
       if (d.parts && d.parts.length > 1)
         rows.push({ line: d.parts.flatMap((p, j) => [...(j ? [dim(' · ')] : []), { t: `${p.state === 'ok' ? '✓' : p.state === 'guard' ? '✗' : '?'} ${p.text}`, s: p.state === 'ok' ? st.ok : p.state === 'guard' ? st.del : st.warn }, ...(p.why ? [dim(` ${p.why}`)] : [])]) });
-    } else {
+    } else if (u.name === 'browser') rows.push({ line: [{ t: String(i.url ?? ''), s: st.titleB }], bg: st.panelBg });
+    else {
       rows.push({ line: [{ t: rel(cwd, path.resolve(cwd, String(i.path ?? ''))), s: st.titleB }] });
       for (const x of diff ?? []) rows.push({ line: [{ t: x.n ? `${String(x.n).padStart(4)} ` : '     ', s: st.dim }, { t: x.sign === ' ' ? x.text : `${x.sign} ${x.text}`, s: x.sign === '+' ? st.ok : x.sign === '-' ? st.del : st.dim }] });
     }
@@ -2243,7 +2328,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     rows.push({ line: [] });
     const labels = [
       'Yes',
-      u.name === 'bash' ? `Yes, and don't ask again for ${d.label} commands in this conversation` : 'Yes, and allow edits for the rest of this conversation',
+      u.name === 'browser' ? `Yes, and don't ask again for ${d.label} in this conversation` : u.name === 'bash' ? `Yes, and don't ask again for ${d.label} commands in this conversation` : 'Yes, and allow edits for the rest of this conversation',
       'No, and tell Rime what to do instead (esc)',
     ];
     const opts = approvalOptions();
@@ -2936,6 +3021,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     } else if (c === '/settings') panel = createSettingsPanel(host);
     else if (c === '/permissions') panel = createPermissions();
     else if (c === '/conversations') openList();
+    else if (c === '/browser') browserCmd(args[0]);
     else if (c === '/clear') {
       newConversation();
       if (later) host.choose(later);
@@ -3396,7 +3482,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const Lo = layout();
       const overSide = Lo.full || (Lo.px > 0 && ev.x >= Lo.px);
       if (overSide && (ev.button === 64 || ev.button === 65)) return side.wheel(ev.button === 64 ? -3 : 3), schedule();
-      if (ev.button === 0 && !ev.release && side.visible && !panel) sideFocus = overSide;
+      if (ev.button === 0 && !ev.release && side.visible && !panel) {
+        sideFocus = overSide;
+        if (overSide) side.press(ev.x - (Lo.full ? 0 : Lo.px - 1), ev.y);
+      }
       const onPrompt = !panel?.masked?.() && promptOffset(ev.x, ev.y) !== null;
       if (ev.button === 64 || ev.button === 65 || ev.button === 96 || ev.button === 97) {
         // The wheel scrolls; a transcript selection stays on its text (and grows
@@ -3546,8 +3635,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     C.mark = save((d) => d.timeline(c.id).filter((e) => e.kind === 'model').at(-1)?.text) ?? '';
     // The stored prefix is reused when it's recent and was sent with today's tools.
-    if (c.prefix && c.prefix_hash === TOOLS_HASH && Date.now() - c.updated < 86400000) C.system = c.prefix;
-    else save((d) => d.setPrefix(c.id, C.system, TOOLS_HASH));
+    if (c.prefix && c.prefix_hash === hashOf(C.tools) && Date.now() - c.updated < 86400000) C.system = c.prefix;
+    else save((d) => d.setPrefix(c.id, C.system, hashOf(C.tools)));
     const stored: Stored[] = save((d) => d.messages(c.id)) ?? [];
     for (const m of stored) {
       const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;

@@ -17,7 +17,18 @@ export type ShellTab = Base & { kind: 'shell'; cmd: string; out: string[]; state
 export type TextTab = Base & { kind: 'diff' | 'file'; lines: Line[]; scroll: number; path?: string; mark?: number };
 export type FilesTab = Base & { kind: 'files'; open: Set<string>; sel: number; filter: string; filtering: boolean; scroll: number };
 // A plug-in's tab (browser, design): it draws itself and takes its keys.
-export type CustomTab = Base & { kind: 'custom'; render(width: number, height: number): Line[]; key?(k: Key): boolean; foot(): Hint[]; close?(): void; busy?(): boolean; click?(x: number, y: number): void };
+export type CustomTab = Base & {
+  kind: 'custom';
+  render(width: number, height: number): Line[];
+  key?(k: Key): boolean;
+  foot(): Hint[];
+  close?(): void;
+  busy?(): boolean;
+  click?(x: number, y: number): void; // 0-based cells in its content
+  wheel?(d: number): void;
+  overlay?(col: number, row: number, width: number, height: number): string | null; // an image drawn after the text (Kitty, iTerm2): null when there's none, '' when it's already up
+  hide?(): string; // takes the image away when the tab stops showing
+};
 export type Tab = ShellTab | TextTab | FilesTab | CustomTab;
 
 export type SideHost = { root: string; st: Styles; redraw(): void; files(): string[]; env(): NodeJS.ProcessEnv; open(path: string, line?: number): void };
@@ -32,6 +43,8 @@ export function createSide(h: SideHost) {
   let visible = false;
   let ratio = 0.45; // the panel's share of the width
   let asking: number | null = null; // closing a running tab: "ctrl-w q again stops it"
+  let lead = 2; // columns before the content: the border and a space (1 without the border)
+  let shown = { w: 0, rows: 0 }; // the content area of the last frame
 
   const add = <T extends Tab>(t: T, focus = true): T => {
     tabs.push(t);
@@ -185,7 +198,7 @@ export function createSide(h: SideHost) {
     const hits: { row: number; x0: number; x1: number; id: string }[] = [];
     const b: Line = border ? [{ t: '│', s: focused ? st.accent : st.line }] : [];
     const w = width - lineWidth(b) - 1; // a space after the border
-    const lead = lineWidth(b) + 1;
+    lead = lineWidth(b) + 1;
     // The tab bar, scrolled so the active tab shows.
     const parts = tabs.map((t, i) => {
       const flash = t.flash && t.flash > Date.now();
@@ -203,6 +216,7 @@ export function createSide(h: SideHost) {
     const t = cur();
     const fh = hintLines(foot(t), w, st);
     const rows = Math.max(1, height - 2 - (fh.lines.length + 1));
+    shown = { w, rows };
     const content = t ? body(t, w, rows) : [[{ t: 'No tabs. ctrl-t opens a shell; ask Rime to open the files or the diff.', s: st.dim }] as Line];
     const lines: Line[] = [bar, [{ t: '─'.repeat(w), s: st.line }], ...content.slice(0, rows), ...new Array(Math.max(0, rows - content.length)).fill([]), [{ t: '─'.repeat(w), s: st.line }], ...fh.lines];
     fh.segs.forEach((segs, i) => hits.push(...segs.map((s) => ({ row: 2 + rows + 2 + i, x0: s.x0 + lead, x1: s.x1 + lead, id: s.id }))));
@@ -398,8 +412,25 @@ export function createSide(h: SideHost) {
       if (t.kind === 'shell') t.scroll = Math.max(0, Math.min(t.out.length, t.scroll - d));
       else if (t.kind === 'files') t.sel = Math.max(0, t.sel + d);
       else if (t.kind !== 'custom') t.scroll = Math.max(0, t.scroll + d);
+      else t.wheel?.(d);
       h.redraw();
     },
+    // A press inside the panel (1-based, relative to its first column): a plug-in
+    // tab gets it in its own cells.
+    press(x: number, y: number) {
+      const t = cur();
+      if (t?.kind !== 'custom' || y < 3) return;
+      t.click?.(x - lead - 1, y - 3);
+      h.redraw();
+    },
+    // What a plug-in tab draws over its cells after a frame (images), with where
+    // its content starts on screen.
+    overlay(col: number) {
+      const t = cur();
+      if (!visible || t?.kind !== 'custom' || !t.overlay) return null;
+      return t.overlay(col + lead, 3, shown.w, shown.rows);
+    },
+    hideImages: () => tabs.map((t) => (t.kind === 'custom' ? (t.hide?.() ?? '') : '')).join(''),
     running: () => tabs.filter((t) => t.kind === 'shell' && t.state === 'running').length,
     killAll: () => tabs.forEach((t) => (t.kind === 'shell' ? stop(t) : t.kind === 'custom' ? t.close?.() : null)),
     key,
