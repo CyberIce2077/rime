@@ -13,7 +13,7 @@ import { startMock } from './fixtures/mock-llama.ts';
 
 // A host with no screen: an in-memory store, the real permissions and tools in a
 // temp project, and scripted answers to approvals and questions.
-async function harness(o: { approve?: Approval; answer?: string | null; mode?: string; context?: { used: number; size: number } } = {}) {
+async function harness(o: { approve?: Approval; answer?: string | null; mode?: string; full?: boolean } = {}) {
   const mock = await startMock();
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'rime-agent-'));
   const conn = connOf('gpubox', { preset: 'llamacpp' }, `${mock.url}/v1`);
@@ -39,7 +39,7 @@ async function harness(o: { approve?: Approval; answer?: string | null; mode?: s
       return u.name === 'write' ? write(project, i as any) : u.name === 'read' ? read(project, i as any) : bash(project, i as any);
     },
     optionsOf,
-    context: () => o.context ?? null,
+    afterRound: async () => !o.full,
     setLastUser: (s) => void (lastUser = s),
   };
   const say = async (text: string, signal = new AbortController().signal) => {
@@ -152,11 +152,10 @@ test('agent: a failed request takes the message back', async () => {
   assert.equal([...t.rows.values()].length, 0);
 });
 
-test('agent: a nearly full context stops before the next step', async () => {
-  const t = await harness({ context: { used: 95, size: 100 } });
+test("agent: when the host can't make room, the turn stops before the next step", async () => {
+  const t = await harness({ full: true });
   try {
     const r = await t.say('make a page');
-    assert.ok(t.events.some((e) => e.type === 'full'));
     assert.equal(r.said, '', 'stopped after the tool results, before the next reply');
     assert.equal(t.messages.at(-1)!.role, 'user');
   } finally {

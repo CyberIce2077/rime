@@ -70,6 +70,10 @@ export async function routerModels(root: string): Promise<ServerModel[] | null> 
 
 export const loadModel = (root: string, model: string, signal?: AbortSignal) => call(`${root}/models/load`, { body: { model }, timeout: 15000, signal, headers: auth(root) });
 export const unloadModel = (root: string, model: string) => call(`${root}/models/unload`, { body: { model }, timeout: 15000, headers: auth(root) });
+// Saved slots (providers.md §6.2): a slot's cache to a file on the server's disk
+// and back (needs --slot-save-path). Router mode names the model (verify).
+export const slotAction = (root: string, id: number, action: 'save' | 'restore', filename: string, model?: string) =>
+  call(`${root}/slots/${id}?action=${action}${model ? `&model=${encodeURIComponent(model)}` : ''}`, { body: { filename }, timeout: 180000, headers: auth(root) });
 export const slots = (root: string) => call(`${root}/slots`, { timeout: 2000, headers: auth(root) });
 
 // Waits until `model` is loaded, reporting 0..1 progress from /models/sse

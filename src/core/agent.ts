@@ -23,7 +23,6 @@ export type AgentEvent =
   | { type: 'run'; use: Block; decision: Decision } // about to run
   | { type: 'ran'; use: Block; decision: Decision; result: ToolResult }
   | { type: 'held'; uses: Block[] } // a question in text, then tool calls: they wait
-  | { type: 'full'; used: number; size: number } // the context is 90% full
   | { type: 'end' }; // the streamed reply is over (ok or not)
 
 export type Approval = 'yes' | 'stop' | { declined: string };
@@ -44,7 +43,7 @@ export type TurnHost = {
   run(use: Block, d: Decision, signal: AbortSignal): Promise<ToolResult>;
   optionsOf(raw: unknown): { label: string; detail?: string }[];
   queued?(): Promise<Block[]>; // messages you sent while it worked
-  context?(): { used: number; size: number } | null; // after each round of tools
+  afterRound?(signal: AbortSignal): Promise<boolean>; // after each round of tool results: make room (token-kit); false stops the turn
   planNote?(): string; // added to a refusal in plan mode
   setLive?(live: { seq: number; text: () => string } | null): void; // the reply being streamed, for quitting mid-reply
   setLastUser?(seq: number): void; // the stored user message new words join
@@ -218,13 +217,9 @@ export async function runTurn(h: TurnHost, signal: AbortSignal, userSeq = 0, max
     h.messages.push({ role: 'user', content: [...results, ...(signal.aborted || !h.queued ? [] : await h.queued())] });
     h.setLastUser?.(h.store.append('user', h.messages.at(-1)!.content as Block[], false));
     if (signal.aborted) break;
-    // No compaction yet (Phase 6): stop before the context overflows, with the
-    // tool results saved so "continue" picks up from here.
-    const ctx = h.context?.();
-    if (ctx && ctx.used > ctx.size * 0.9) {
-      h.emit({ type: 'full', ...ctx });
-      break;
-    }
+    // The context filling up: the host clears or compacts, or stops with the tool
+    // results saved so "continue" picks up from here.
+    if (h.afterRound && !(await h.afterRound(signal))) break;
   }
   return { said };
 }

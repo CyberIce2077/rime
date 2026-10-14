@@ -4,10 +4,10 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 // xmlTools: answer tool calls as Qwen's text form, like a server without a tool template.
-export type MockOpts = { started?: boolean; loaded?: boolean; busy?: boolean; unsafeTemplate?: boolean; key?: string; xmlTools?: boolean; guardAll?: boolean; single?: boolean };
+export type MockOpts = { started?: boolean; loaded?: boolean; busy?: boolean; unsafeTemplate?: boolean; key?: string; xmlTools?: boolean; guardAll?: boolean; single?: boolean; noSave?: boolean };
 
 export async function startMock(o: MockOpts = {}) {
-  const state = { started: o.started ?? true, loaded: o.loaded ?? true, busy: !!o.busy, requests: [] as { path: string; body: any }[], controls: [] as any[] };
+  const state = { saved: new Set<string>(), started: o.started ?? true, loaded: o.loaded ?? true, busy: !!o.busy, requests: [] as { path: string; body: any }[], controls: [] as any[] };
   const MODEL = 'qwen3.8-27b';
   const send = (res: http.ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { 'content-type': 'application/json' });
@@ -40,6 +40,14 @@ export async function startMock(o: MockOpts = {}) {
         await new Promise((r) => setTimeout(r, 40));
       }
       return res.end();
+    }
+    // Saved slots: files by name, like --slot-save-path (o.noSave: a server without it).
+    const sa = /^\/slots\/(\d+)$/.exec(path);
+    if (sa) {
+      const action = new URL(req.url ?? '', 'http://x').searchParams.get('action');
+      if (o.noSave) return send(res, 501, { error: { message: 'This server does not support slots action.' } });
+      if (action === 'save') return state.saved.add(body.filename), send(res, 200, { id_slot: +sa[1], filename: body.filename, n_saved: 41000, timings: { save_ms: 900 } });
+      if (action === 'restore') return state.saved.has(body.filename) ? send(res, 200, { id_slot: +sa[1], filename: body.filename, n_restored: 41000, timings: { restore_ms: 700 } }) : send(res, 400, { error: { message: 'failed to restore slot' } });
     }
     if (path === '/slots') return state.busy ? send(res, 503, { error: 'no slot' }) : send(res, 200, [{ id: 0, n_past: 3100 }]);
     if (path === '/v1/models') return send(res, 200, { data: [{ id: MODEL, meta: { n_ctx_train: 262144 } }] });

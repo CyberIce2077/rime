@@ -15,8 +15,8 @@ export type ToolResult = { content: string; error?: boolean; summary: string; di
 export const TOOLS: ToolDef[] = [
   {
     name: 'read',
-    description: 'Read a text file. Returns numbered lines, 200 at a time; use offset for more.',
-    input_schema: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', description: 'first line, 1-based' }, limit: { type: 'integer' } }, required: ['path'] },
+    description: 'Read a text file. Returns numbered lines, 200 at a time; use offset for more. summary: true returns a short summary of the whole file instead (for long files).',
+    input_schema: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', description: 'first line, 1-based' }, limit: { type: 'integer' }, summary: { type: 'boolean' } }, required: ['path'] },
   },
   {
     name: 'write',

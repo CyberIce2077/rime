@@ -25,7 +25,7 @@ const STATUS = [
 
 const ago = (s: number) => (s >= 86400 ? `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h` : s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m` : `${Math.floor(s / 60)}m`);
 
-type ServerHost = Host & { openSteps(name: string): void; ensure(name: string): void; down(name: string): void; promptRate(): number | undefined };
+type ServerHost = Host & { openSteps(name: string): void; ensure(name: string): void; down(name: string): void; promptRate(): number | undefined; saveCache(name: string): Promise<string> };
 type Confirm = { q: string; why: string; cmd: string; yes: string; no: string; run: (signal: AbortSignal, progress: (p: number | null) => void) => Promise<string>; label: string; stopped: string };
 
 // /server actions still running, per server: one moved to the background is
@@ -98,7 +98,12 @@ export function createServer(h: ServerHost, name: string): Panel {
     if (r.code !== 0) throw new Error(`${cmd}: ${r.err.trim().split('\n').at(-1) || `exit ${r.code}`}`);
     return done;
   };
-  const cacheNote = () => (cached ? `The main chat's cache (${(cached / 1000).toFixed(1)}k tokens) is dropped with it. ` : '');
+  const cacheNote = () => (cached ? `The main chat's cache (${(cached / 1000).toFixed(1)}k tokens) is saved to the server's disk first and restored after the next start (needs --slot-save-path). ` : '');
+  // Restart, stop and power off save the conversations' caches first.
+  const saved = async () => {
+    const s = await h.saveCache(name).catch(() => '');
+    return s ? `${s}; ` : '';
+  };
 
   // Loading follows /models/sse; a cancel unloads it again (which also stops a download).
   const load = (model: string): Confirm => ({
@@ -149,12 +154,20 @@ export function createServer(h: ServerHost, name: string): Panel {
       if (sshy) list.push({ n: 'Restart server', d: 'sudo systemctl restart llama-server', go: ask({
         q: 'Restart llama-server?', why: `${cacheNote()}The model loads again when the next message needs it.`, cmd: 'sudo systemctl restart llama-server', yes: 'Restart', no: 'Keep it running',
         label: 'restarting llama-server', stopped: 'The restart was stopped part-way; /server shows where it is.',
-        run: async (signal) => (h.down(name), sshRun('sudo systemctl restart llama-server', 'llama-server was restarted.')(signal)),
+        run: async (signal) => {
+          const s = await saved();
+          h.down(name);
+          return s + (await sshRun('sudo systemctl restart llama-server', 'llama-server was restarted.')(signal));
+        },
       }) });
       if (sshy) list.push({ n: 'Stop server', d: 'sudo systemctl stop llama-server', go: ask({
         q: 'Stop llama-server?', why: `${cacheNote()}Messages start it again when you send one.`, cmd: 'sudo systemctl stop llama-server', yes: 'Stop it', no: 'Keep it running',
         label: 'stopping llama-server', stopped: 'Stopping was cancelled part-way; /server shows where it is.',
-        run: async (signal) => (h.down(name), sshRun('sudo systemctl stop llama-server', `llama-server was stopped; ${host} is still on.`)(signal)),
+        run: async (signal) => {
+          const s = await saved();
+          h.down(name);
+          return s + (await sshRun('sudo systemctl stop llama-server', `llama-server was stopped; ${host} is still on.`)(signal));
+        },
       }) });
     }
     if (!sshy) return list;
@@ -163,7 +176,11 @@ export function createServer(h: ServerHost, name: string): Panel {
       label: `powering off ${host}`, stopped: 'Power off was cancelled before it went through.',
       // A machine that powers off drops the ssh connection, so that "error" is
       // success; ssh never connecting (refused, timed out, no key) is not.
-      run: async (signal) => (h.down(name), sshRun('sudo poweroff', `${host} is powering off.`)(signal).catch((e) => (signal.aborted || !/closed by remote host|connection reset|broken pipe|exit 255$/i.test((e as Error).message) ? Promise.reject(e) : `${host} is powering off.`))),
+      run: async (signal) => {
+        const s = await saved();
+        h.down(name);
+        return s + (await sshRun('sudo poweroff', `${host} is powering off.`)(signal).catch((e) => (signal.aborted || !/closed by remote host|connection reset|broken pipe|exit 255$/i.test((e as Error).message) ? Promise.reject(e) : `${host} is powering off.`)));
+      },
     }) });
     list.push({ n: 'Show log', d: 'journalctl -u llama-server, last 200 lines', go: () => void showLog() });
     list.push({ n: 'Edit steps', d: 'same list as in /setup', go: () => h.openSteps(name) });

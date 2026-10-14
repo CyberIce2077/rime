@@ -29,7 +29,8 @@ import { type BoxRow, type Hint, type Hit, type Item, box, caretOf, footRows, hi
 import { type Turn, addTurns, createMeter, fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
 import * as llama from '../providers/llamacpp.ts';
 import { PRESETS } from '../providers/presets.ts';
-import { connOf, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
+import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
+import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
 import { recheck } from '../providers/probe.ts';
 import { ApiError, type Block, type Conn, type Controls, type Effort, type Message, type Model, type Usage } from '../providers/types.ts';
 import { bar } from '../setup/loader.ts';
@@ -47,6 +48,7 @@ const CMDS: [string, string][] = [
   ['/connect', 'add a provider or URL: /connect <url>'],
   ['/clear', 'start a new conversation'],
   ['/conversations', 'search, open, fork or delete your conversations'],
+  ['/compact', 'summarise the earlier conversation to free context'],
   ['/usage', 'token, cost and savings breakdown'],
   ['/exit', 'quit Rime'],
 ];
@@ -278,6 +280,7 @@ export async function runApp(cfg: Config, version: string) {
     title: string;
     mark: string; // the model and effort last put on the timeline
     planSaid: boolean; // the model was told plan mode is on
+    slot?: number; // its llama.cpp slot when the server has several
     costItem: Item | null; // this turn's ↳ line, kept last as its requests add up
     system: string; // its frozen system prompt: the stored one when reopened while the cache is warm
   };
@@ -945,6 +948,7 @@ export async function runApp(cfg: Config, version: string) {
           serverInfo();
         }
         const worked = run.state.steps.filter((v) => ['wake', 'start', 'load'].includes(v.id) && v.status === 'done' && !['on', 'running', 'loaded'].includes(v.result));
+        if (worked.some((v) => v.id === 'wake' || v.id === 'start')) void restoreCache(name);
         if (worked.length && S.convId) bound(S).event('server', `${name} ${worked.map((v) => `${NAMES[v.id]} ${v.result}`).join(' · ')}`);
         if (!quiet && worked.length) {
           S.items.push({ kind: 'lines', lines: [[{ t: '● ', s: st.ok }, { t: `${name} is ready · `, s: st.fg }, { t: model?.label ?? p.model ?? '', s: st.titleB }, { t: ` · ${worked.map((v) => `${NAMES[v.id]} ${v.result}`).join(' · ')}`, s: st.dim }]] });
@@ -1118,8 +1122,8 @@ export async function runApp(cfg: Config, version: string) {
     if (!conn.key && conn.wire === 'anthropic') return note(`No API key for ${conn.name}. /setup adds one, or set ${PRESETS.anthropic.keyEnv}.`);
     const root = llama.rootOf(conn.base);
     // Another of your conversations on the same server: the server queues this one.
-    // ponytail: they share slot 0, so each evicts the other's cache; per-conversation slots when total_slots > 1.
-    const mine = sessions.some((x) => x !== C && x.busy && conn && x.convId !== null);
+    // With one slot they share it (and evict each other's cache); with several each has its own.
+    const mine = slotCount(conn.name) < 2 && sessions.some((x) => x !== C && x.busy && conn && x.convId !== null);
     if (conn.llamacpp && !mine && (await llama.busy(root))) return note(`${conn.name} is busy: another client is using its slot. Try again in a moment.`);
     if (conn.llamacpp && mine) note(`waits for ${conn.name}: another conversation is using it`, 'dim');
 
@@ -1176,6 +1180,7 @@ export async function runApp(cfg: Config, version: string) {
     try {
       // The loop (agent.ts): a reply, its tool calls (asked about first), their
       // results back to the model, until it answers without tools or you stop it.
+      await makeRoom(C, m, cn, ac.signal, true); // already full from earlier turns: compact first
       said = (await runTurn(h, ac.signal, userSeq)).said;
     } finally {
       if (C.busy === me) C.busy = null;
@@ -1217,6 +1222,170 @@ export async function runApp(cfg: Config, version: string) {
     buf = buf ? `${text}\n${buf}` : text;
     cur = buf.length;
     anchor = null;
+  }
+
+  // ---- token-kit (Phase 6) ----
+
+  // The slot a conversation uses on a llama.cpp server: its own when the server
+  // has several (the last stays free for side calls), else slot 0 for everyone.
+  const slotCount = (provider: string) => cfg.providers[provider]?.probe?.slots ?? 1;
+  function slotOf(C: Session, provider: string) {
+    const n = slotCount(provider);
+    if (n < 2) return 0;
+    const taken = new Set(sessions.filter((x) => x !== C && x.slot !== undefined).map((x) => x.slot));
+    if (C.slot === undefined || C.slot >= n - 1 || taken.has(C.slot)) C.slot = [...Array(n - 1).keys()].find((k) => !taken.has(k)) ?? 0;
+    return C.slot;
+  }
+  const sideSlot = (provider: string) => (slotCount(provider) >= 2 ? slotCount(provider) - 1 : 0);
+
+  // A side call (a summary): no tools, reasoning off, the side slot on llama.cpp.
+  // Its tokens count on the meter. ponytail: it uses the conversation's model; the
+  // cheapest connected model, local first, comes with the router (Phase 7).
+  async function sideCall(m: Model, cn: Conn, prompt: string, system: string, C: Session, signal?: AbortSignal) {
+    let text = '', usage: Usage | null = null;
+    for await (const ev of streamFor(cn)({ conn: cn, model: m, system, messages: [{ role: 'user', content: prompt }], controls: { reasoning: false }, signal, slot: cn.llamacpp ? sideSlot(cn.name) : undefined })) {
+      if (ev.type === 'text') text += ev.text;
+      else if (ev.type === 'usage') usage = ev.usage;
+    }
+    if (usage) C.meter.charge(usage, m.price, cn.local);
+    return splitToolCalls(text).text.trim();
+  }
+
+  const contextOf = (m: Model) => m.context ?? cfg.providers[m.provider]?.probe?.ctx;
+  // Pi-style compaction: the older part of the history becomes a summary, the
+  // last ~20k tokens stay as they were. The system prompt and tools don't change,
+  // so only the messages are processed again. Kept in rime.db as a compaction row.
+  async function compact(C: Session, m: Model, cn: Conn, signal?: AbortSignal) {
+    const size = contextOf(m) ?? 128000;
+    const cut = cutPoint(C.messages, Math.min(20000, size * 0.25));
+    if (!cut) return false;
+    const before = Math.max(C.task?.lastPrompt ?? 0, tokensOf(C.messages));
+    const row: Extract<Item, { kind: 'lines' }> = { kind: 'lines', lines: [[{ t: '  ⟳ ', s: st.accent }, { t: `compacting · summarising ${fmtT(tokensOf(C.messages.slice(0, cut)))} tokens of earlier conversation…`, s: st.dim }]] };
+    const show = (l: Line) => ((row.lines = [l]), cache.delete(row), schedule());
+    C.items.push(row);
+    schedule();
+    let summary = '';
+    try {
+      summary = await sideCall(m, cn, historyText(C.messages.slice(0, cut)), SUMMARY_SYSTEM, C, signal);
+    } catch (e) {
+      show([{ t: '  ! ', s: st.warn }, { t: `couldn't compact: ${(e as Error).message}`, s: st.dim }]);
+      return false;
+    }
+    if (!summary) {
+      show([{ t: '  ! ', s: st.warn }, { t: "couldn't compact: the summary came back empty", s: st.dim }]);
+      return false;
+    }
+    const kept = C.messages.length - cut;
+    C.messages.splice(0, C.messages.length, ...compacted(C.messages, cut, summary));
+    save((d) => d.append(bound(C).conversation()!, 'system', [{ type: 'compaction', summary, kept }], false));
+    const after = tokensOf(C.messages) + Math.ceil(C.system.length / 4);
+    if (C.task) C.task.lastPrompt = after;
+    bound(C).event('compact', `compacted ${fmtT(before)} → ${fmtT(after)} tokens`);
+    show([{ t: '  ⟳ ', s: st.accent }, { t: `compacted ${fmtT(before)} → ${fmtT(after)} tokens · the next reply rebuilds the cache`, s: st.dim }]);
+    return true;
+  }
+
+  // read with summary: a side call summarises the whole file; kept in
+  // .rime/cache/ by the file's content and the model, so it's done once.
+  async function summarize(file: string, C: Session, signal?: AbortSignal): Promise<ToolResult> {
+    const p = path.resolve(cwd, file);
+    let text: string;
+    try {
+      text = fs.readFileSync(p, 'utf8');
+    } catch (e) {
+      return { content: (e as Error).message, error: true, summary: 'not found' };
+    }
+    if (!model || !conn) return readTool(cwd, { path: file });
+    const lines = text.split('\n').length;
+    const key = createHash('sha256').update(text).digest('hex').slice(0, 16);
+    const dir = path.join(project, '.rime', 'cache');
+    const hit = path.join(dir, `${key}-${model.ref.replace(/[^\w.-]+/g, '_')}.md`);
+    if (fs.existsSync(hit)) return { content: fs.readFileSync(hit, 'utf8'), summary: `summary · ${lines} lines (cached)` };
+    const size = contextOf(model) ?? 32000;
+    const body = text.length > size * 2 ? text.slice(0, size * 2) + '\n… (cut)' : text; // half the context at most
+    let out = '';
+    try {
+      out = await sideCall(model, conn, `File: ${rel(cwd, p)} (${lines} lines)\n\n${body}`, 'Summarise this file for a programmer who will change it: its purpose, its main parts with line numbers, exported names, and anything surprising. Plain text, under 300 words.', C, signal);
+    } catch (e) {
+      return { content: `Couldn't summarise: ${(e as Error).message}. Read it in ranges instead.`, error: true, summary: "couldn't summarise" };
+    }
+    const content = `Summary of ${rel(cwd, p)} (${lines} lines; read ranges with offset for exact code):\n${out}`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(hit, content);
+    return { content, summary: `summary · ${lines} lines` };
+  }
+
+  // /compact: now, between replies.
+  async function compactNow() {
+    const C = S;
+    if (C.busy) return say('Rime is working; /compact after this reply');
+    if (!model || !conn) return note('Connect a model first; /compact uses it to write the summary.');
+    if (!C.messages.length) return say('nothing to compact yet');
+    const ac = new AbortController(), me = { abort: () => ac.abort(), esc: () => ac.abort() };
+    C.busy = me;
+    schedule();
+    try {
+      if (!(await compact(C, model, conn, ac.signal))) note('Nothing to compact: the conversation is still short.', 'dim');
+    } finally {
+      if (C.busy === me) C.busy = null;
+      schedule();
+    }
+  }
+
+  // Before the context overflows: hosted models first lose old tool output, all at
+  // once and rarely (from half full); at 80% the older part is summarised. Not on
+  // llama.cpp, where clearing the middle means reprocessing everything after it.
+  // False when it's still over 90% and nothing helped.
+  async function makeRoom(C: Session, m: Model, cn: Conn, signal?: AbortSignal, quiet = false) {
+    const size = contextOf(m);
+    if (!size) return true;
+    let used = C.task?.lastPrompt ?? 0;
+    if (!cn.llamacpp && used > size * 0.5) {
+      const freed = Math.floor(clearOld(C.messages) / 4);
+      if (freed > 500) {
+        used -= freed;
+        if (C.task) C.task.lastPrompt = used;
+        bound(C).note(`cleared old tool output (~${fmtT(freed)} tokens) to save context`, 'dim');
+      }
+    }
+    if (used <= size * 0.8 || (await compact(C, m, cn, signal))) return true;
+    if (used <= size * 0.9 || quiet) return true;
+    bound(C).note(`This conversation fills ${Math.round((used / size) * 100)}% of ${m.label}'s context (${fmtT(used)} of ${fmtT(size)} tokens) and couldn't be compacted, so Rime stopped before the next step. Say "continue" to go on anyway, or /clear to start fresh.`);
+    return false;
+  }
+
+  // Saved slots (providers.md §6.2): before the server stops or powers off, each
+  // open conversation's slot goes to a file on its disk; after the next start the
+  // one on screen is restored, so it doesn't rebuild a long context. The file is
+  // named by conversation and prefix, so a changed prompt never restores old state.
+  const slotFile = (C: Session) => `rime-${C.convId}-${createHash('sha256').update(TOOLS_HASH + C.system).digest('hex').slice(0, 8)}.bin`;
+  const cached = (name: string) => sessions.filter((x) => x.convId && x.messages.length && model?.provider === name);
+  const routerModel = (name: string) => (cfg.providers[name]?.router ? (model?.provider === name ? model.id : cfg.providers[name].model) : undefined);
+  async function saveCache(name: string) {
+    const port = tunnels[name]?.port;
+    if (!port) return '';
+    let n = 0;
+    for (const x of cached(name)) {
+      const r = await llama.slotAction(`http://127.0.0.1:${port}`, slotOf(x, name), 'save', slotFile(x), routerModel(name)).catch(() => null);
+      if (r && r.status < 300) n += Number(r.json?.n_saved ?? 0);
+    }
+    return n ? `saved the cache (${fmtT(n)} tokens)` : '';
+  }
+  async function restoreCache(name: string) {
+    const port = tunnels[name]?.port;
+    if (!port || !S.convId || !cached(name).includes(S)) return;
+    const t0 = Date.now();
+    const r = await llama.slotAction(`http://127.0.0.1:${port}`, slotOf(S, name), 'restore', slotFile(S), routerModel(name)).catch(() => null);
+    const n = Number(r?.json?.n_restored ?? 0);
+    if (r && r.status < 300 && n) note(`restored this conversation's cache (${fmtT(n)} tokens in ${fmtS(Date.now() - t0)})`, 'dim');
+  }
+  // The same save, as shell commands run on the server when Rime quits (quitting
+  // never waits): one curl per conversation, then the stop or power off.
+  function saveOnServer(name: string) {
+    const p = cfg.providers[name], remote = p.tunnel?.remote ?? '127.0.0.1:8080', key = providerKey(p), rm = routerModel(name);
+    return cached(name)
+      .map((x) => `curl -s -m 120 -X POST 'http://${remote}/slots/${slotOf(x, name)}?action=save${rm ? `&model=${encodeURIComponent(rm)}` : ''}' -H 'Content-Type: application/json'${key ? ` -H 'Authorization: Bearer ${key}'` : ''} -d '{"filename":"${slotFile(x)}"}' >/dev/null 2>&1; `)
+      .join('');
   }
 
   // The turn loop lives in agent.ts; this is its host for one conversation: the
@@ -1343,12 +1512,11 @@ export async function runApp(cfg: Config, version: string) {
           detail([...(r.output.length > 6 ? [[{ t: `… ${r.output.length - 6} more lines`, s: st.dim }]] : []), ...tail.map((l) => [{ t: l, s: st.dim }]), [{ t: r.summary, s: r.error ? st.warn : st.dim }]]);
         } else detail([[{ t: r.summary, s: r.error ? st.warn : st.dim }]]);
       } else if (e.type === 'held') note('Rime asked you something, so it waits for your answer before running that.', 'dim');
-      else if (e.type === 'full') note(`This conversation fills ${Math.round((e.used / e.size) * 100)}% of ${m.label}'s context (${fmtT(e.used)} of ${fmtT(e.size)} tokens), so Rime stopped before the next step. Say "continue" to go on anyway, or /clear to start fresh.`);
       schedule();
     };
     return {
       messages: C.messages,
-      stream: (signal) => streamFor(cn)({ conn: cn, model: m, system: C.system, tools: TOOLS, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal, slot: cn.llamacpp ? 0 : undefined }),
+      stream: (signal) => streamFor(cn)({ conn: cn, model: m, system: C.system, tools: TOOLS, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal, slot: cn.llamacpp ? slotOf(C, cn.name) : undefined }),
       store: {
         append: (role, content, interrupted) => save((d) => d.append(bound(C).conversation()!, role, content, interrupted)) ?? 0,
         update: (seq, content, interrupted) => void save((d) => d.update(C.convId!, seq, content, interrupted)),
@@ -1402,10 +1570,7 @@ export async function runApp(cfg: Config, version: string) {
       run: async (u, d, signal) => runTool(String(u.name), (u.input ?? {}) as Record<string, any>, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv }),
       optionsOf,
       queued: () => takeQueued(C),
-      context: () => {
-        const size = m.context ?? cfg.providers[m.provider]?.probe?.ctx;
-        return size ? { used: C.task?.lastPrompt ?? 0, size } : null;
-      },
+      afterRound: (signal) => makeRoom(C, m, cn, signal),
       planNote: () => (mode === 'plan' ? ' Rime is in plan mode (read-only): answer with a plan instead. The user switches modes with shift+tab.' : ''),
       setLive: (l) => void (C.live = l),
       setLastUser: (seq) => void (C.lastUserSeq = seq),
@@ -1492,7 +1657,7 @@ export async function runApp(cfg: Config, version: string) {
 
   function runTool(name: string, input: Record<string, any>, signal: AbortSignal, C: Session, as: RunAs = {}): ToolResult | Promise<ToolResult> {
     const { conversation, store, note, drop, addConvRule, detail } = bound(C);
-    if (name === 'read') return readTool(cwd, input as { path: string });
+    if (name === 'read') return input.summary ? summarize(String(input.path ?? ''), C, signal) : readTool(cwd, input as { path: string });
     if (name === 'write') return writeTool(cwd, input as { path: string; content: string });
     if (name === 'edit') return editTool(cwd, input as { path: string; old: string; new: string });
     if (name === 'bash') return bashTool(cwd, input as { command: string }, signal, as);
@@ -1879,7 +2044,7 @@ export async function runApp(cfg: Config, version: string) {
     return t >= start ? 'Today' : t >= start - day ? 'Yesterday' : t >= start - 6 * day ? 'This week' : 'Older';
   };
   // A timeline entry's mark.
-  const KIND: Record<string, string> = { edit: '±', test: '▸', command: '▸', error: '✗', commit: '⎇', pin: '◆', server: '●', model: '◇', attach: '+' };
+  const KIND: Record<string, string> = { edit: '±', test: '▸', command: '▸', error: '✗', commit: '⎇', pin: '◆', server: '●', model: '◇', attach: '+', compact: '⟳' };
   const markOf = (kind: string) => KIND[kind] ?? '·';
   const hhmm = (t: number) => new Date(t).toTimeString().slice(0, 5);
 
@@ -2282,6 +2447,7 @@ export async function runApp(cfg: Config, version: string) {
     },
     ensure: (name) => void ensure(name),
     promptRate: () => promptRate,
+    saveCache: (name) => saveCache(name),
     current: () => model,
     controls: () => controls,
     setControls: (c) => {
@@ -2418,6 +2584,7 @@ export async function runApp(cfg: Config, version: string) {
       if (later) host.choose(later);
     } else if (c === '/usage') boxKind = 'usage';
     else if (c === '/exit') quit();
+    else if (c === '/compact') void compactNow();
     else {
       S.items.push({ kind: 'user', text: v });
       S.items.push({ kind: 'reply', text: `Unknown command ${c}. Press / to see the commands.`, done: true });
@@ -2968,11 +3135,10 @@ export async function runApp(cfg: Config, version: string) {
     header?.close();
     for (const [name, p] of Object.entries(cfg.providers)) {
       if (!p.ssh || !p.onQuit || p.onQuit === 'keep' || !tunnels[name]?.port) continue;
-      // ponytail: saving the slot before stopping arrives with token-kit.
       const logs = path.join(os.homedir(), '.rime', 'logs');
       fs.mkdirSync(logs, { recursive: true });
       const log = fs.openSync(path.join(logs, 'quit.log'), 'a');
-      spawn('ssh', [...SSH_OPTS, p.ssh, p.onQuit === 'stop' ? 'sudo systemctl stop llama-server' : 'sudo poweroff'], { detached: true, stdio: ['ignore', log, log] }).unref();
+      spawn('ssh', [...SSH_OPTS, p.ssh, saveOnServer(name) + (p.onQuit === 'stop' ? 'sudo systemctl stop llama-server' : 'sudo poweroff')], { detached: true, stdio: ['ignore', log, log] }).unref();
     }
     restore();
     process.exit(0);
@@ -2995,6 +3161,13 @@ export async function runApp(cfg: Config, version: string) {
     const stored: Stored[] = save((d) => d.messages(c.id)) ?? [];
     for (const m of stored) {
       const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;
+      // A compaction: the history from here on is its summary plus the kept tail.
+      if (m.role === 'system' && blocks[0]?.type === 'compaction') {
+        const kept = Number(blocks[0].kept ?? 0);
+        C.messages.splice(0, C.messages.length, ...compacted(C.messages, Math.max(0, C.messages.length - kept), String(blocks[0].summary)));
+        C.items.push({ kind: 'lines', lines: [[{ t: '  ⟳ ', s: st.accent }, { t: 'compacted here: what came before was summarised', s: st.dim }]] });
+        continue;
+      }
       if (m.role === 'system') {
         const { type: _, ...oc } = blocks[0] ?? {};
         C.messages.push({ role: 'system', content: [], output_config: oc });
