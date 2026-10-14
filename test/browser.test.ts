@@ -36,3 +36,10 @@ test("a download's size and progress are read from Playwright's bar (the newest 
   assert.deepEqual(parseBar('Downloading Chromium 140.0 from https://x\n150.5 MiB [====      ] 20% 3.1s150.5 MiB [=====     ] 25% 2.9s'), { total: 157810688, pct: 25 });
   assert.equal(parseBar('Downloading FFmpeg from https://x'), null);
 });
+
+test("the rime tool's browser.open and tab.open {kind: browser} are checked like the browser's open", () => {
+  assert.equal(decide('rime', { action: 'tab.open', args: { kind: 'browser', url: 'index.html' } }, ctx('ask')).verdict, 'allow', 'a local file');
+  assert.equal(decide('rime', { action: 'tab.open', args: { kind: 'browser', url: 'https://example.com' } }, ctx('ask')).verdict, 'ask');
+  assert.equal(decide('rime', { action: 'browser.open', args: { url: 'http://localhost:3000' } }, ctx('ask')).verdict, 'allow');
+  assert.equal(decide('rime', { action: 'tab.open', args: { kind: 'files' } }, ctx('ask')).verdict, 'allow');
+});

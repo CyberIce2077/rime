@@ -2244,7 +2244,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // keys, and it can't change permission modes or rules (it opens /permissions).
   function rimeTool(action: string, args: Record<string, any>, C: Session = S, signal?: AbortSignal): string | Promise<string> {
     const { conversation, store, note, drop, addConvRule, detail } = bound(C);
-    const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open {kind: files | file {path, line} | diff} · tab.close {n} · tab.focus {n} · panel.show · panel.hide · browser.open {url: a web address or a local HTML file} · design.open {name} or {new: what to build}';
+    const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open {kind: files | file {path, line} | diff | browser {url} | design {name}} · tab.close {n} · tab.focus {n} · panel.show · panel.hide · browser.open {url: a web address or a local HTML file} · design.open {name} or {new: what to build}';
     if (action === 'help') return `Actions: ${ACTIONS}\nSettings: ${settings.list().map((d) => `${d.key} (${d.values.join(' | ')}; applies ${WHEN[d.applies]})`).join(', ')}`;
     if (action === 'settings.list') return settings.list().map((d) => `${d.key} = ${d.get(cfg)} · ${d.help} · applies ${WHEN[d.applies]}`).join('\n');
     if (action === 'settings.get') return `${args.key} = ${settings.get(String(args.key)) ?? '(no such setting)'}`;
@@ -2306,8 +2306,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         if (!cps || !cp) return 'No change on record to diff.';
         return side.diff(cps.diff(cp), true), 'Opened the diff of the last change in a tab.';
       }
+      if (kind === 'browser' || kind === 'web' || kind === 'page') return openPage(args);
+      if (kind === 'design') return openDesign_(args);
       if (kind === 'shell') return 'Run commands with the bash tool; while the panel is open their output shows in a tab of its own.';
-      return `No tab kind ${kind}. Kinds: files, file {path, line}, diff.`;
+      return `No tab kind ${kind}. Kinds: files, file {path, line}, diff, browser {url: a web address or a local HTML file}, design {name} or {new: what to build}.`;
     }
     if (action === 'tab.close' || action === 'tab.focus') {
       const n = Number(args.n ?? args.tab) - 1;
@@ -2319,24 +2321,29 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     // The browser tab: a web address, or a local file shown as file://. The first
     // time, the user is asked to turn the plug-in on (a one-time set-up).
-    if (action === 'browser.open') {
-      const raw = String(args.url ?? '').trim();
-      if (!raw) return 'browser.open needs {url}: a web address or a local HTML file.';
-      const local = !/^[a-z]+:\/\//i.test(raw) && fs.existsSync(path.resolve(cwd, raw.replace(/^~(?=\/)/, os.homedir())));
-      const url = local ? pathToFileURL(path.resolve(cwd, raw.replace(/^~(?=\/)/, os.homedir()))).href : raw;
-      if (!cfg.plugins?.browser || !browserInstalled()) return browserCmd(url), "The browser plug-in isn't on yet, so Rime asked the user to turn it on (a one-time set-up); the page opens in a tab when they do.";
-      return browserNow()
-        .then((b) => b.act({ action: 'open', url }))
-        .then((t) => `${t.split('. Use snapshot')[0]}. It shows in the browser tab next to the chat.`)
-        .catch((e) => `Couldn't open it: ${(e as Error).message.split('\n')[0]}`);
-    }
-    if (action === 'design.open') {
-      designCmd(args.new ? ['new', String(args.new)] : args.name ? [String(args.name)] : []);
-      return cfg.plugins?.design && browserInstalled() ? 'Opened the design tab.' : "The design plug-in isn't on yet, so Rime asked the user to turn it on; the tab opens when they do.";
-    }
+    if (action === 'browser.open') return openPage(args);
+    if (action === 'design.open') return openDesign_(args);
     if (action === 'panel.show' || action === 'panel.split') return side.tabs.length ? (side.show(true), 'The panel is showing.') : (side.files(), 'Opened the panel with the files tab.');
     if (action === 'panel.hide') return side.show(false), (sideFocus = false), 'The panel is hidden; its tabs keep running.';
     return `Unknown action ${action}. Actions: ${ACTIONS}`;
+  }
+
+  // The browser tab at a web address, or a local file shown as file:// (rime tool
+  // browser.open, or tab.open {kind: browser}). The first time, the user is asked
+  // to turn the plug-in on (a one-time set-up).
+  function openPage(args: Record<string, any>): string | Promise<string> {
+    const raw = String(args.url ?? args.path ?? '').trim();
+    if (!raw) return 'Opening the browser tab needs {url}: a web address or a local HTML file.';
+    const url = pageUrl(raw);
+    if (!cfg.plugins?.browser || !browserInstalled()) return browserCmd(url), "The browser plug-in isn't on yet, so Rime asked the user to turn it on (a one-time set-up); the page opens in a tab when they do.";
+    return browserNow()
+      .then((b) => b.act({ action: 'open', url }))
+      .then((t) => `${t.split('. Use snapshot')[0]}. It shows in the browser tab next to the chat.`)
+      .catch((e) => `Couldn't open it: ${(e as Error).message.split('\n')[0]}`);
+  }
+  function openDesign_(args: Record<string, any>) {
+    designCmd(args.new ? ['new', String(args.new)] : args.name ? [String(args.name)] : []);
+    return cfg.plugins?.design && browserInstalled() ? 'Opened the design tab.' : "The design plug-in isn't on yet, so Rime asked the user to turn it on; the tab opens when they do.";
   }
 
   // Asks before a command or an edit: Yes · Yes, don't ask again · No, tell Rime

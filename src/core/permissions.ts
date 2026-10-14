@@ -270,7 +270,8 @@ export type Ctx = { mode: Mode; project: string; rules: Rule[]; granted?: (p: st
 
 export function decide(tool: string, input: Record<string, any>, c: Ctx): Decision {
   // Opening a page through the rime tool is checked like the browser tool's open.
-  if (tool === 'rime' && input.action === 'browser.open') return decide('browser', { action: 'open', url: (input.args as Record<string, unknown> | undefined)?.url }, c);
+  const ra = (input.args ?? {}) as Record<string, unknown>;
+  if (tool === 'rime' && (input.action === 'browser.open' || (input.action === 'tab.open' && /^(browser|web|page)$/.test(String(ra.kind))))) return decide('browser', { action: 'open', url: ra.url ?? ra.path }, c);
   if (tool === 'rime') return { verdict: 'allow', why: "Rime's own settings" };
   if (tool === 'search') return { verdict: 'allow', why: 'searching the project' };
   // The browser plug-in: a page on this computer opens without asking; a site
