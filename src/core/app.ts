@@ -15,6 +15,7 @@ import path from 'node:path';
 import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
 import { type Decision, MODE_HELP, MODES, type Mode, addProjectRule, decide, projectRules, removeProjectRule, ruleList, rulesHash, trustedProjectRules } from './permissions.ts';
 import { type RunAs, type ToolResult, TOOLS, bash as bashTool, sandboxed, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
+import { type AgentEvent, type TurnHost, result, runTools, runTurn } from './agent.ts';
 import { WHEN, createSettings, phrase } from './settings.ts';
 import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
 import { toolEvents } from './timeline.ts';
@@ -1138,13 +1139,15 @@ export async function runApp(cfg: Config, version: string) {
     const did: Did = { wrote: [], ran: [], about: attached };
     // Tool calls still waiting for your answer when Rime closed are asked again
     // first (SPEC §17); their results go ahead of your words.
+    let esc = () => ac.abort();
+    const h = turnHost(C, m, cn, c, ac, did, (f) => (esc = f));
     const pending = pendingUses(C);
     if (pending.length) {
       const me = { abort: () => ac.abort(), esc: () => ac.abort() };
       C.busy = me;
       C.resumeOk = false;
       schedule();
-      const results = await runTools(pending, ac.signal, did, C);
+      const results = await runTools(h, pending, ac.signal);
       if (C.busy === me) C.busy = null;
       if (ac.signal.aborted) {
         C.messages.push({ role: 'user', content: results });
@@ -1167,46 +1170,13 @@ export async function runApp(cfg: Config, version: string) {
     if (!C.question?.tool) C.question = null; // a picker from the last reply is answered or moot now
 
     let said = ''; // the last reply's text, for the next-step suggestion
-    let esc = () => ac.abort();
     const me = { abort: () => ac.abort(), esc: () => esc() };
     C.busy = me;
     schedule();
     try {
-      // The loop: a reply, its tool calls (asked about first), their results back
-      // to the model, until it answers without tools or you stop it.
-      for (let step = 0; step < 200; step++) {
-        const r = await streamOnce(m, cn, c, ac, step === 0 ? userSeq : 0, (f) => (esc = f), C);
-        if (!r.ok) break;
-        said = r.blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
-        const uses = r.blocks.filter((b) => b.type === 'tool_use');
-        if (!uses.length) break;
-        // A reply that asks you something in text and then goes ahead anyway: the
-        // calls wait for your answer (they get "not run" results, so the history
-        // stays valid, and your next message goes with them).
-        const asked = splitToolCalls(said).text.trim();
-        if (asked.endsWith('?') && !uses.some((u) => u.name === 'ask')) {
-          C.messages.push({ role: 'user', content: uses.map((u) => result(u.id, 'Not run: you asked the user a question. Wait for their answer, and use the ask tool when they need to choose.', true)) });
-          C.lastUserSeq = store(C.messages.at(-1)!);
-          note('Rime asked you something, so it waits for your answer before running that.', 'dim');
-          break;
-        }
-        esc = () => ac.abort();
-        const results = await runTools(uses, ac.signal, did, C);
-        C.messages.push({ role: 'user', content: [...results, ...(ac.signal.aborted ? [] : await takeQueued(C))] });
-        C.lastUserSeq = store(C.messages.at(-1)!);
-        if (ac.signal.aborted) {
-          note('stopped', 'dim');
-          break;
-        }
-        // No compaction yet (Phase 6): stop before the context overflows, with the
-        // tool results saved so "continue" picks up from here.
-        const ctx = m.context ?? cfg.providers[m.provider]?.probe?.ctx;
-        const used = C.task?.lastPrompt ?? 0;
-        if (ctx && used > ctx * 0.9) {
-          note(`This conversation fills ${Math.round((used / ctx) * 100)}% of ${m.label}'s context (${fmtT(used)} of ${fmtT(ctx)} tokens), so Rime stopped before the next step. Say "continue" to go on anyway, or /clear to start fresh.`);
-          break;
-        }
-      }
+      // The loop (agent.ts): a reply, its tool calls (asked about first), their
+      // results back to the model, until it answers without tools or you stop it.
+      said = (await runTurn(h, ac.signal, userSeq)).said;
     } finally {
       if (C.busy === me) C.busy = null;
       C.nextStep = nextFor(said, did, project);
@@ -1249,16 +1219,18 @@ export async function runApp(cfg: Config, version: string) {
     anchor = null;
   }
 
-  // One streamed reply. Returns its blocks, or ok: false when it was stopped or failed.
-  async function streamOnce(m: Model, cn: Conn, c: Controls, ac: AbortController, userSeq: number, setEsc: (f: () => void) => void, C: Session): Promise<{ ok: boolean; blocks: Block[] }> {
-    const { conversation, store, note, drop, addConvRule, detail, event } = bound(C);
-    // The model and effort go on the timeline when they change.
-    const mark = `${m.label} · ${!c.reasoning ? 'reasoning off' : `${c.effort ?? 'default'} effort`}`;
-    if (mark !== C.mark) (C.mark = mark), event('model', mark);
+  // The turn loop lives in agent.ts; this is its host for one conversation: the
+  // request, storage, permissions and questions, and the screen built from its
+  // events (thinking, the reply, the live "writing…" row, tool rows, cost).
+  function turnHost(C: Session, m: Model, cn: Conn, c: Controls, ac: AbortController, did: Did, setEsc: (f: () => void) => void): TurnHost {
+    const { store, note, drop, addConvRule, detail, event } = bound(C);
     const root = llama.rootOf(cn.base);
-    const thinking: Extract<Item, { kind: 'think' }> = { kind: 'think', text: '', start: Date.now(), open: showThinking };
-    C.items.push(thinking);
-    const spin = setInterval(schedule, 250);
+    // Per reply: its thinking row, its text row, the live tool-call row.
+    let thinking: Extract<Item, { kind: 'think' }> = { kind: 'think', text: '', start: 0, open: false };
+    let reply: Extract<Item, { kind: 'reply' }> | null = null;
+    let drafting: Extract<Item, { kind: 'lines' }> | null = null;
+    let spin: NodeJS.Timeout | undefined;
+    let completionId = '', thinkingNow = true, ended = false;
     // Thinking ends when the answer starts (or the stream does): it stays as one
     // "Thought for 6s" line, or goes when the model didn't think out loud.
     const settle = () => {
@@ -1269,27 +1241,8 @@ export async function runApp(cfg: Config, version: string) {
       if (!thinking.text.trim()) drop(thinking);
       schedule();
     };
-    let completionId = '';
-    let thinkingNow = true, ended = false;
-    // esc while a local model is thinking ends the thinking instead of the reply.
-    setEsc(() => {
-      if (cn.llamacpp && thinkingNow && completionId && !ended) {
-        ended = true;
-        llama.endReasoning(root, completionId);
-        thinking.note = 'wrapping up (esc again stops)';
-      } else ac.abort();
-    });
-    schedule();
-
-    let reply: Extract<Item, { kind: 'reply' }> | null = null;
-    let blocks: Block[] = [];
-    let usage: Usage | null = null;
-    let stop = '';
-    let flush: NodeJS.Timeout | null = null;
-    let replySeq = 0; // the stored reply, which keeps what it cost
     // A tool call being written (a long file can take a minute on a local model):
     // one live row with its name, path and size, so the reply doesn't look finished.
-    let drafting: Extract<Item, { kind: 'lines' }> | null = null;
     const draft = (name: string, args: string) => {
       settle();
       const field = (k: string) => new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`).exec(args)?.[1] ?? new RegExp(`<parameter=${k}>\\s*([^<\\n]+)`).exec(args)?.[1];
@@ -1301,11 +1254,12 @@ export async function runApp(cfg: Config, version: string) {
       cache.delete(drafting);
       schedule();
     };
-    const charge = () => {
+    // What a reply cost: the ↳ line, the meter, rime.db, and the cache-safety measure.
+    const charge = (usage: Usage | null, seq: number) => {
       if (!usage) return;
       const turn = C.meter.charge(usage, m.price, cn.local);
       addCost(C, turn);
-      if (replySeq) save((d) => d.setUsage(C.convId!, replySeq, { usage: usage!, ...(m.price ? { price: m.price } : {}), ...(cn.local ? { local: true } : {}) }));
+      if (seq) save((d) => d.setUsage(C.convId!, seq, { usage, ...(m.price ? { price: m.price } : {}), ...(cn.local ? { local: true } : {}) }));
       save((d) => d.usage(C.convId!, turn.in + turn.out, turn.spent ?? 0, m.ref));
       if (cn.local && usage.promptMs && usage.input > 500) promptRate = usage.input / (usage.promptMs / 1000);
       // Measured, not assumed: a control change that collapses the cached prefix
@@ -1319,78 +1273,47 @@ export async function runApp(cfg: Config, version: string) {
       }
       if (C.task) Object.assign(C.task, { lastPrompt: prompt, lastControls: c });
     };
-    // Only the user's own message is taken back when nothing came of it; tool
-    // results stay, so every tool call keeps its answer.
-    const forget = () => {
-      if (!userSeq) return;
-      if (C.messages.at(-1)?.role === 'user') C.messages.pop();
-      if (C.live) save((d) => d.remove(C.convId!, C.live!.seq));
-      save((d) => d.remove(C.convId!, userSeq));
-      C.lastUserSeq = 0;
-    };
-    try {
-      for await (const ev of streamFor(cn)({ conn: cn, model: m, system: C.system, tools: TOOLS, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal: ac.signal, slot: cn.llamacpp ? 0 : undefined })) {
-        if (ev.type === 'id') completionId = ev.id;
-        else if (ev.type === 'blocks') blocks = ev.blocks;
-        else if (ev.type === 'usage') usage = ev.usage;
-        else if (ev.type === 'stop') stop = ev.reason;
-        else if (ev.type === 'tool') draft(ev.name, ev.args);
-        else if (ev.type === 'thinking') {
-          if (thinking.ms === undefined) thinking.text += ev.text;
-        } else if (ev.type === 'text') {
-          thinkingNow = false;
-          if (!reply) {
-            settle();
-            const r: Extract<Item, { kind: 'reply' }> = { kind: 'reply', text: '', done: false };
-            reply = r;
-            C.items.push(reply);
-            // The reply is stored while it streams (flushed about once a second), so
-            // quitting mid-reply keeps it, marked interrupted.
-            const seq = save((d) => d.append(C.convId!, 'assistant', [{ type: 'text', text: ev.text }], true));
-            if (seq) {
-              C.live = { seq, text: () => r.text };
-              flush = setInterval(() => save((d) => d.update(C.convId!, seq, [{ type: 'text', text: r.text }], true)), 1000);
-            }
-          }
-          reply.text += ev.text;
-          // Qwen's own <tool_call> XML in the text (no native tools): the same live row.
-          const at = reply.text.indexOf('<tool_call>');
-          if (at >= 0) draft(/<function=([^>\s]+)>/.exec(reply.text.slice(at))?.[1] ?? /"name"\s*:\s*"([^"]+)"/.exec(reply.text.slice(at))?.[1] ?? 'tool', reply.text.slice(at));
-          schedule();
-        }
-      }
+    const done = () => {
       if (reply) {
         reply.done = true;
         if (!reply.text.trim() || !splitToolCalls(reply.text).text.trim()) drop(reply);
       }
-      if (flush) clearInterval(flush);
       settle();
-      if (blocks.length) {
-        C.messages.push({ role: 'assistant', content: blocks });
-        C.lastUserSeq = 0;
-        if (C.live) save((d) => d.update(C.convId!, C.live!.seq, blocks, false)), (replySeq = C.live.seq);
-        else replySeq = store(C.messages.at(-1)!);
-      } else forget();
-      charge();
-      if (stop === 'refusal') note('The model declined this request. Rephrase it, or /clear to start over.');
-      else if (stop === 'max_tokens') note('The reply hit the output limit and was cut off.');
-      return { ok: blocks.length > 0, blocks };
-    } catch (e) {
-      settle();
-      if (reply) reply.done = true;
-      if (flush) clearInterval(flush);
-      if (ac.signal.aborted) {
-        if (reply?.text.trim()) {
-          C.messages.push({ role: 'assistant', content: [{ type: 'text', text: reply.text.trimEnd() }] });
-          C.lastUserSeq = 0;
-          if (C.live) save((d) => d.update(C.convId!, C.live!.seq, C.messages.at(-1)!.content, false)), (replySeq = C.live.seq);
-        } else forget();
-        charge();
-        note('stopped', 'dim');
-      } else {
-        if (C.live) save((d) => d.remove(C.convId!, C.live!.seq));
-        forget();
-        const err = e as Error;
+    };
+    const on = (e: AgentEvent) => {
+      if (e.type === 'start') {
+        // The model and effort go on the timeline when they change.
+        const mark = `${m.label} · ${!c.reasoning ? 'reasoning off' : `${c.effort ?? 'default'} effort`}`;
+        if (mark !== C.mark) (C.mark = mark), event('model', mark);
+        thinking = { kind: 'think', text: '', start: Date.now(), open: showThinking };
+        C.items.push(thinking);
+        (reply = null), (drafting = null), (completionId = ''), (thinkingNow = true), (ended = false);
+        spin = setInterval(schedule, 250);
+        // esc while a local model is thinking ends the thinking instead of the reply.
+        setEsc(() => {
+          if (cn.llamacpp && thinkingNow && completionId && !ended) {
+            ended = true;
+            llama.endReasoning(root, completionId);
+            thinking.note = 'wrapping up (esc again stops)';
+          } else ac.abort();
+        });
+      } else if (e.type === 'id') completionId = e.id;
+      else if (e.type === 'thinking') {
+        if (thinking.ms === undefined) thinking.text += e.text;
+      } else if (e.type === 'text') {
+        thinkingNow = false;
+        if (!reply) settle(), C.items.push((reply = { kind: 'reply', text: '', done: false }));
+        reply.text += e.text;
+      } else if (e.type === 'draft') draft(e.name, e.args);
+      else if (e.type === 'reply') {
+        done();
+        charge(e.usage, e.seq);
+        if (e.stop === 'refusal') note('The model declined this request. Rephrase it, or /clear to start over.');
+        else if (e.stop === 'max_tokens') note('The reply hit the output limit and was cut off.');
+      } else if (e.type === 'stopped') done(), charge(e.usage, e.seq), note('stopped', 'dim');
+      else if (e.type === 'failed') {
+        done();
+        const err = e.error;
         note(
           err instanceof ApiError && (err.status === 401 || err.status === 403)
             ? `${cn.name} refused the API key. /setup can replace it.`
@@ -1398,15 +1321,95 @@ export async function runApp(cfg: Config, version: string) {
             : `Couldn't reach ${cn.name} (${new URL(cn.base).host}). ${err.message}`,
         );
         if (cfg.providers[cn.name]?.ssh) conn = undefined; // bring it up again next time
-      }
-      return { ok: false, blocks: [] };
-    } finally {
-      clearInterval(spin);
-      if (flush) clearInterval(flush);
-      if (drafting) drop(drafting); // the real tool row replaces it
-      C.live = null;
+      } else if (e.type === 'end') {
+        clearInterval(spin);
+        if (drafting) drop(drafting); // the real tool row replaces it
+      } else if (e.type === 'denied') C.items.push({ ...toolLine(e.use), extra: [{ t: ` · not run: ${e.why}`, s: st.warn }] } as Item);
+      else if (e.type === 'asked') {
+        C.items.push(toolLine(e.use));
+        detail([[e.answer === null ? { t: 'not answered', s: st.dim } : { t: e.answer, s: st.title }]]);
+      } else if (e.type === 'run') C.items.push({ ...toolLine(e.use), ...(e.decision.verdict === 'allow' && e.use.name === 'bash' ? { extra: [{ t: ` · ${e.decision.why}`, s: st.dim }] } : {}) } as Item);
+      else if (e.type === 'ran') {
+        const input = (e.use.input ?? {}) as Record<string, any>, r = e.result;
+        const file = rel(cwd, path.resolve(cwd, String(input.path ?? '')));
+        if ((e.use.name === 'write' || e.use.name === 'edit') && !r.error) did.wrote.push(file);
+        if (e.use.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error, out: r.output });
+        if (e.use.name === 'read' && !r.error) (did.about ??= []).push(file);
+        for (const x of toolEvents(String(e.use.name), input, r, file)) event(x.kind, x.text, x.ref);
+        // What it did, short: the diff of an edit, the end of a command's output.
+        if (r.diff) detail(r.diff.map((x) => [{ t: x.n ? `${String(x.n).padStart(4)} ` : '     ', s: st.dim }, { t: x.sign === ' ' ? x.text : `${x.sign} ${x.text}`, s: x.sign === '+' ? st.ok : x.sign === '-' ? st.del : st.dim }]));
+        else if (r.output?.length) {
+          const tail = r.output.slice(-6);
+          detail([...(r.output.length > 6 ? [[{ t: `… ${r.output.length - 6} more lines`, s: st.dim }]] : []), ...tail.map((l) => [{ t: l, s: st.dim }]), [{ t: r.summary, s: r.error ? st.warn : st.dim }]]);
+        } else detail([[{ t: r.summary, s: r.error ? st.warn : st.dim }]]);
+      } else if (e.type === 'held') note('Rime asked you something, so it waits for your answer before running that.', 'dim');
+      else if (e.type === 'full') note(`This conversation fills ${Math.round((e.used / e.size) * 100)}% of ${m.label}'s context (${fmtT(e.used)} of ${fmtT(e.size)} tokens), so Rime stopped before the next step. Say "continue" to go on anyway, or /clear to start fresh.`);
       schedule();
-    }
+    };
+    return {
+      messages: C.messages,
+      stream: (signal) => streamFor(cn)({ conn: cn, model: m, system: C.system, tools: TOOLS, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal, slot: cn.llamacpp ? 0 : undefined }),
+      store: {
+        append: (role, content, interrupted) => save((d) => d.append(bound(C).conversation()!, role, content, interrupted)) ?? 0,
+        update: (seq, content, interrupted) => void save((d) => d.update(C.convId!, seq, content, interrupted)),
+        remove: (seq) => void save((d) => d.remove(C.convId!, seq)),
+      },
+      emit: on,
+      decide: (u) => {
+        const d = decide(String(u.name), (u.input ?? {}) as Record<string, any>, permCtx(C));
+        decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why });
+        decisions.length = Math.min(decisions.length, 50);
+        return d;
+      },
+      approve: async (u, d, signal) => {
+        const answer = await ask(u, d, signal, C);
+        if (answer === 'stop') return 'stop';
+        if (answer === 'no') {
+          C.items.push({ kind: 'lines', lines: [[{ t: '✗ ', s: st.del }, { t: 'declined ', s: st.dim }, { t: `${describe(u).verb} ${describe(u).rest}`, s: st.title }, { t: ' · tell Rime what to do instead', s: st.dim }]] });
+          schedule();
+          // Your next words are the reason; esc (or ctrl+c) stops the whole turn instead.
+          const words = await new Promise<string | null>((res) => {
+            C.declining = res;
+            signal.addEventListener('abort', () => res(null), { once: true });
+          });
+          C.declining = null;
+          return words === null ? 'stop' : { declined: words };
+        }
+        if (answer === 'always') {
+          const edits = u.name === 'write' || u.name === 'edit';
+          if (edits || d.rule) {
+            for (const r of edits ? ['edit(**)'] : (d.rules ?? [d.rule!])) addConvRule('allow', r);
+            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${edits ? 'edits' : `${d.label} commands`} in this conversation · /permissions`, s: st.dim }]] });
+          }
+        }
+        return 'yes';
+      },
+      question: (q, options, signal) =>
+        new Promise<string | null>((res) => {
+          const finish = (v: string | null) => {
+            signal.removeEventListener('abort', stop);
+            C.question = null;
+            schedule();
+            res(v);
+          };
+          const stop = () => finish(null);
+          signal.addEventListener('abort', stop, { once: true });
+          C.question = { q, options, sel: 0, tool: true, done: finish };
+          schedule();
+        }),
+      // Auto mode's unasked commands run in the sandbox; read-only ones get git
+      // hardened. Asked-and-approved commands run as you approved them.
+      run: async (u, d, signal) => runTool(String(u.name), (u.input ?? {}) as Record<string, any>, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv }),
+      optionsOf,
+      queued: () => takeQueued(C),
+      context: () => {
+        const size = m.context ?? cfg.providers[m.provider]?.probe?.ctx;
+        return size ? { used: C.task?.lastPrompt ?? 0, size } : null;
+      },
+      planNote: () => (mode === 'plan' ? ' Rime is in plan mode (read-only): answer with a plan instead. The user switches modes with shift+tab.' : ''),
+      setLive: (l) => void (C.live = l),
+      setLastUser: (seq) => void (C.lastUserSeq = seq),
+    };
   }
 
   // A reply that ended with "(a) … (b) … which one?": the picker, where a pick
@@ -1449,7 +1452,6 @@ export async function runApp(cfg: Config, version: string) {
 
   // ---- tools (Phase 4) and permissions (SPEC §17) ----
 
-  const result = (id: unknown, content: string, error = false): Block => ({ type: 'tool_result', tool_use_id: id, content, ...(error ? { is_error: true } : {}) });
   // The project's .rime/permissions.json: its allow rules count once you trusted
   // this exact file (a cloned repo can't grant itself commands). Asked when Rime
   // opens the project and again before a message if the file changed.
@@ -1487,120 +1489,6 @@ export async function runApp(cfg: Config, version: string) {
   };
   const toolLine = (u: Block): Item => ({ kind: 'tool', ...describe(u) });
   const detail = (lines: Line[]) => bound(S).detail(lines);
-
-  // Runs each tool call in order. Every call gets a result, also when it's
-  // refused, declined or stopped, so the history stays valid.
-  async function runTools(uses: Block[], signal: AbortSignal, did: Did, C: Session): Promise<Block[]> {
-    const { conversation, store, note, drop, addConvRule, detail, event } = bound(C);
-    const out: Block[] = [];
-    let skip = '';
-    for (const u of uses) {
-      const input = (u.input ?? {}) as Record<string, any>;
-      if (signal.aborted) {
-        out.push(result(u.id, 'Not run: the user stopped Rime.', true));
-        continue;
-      }
-      if (skip) {
-        out.push(result(u.id, skip, true));
-        continue;
-      }
-      // A question for you: the turn waits for your pick (or your own words).
-      if (u.name === 'ask') {
-        const options = optionsOf(input.options);
-        const q = String(input.question ?? '').trim();
-        if (!q || options.length < 2) {
-          out.push(result(u.id, 'ask needs a question and 2-4 options.', true));
-          continue;
-        }
-        const a = await new Promise<string | null>((res) => {
-          const done = (v: string | null) => {
-            signal.removeEventListener('abort', stop);
-            C.question = null;
-            schedule();
-            res(v);
-          };
-          const stop = () => done(null);
-          signal.addEventListener('abort', stop, { once: true });
-          C.question = { q, options, sel: 0, tool: true, done };
-          schedule();
-        });
-        C.items.push(toolLine(u));
-        if (a === null) {
-          detail([[{ t: 'not answered', s: st.dim }]]);
-          out.push(result(u.id, 'Not answered: the user stopped Rime.', true));
-          skip = 'Not run: the user stopped Rime.';
-          continue;
-        }
-        detail([[{ t: a, s: st.title }]]);
-        out.push(result(u.id, `The user answered: ${a}`));
-        schedule();
-        continue;
-      }
-      const d = decide(String(u.name), input, permCtx(C));
-      decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why });
-      decisions.length = Math.min(decisions.length, 50);
-      if (d.verdict === 'deny') {
-        C.items.push({ ...toolLine(u), extra: [{ t: ` · not run: ${d.why}`, s: st.warn }] } as Item);
-        out.push(result(u.id, `Not run: ${d.why}.${mode === 'plan' ? ' Rime is in plan mode (read-only): answer with a plan instead. The user switches modes with shift+tab.' : ''}`, true));
-        continue;
-      }
-      if (d.verdict === 'ask') {
-        const answer = await ask(u, d, signal, C);
-        if (answer === 'stop') {
-          out.push(result(u.id, 'Not run: the user stopped Rime.', true));
-          continue;
-        }
-        if (answer === 'no') {
-          C.items.push({ kind: 'lines', lines: [[{ t: '✗ ', s: st.del }, { t: 'declined ', s: st.dim }, { t: `${describe(u).verb} ${describe(u).rest}`, s: st.title }, { t: ' · tell Rime what to do instead', s: st.dim }]] });
-          schedule();
-          // Your next words are the reason; esc (or ctrl+c) stops the whole turn instead.
-          const words = await new Promise<string | null>((res) => {
-            C.declining = res;
-            signal.addEventListener('abort', () => res(null), { once: true });
-          });
-          C.declining = null;
-          if (words === null) {
-            out.push(result(u.id, 'Not run: the user stopped Rime.', true));
-            skip = 'Not run: the user stopped Rime.';
-            continue;
-          }
-          out.push(result(u.id, words ? `The user declined this and said: ${words}` : 'The user declined this.', true));
-          skip = 'Not run: the user declined an earlier step.';
-          continue;
-        }
-        if (answer === 'always') {
-          const edits = u.name === 'write' || u.name === 'edit';
-          if (edits || d.rule) {
-            for (const r of edits ? ['edit(**)'] : (d.rules ?? [d.rule!])) addConvRule('allow', r);
-            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${edits ? 'edits' : `${d.label} commands`} in this conversation · /permissions`, s: st.dim }]] });
-          }
-        }
-      }
-      C.items.push({ ...toolLine(u), ...(d.verdict === 'allow' && u.name === 'bash' ? { extra: [{ t: ` · ${d.why}`, s: st.dim }] } : {}) } as Item);
-      schedule();
-      let r: ToolResult;
-      try {
-        // Auto mode's unasked commands run in the sandbox; read-only ones get git
-        // hardened. Asked-and-approved commands run as you approved them.
-        r = await runTool(String(u.name), input, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv });
-      } catch (e) {
-        r = { content: (e as Error).message, error: true, summary: (e as Error).message };
-      }
-      if (u.name === 'write' || u.name === 'edit') !r.error && did.wrote.push(rel(cwd, path.resolve(cwd, String(input.path))));
-      if (u.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error, out: r.output });
-      if (u.name === 'read' && !r.error) (did.about ??= []).push(rel(cwd, path.resolve(cwd, String(input.path))));
-      for (const e of toolEvents(String(u.name), input, r, rel(cwd, path.resolve(cwd, String(input.path ?? ''))))) event(e.kind, e.text, e.ref);
-      // What it did, short: the diff of an edit, the end of a command's output.
-      if (r.diff) detail(r.diff.map((x) => [{ t: x.n ? `${String(x.n).padStart(4)} ` : '     ', s: st.dim }, { t: x.sign === ' ' ? x.text : `${x.sign} ${x.text}`, s: x.sign === '+' ? st.ok : x.sign === '-' ? st.del : st.dim }]));
-      else if (r.output?.length) {
-        const tail = r.output.slice(-6);
-        detail([...(r.output.length > 6 ? [[{ t: `… ${r.output.length - 6} more lines`, s: st.dim }]] : []), ...tail.map((l) => [{ t: l, s: st.dim }]), [{ t: r.summary, s: r.error ? st.warn : st.dim }]]);
-      } else detail([[{ t: r.summary, s: r.error ? st.warn : st.dim }]]);
-      out.push(result(u.id, r.content, !!r.error));
-      schedule();
-    }
-    return out;
-  }
 
   function runTool(name: string, input: Record<string, any>, signal: AbortSignal, C: Session, as: RunAs = {}): ToolResult | Promise<ToolResult> {
     const { conversation, store, note, drop, addConvRule, detail } = bound(C);
