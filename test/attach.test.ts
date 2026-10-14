@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { blocksFor, chipChar, fromBlocks, chipFor, folderTree, fuzzy, imageSize, label, listFiles, parts, pastedPaths, textChip, thumbSize } from '../src/core/attach.ts';
+import { blocksFor, chipChar, cleanPaste, fromBlocks, chipFor, folderTree, fuzzy, imageSize, label, listFiles, parts, pastedPaths, textChip, thumbSize } from '../src/core/attach.ts';
 import { offsetAt, prompt, styles } from '../src/core/view.ts';
 import { stripAnsi } from '../src/core/term.ts';
 import { toWire } from '../src/providers/openai.ts';
@@ -184,4 +184,8 @@ test('a saved message shows its attachments as chips again, not their contents',
   assert.equal(label(back[1]), label(long));
   assert.equal(back[0].text, file.text, 'it previews the same contents');
   assert.equal(fromBlocks([{ type: 'text', text: 'plain' }], () => 'x'), 'plain');
+});
+
+test('pasted text keeps hyphens; tabs, control and chip characters go', () => {
+  assert.equal(cleanPaste('npm run build-dev --force\r\na-b --c\tx\x07' + chipChar(0) + chipChar(6399)), 'npm run build-dev --force\na-b --c  x');
 });

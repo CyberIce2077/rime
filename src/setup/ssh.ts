@@ -16,9 +16,17 @@ export function run(cmd: string, args: string[], timeoutMs = 15000, input?: stri
   return new Promise((resolve) => {
     let out = '', err = '';
     if (signal?.aborted) return resolve({ code: 124, out, err: 'cancelled' });
-    const p = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] });
-    const t = setTimeout(() => p.kill('SIGKILL'), timeoutMs);
-    const kill = () => p.kill('SIGKILL');
+    // Its own process group, so a stop also ends what `sh -c 'a && ssh …'` started.
+    const group = process.platform !== 'win32';
+    const p = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], detached: group });
+    const kill = () => {
+      try {
+        group && p.pid ? process.kill(-p.pid, 'SIGKILL') : p.kill('SIGKILL');
+      } catch {
+        p.kill('SIGKILL');
+      }
+    };
+    const t = setTimeout(kill, timeoutMs);
     signal?.addEventListener('abort', kill, { once: true });
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (err += d));
@@ -153,6 +161,22 @@ export function parseUnit(text: string): Unit | null {
     alias: flag('-a', '--alias'),
     args,
   };
+}
+
+// What the unit's flags keep Rime from doing (docs/providers.md §3.4).
+export function unitWarnings(u: Unit): string[] {
+  const has = (...f: string[]) => u.args.some((a) => f.includes(a) || f.some((x) => a.startsWith(`${x}=`)));
+  const val = (...f: string[]) => {
+    const i = u.args.findIndex((a) => f.includes(a));
+    return i >= 0 ? u.args[i + 1] : u.args.find((a) => f.some((x) => a.startsWith(`${x}=`)))?.split('=')[1];
+  };
+  const out: string[] = [];
+  if (!u.router && !u.alias) out.push('no --alias: the model is named by its file path; add --alias so Rime can name it');
+  if (has('--no-slots')) out.push("--no-slots: Rime can't see whether the server is busy or how much is cached");
+  if (val('--cache-ram', '-cram') === '0') out.push('--cache-ram 0: no prompt cache in RAM, so switching conversations reprocesses them');
+  if (!has('--slot-save-path')) out.push('no --slot-save-path: the cache can\'t be saved when Rime quits, so reopening rebuilds it');
+  if (!/^(127\.|localhost$|::1$)/.test(u.host) && !has('--api-key', '--api-key-file')) out.push(`listens on ${u.host} with no --api-key: anyone on the network can use it`);
+  return out;
 }
 
 export type Gpu = { name: string; memTotal: number; memUsed: number; temp: number; power: number; powerLimit: number };

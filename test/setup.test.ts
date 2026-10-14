@@ -5,15 +5,17 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { argv, buildOf, parseGpu, parseIni, parseUnit, sections, sshHosts } from '../src/setup/ssh.ts';
+import { argv, buildOf, parseGpu, parseIni, parseUnit, sections, sshHosts, unitWarnings } from '../src/setup/ssh.ts';
 import { magicPacket, wake } from '../src/setup/wol.ts';
-import { Cancelled, happened, runSteps } from '../src/setup/steps.ts';
+import { Cancelled, fillStep, happened, runSteps } from '../src/setup/steps.ts';
 import { createServer } from '../src/setup/panels.ts';
+import { createStopped } from '../src/setup/ui.ts';
 import { styles } from '../src/core/view.ts';
 import { stripAnsi } from '../src/core/term.ts';
 import { createLoader, bar } from '../src/setup/loader.ts';
 import { PALETTE, SCENE, SPRITE } from '../src/core/header.ts';
 import { startMock } from './fixtures/mock-llama.ts';
+import * as llama from '../src/providers/llamacpp.ts';
 
 test('ssh hosts come from the config and its Includes, without wildcards or git hosts', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rime-ssh-'));
@@ -261,4 +263,84 @@ test('the loader freezes him from the bottom row up', () => {
   assert.notDeepEqual(half[SCENE.SY][SCENE.SX + 1], PALETTE.A, 'the top is still water');
   assert.equal(l.cells(0.5, now, 'truecolor').length, 3);
   assert.deepEqual(bar(0.5), { fill: '▰'.repeat(12), empty: '▱'.repeat(12), pct: ' 50%' });
+});
+
+test('V-1: /server works for a llama.cpp server added with /connect (no ssh actions)', { timeout: 20000 }, async () => {
+  const mock = await startMock({ started: true, loaded: false });
+  try {
+    const cfg = { providers: { box: { preset: 'llamacpp', url: `${mock.url}/v1` } }, models: {} };
+    const calls: string[] = [];
+    const panel = createServer({
+      st: styles('none'), cfg, system: 'SYS', redraw() {}, close() {}, setBuffer() {}, save() {}, activate() {}, open() {},
+      say() {}, tunnel: () => { throw new Error('no tunnel for a direct server'); }, background() {},
+      openSteps() {}, ensure: (n: string) => calls.push(`ensure ${n}`), down: (n: string) => calls.push(`down ${n}`), promptRate: () => undefined,
+    } as any, 'box');
+    const text = () => panel.view(80).rows.map((x) => stripAnsi(x.line.map((c) => c.t).join(''))).join('\n');
+    for (let i = 0; i < 100 && !/Load qwen/.test(text()); i++) await new Promise((res) => setTimeout(res, 50));
+    assert.match(text(), /online/);
+    assert.match(text(), /no model loaded/);
+    assert.match(text(), /Load qwen3\.8-27b/);
+    assert.doesNotMatch(text(), /Restart server|Stop server|Power off|Show log|Edit steps/);
+    panel.key({ name: 'enter' }, '');
+    for (let i = 0; i < 100 && !/qwen3\.8-27b is loaded\./.test(text()); i++) await new Promise((res) => setTimeout(res, 50));
+    assert.equal(mock.state.loaded, true, text());
+  } finally {
+    await mock.close();
+  }
+});
+
+test('V-2: a single-model server is loaded, not a router to POST /models/load to', async () => {
+  const mock = await startMock({ started: true, single: true });
+  try {
+    assert.equal(await llama.routerModels(mock.url), null, 'a /models list without status is a single-model server');
+  } finally {
+    await mock.close();
+  }
+});
+
+test('V-5: setup warns about a server Rime can only half use', () => {
+  const unit = (exec: string) => parseUnit(`[Service]\nExecStart=${exec}\n`)!;
+  assert.deepEqual(unitWarnings(unit('/opt/llama-server --models-preset /etc/p.ini --host 127.0.0.1 --slot-save-path /var/slots')), []);
+  const w = unitWarnings(unit('/opt/llama-server -m /m/qwen.gguf --host 0.0.0.0 --cache-ram 0 --no-slots'));
+  assert.equal(w.length, 5, w.join('\n'));
+  assert.match(w.join('\n'), /--alias/);
+  assert.match(w.join('\n'), /--no-slots/);
+  assert.match(w.join('\n'), /--cache-ram 0/);
+  assert.match(w.join('\n'), /--slot-save-path/);
+  assert.match(w.join('\n'), /0\.0\.0\.0.*--api-key/);
+  assert.equal(unitWarnings(unit('/opt/llama-server -m /m/q.gguf -a qwen --host 0.0.0.0 --api-key-file /k --slot-save-path /s')).length, 0);
+});
+
+test('V-10: cancelling while llama-server starts offers to stop it', { timeout: 30000 }, async () => {
+  const r = await rig(true);
+  const tunnel = { child: null as any, port: 0 };
+  try {
+    // The start command goes out, but the server takes a while to answer: cancel then.
+    const run = runSteps(
+      { name: 'gpubox', host: 'gpubox', remote: r.remote, model: 'qwen3.8-27b', router: true },
+      { system: 'SYS', controls: { reasoning: true }, tunnel, edited: { start: 'true # slow start' }, onUpdate: (s) => s.steps[3].status === 'run' && (s.steps[3].progress ?? 0) > 0 && run.cancel() },
+    );
+    await assert.rejects(run.promise, Cancelled);
+    assert.equal(run.state.steps[3].status, 'stopped');
+    const panel = createStopped({ st: styles('none'), redraw() {}, say() {}, close() {} } as any, { name: 'gpubox', host: 'gpubox', state: run.state, after: '' }, () => {});
+    const text = panel.view(80).rows.map((x) => stripAnsi(x.line.map((c) => c.t).join(''))).join('\n');
+    assert.match(text, /Stop llama-server/);
+  } finally {
+    tunnel.child?.kill();
+    await r.close();
+  }
+});
+
+test('V-13: edited steps get {host} {port} {model} {mac} filled', () => {
+  const s = { name: 'g', host: 'gpubox', remote: '127.0.0.1:8080', mac: 'aa:bb:cc:dd:ee:ff', model: 'qwen', router: true };
+  assert.equal(fillStep('wol {mac} && ssh {host} load {model} -p {port}', s, 9000), 'wol aa:bb:cc:dd:ee:ff && ssh gpubox load qwen -p 9000');
+  assert.equal(fillStep('ssh -L {port}:x {host}', s, 0), 'ssh -L {port}:x gpubox', 'an unknown port waits for the tunnel step');
+});
+
+test('V-14: Wake-on-LAN only waits for a machine on this network', async () => {
+  const { onLan } = await import('../src/setup/wol.ts');
+  const nets = [{ family: 'IPv4', internal: false, address: '192.168.1.5', netmask: '255.255.255.0' }] as any;
+  assert.equal(onLan('192.168.1.20', nets), true);
+  assert.equal(onLan('10.0.0.7', nets), false);
+  assert.equal(onLan('gpubox.example', nets), true, "a name can't be told");
 });

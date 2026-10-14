@@ -4,7 +4,7 @@
 import { type Chip, fitTo, fmtK, isChip, parts, thumbSize, thumbnail } from './attach.ts';
 import { pixelCells } from './header.ts';
 import { type Line, fit, strWidth, wrap } from './term.ts';
-import type { BoxRow, Styles } from './view.ts';
+import { type BoxRow, type Styles, footRows } from './view.ts';
 
 const STRIP_MAX = 8;
 
@@ -84,9 +84,8 @@ export function previewBox(c: Chip, width: number, o: { big: boolean; hovering: 
   }
   rows.push({ line: info });
   if (o.blind) rows.push({ line: [{ t: o.blind, s: st.warn }] });
-  rows.push({ line: [], rule: 'full' }, {
-    line: [dim(o.big ? (max ? '↑ ↓ or wheel scroll · ctrl+u ctrl+d page · esc closes' : 'esc or a click on the chip closes this') : o.hovering ? 'move off the chip to close · click it for full size' : '← → move off the chip to close · backspace removes it · click it for full size')],
-  });
+  if (o.big) rows.push(...footRows(max ? ['↑ ↓', ' or wheel scroll · ', 'ctrl+u ctrl+d', ' page · ', 'esc', ' closes'] : ['esc', ' or a click on the chip closes this'], st));
+  else rows.push({ line: [], rule: 'full' }, { line: [dim(o.hovering ? 'move off the chip to close · click it for full size' : '← → move off the chip to close · backspace removes it · click it for full size')] });
   const legend: Line = [{ t: c.kind === 'folder' || c.kind === 'file' || c.kind === 'path' ? c.kind : `${c.kind} ${c.n}`, s: st.accent }, dim(' · preview')];
   return { legend, rows, max };
 }

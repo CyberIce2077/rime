@@ -54,7 +54,8 @@ test('a conversation open in another live window is left alone', async () => {
 
 test('titles are the first line, trimmed by code', () => {
   assert.equal(titleOf('\n  Fix signup crash  \nmore'), 'Fix signup crash');
-  assert.equal(titleOf('see  here'), 'see  here');
+  assert.equal(titleOf('build-dev --force'), 'build-dev --force');
+  assert.equal(titleOf('see \uE000 here'), 'see  here');
   assert.ok(titleOf('word '.repeat(30)).length <= 60);
 });
 
@@ -71,5 +72,26 @@ test('a conversation can be renamed and deleted from the list', async () => {
   assert.equal(db.get(b), undefined);
   assert.deepEqual(db.messages(b), []);
   assert.deepEqual(db.list('/p').map((c) => c.id), [a]);
+  db.close();
+});
+
+test('C-4: keep on top, and fork copies messages, timeline and search', async () => {
+  const db = await openDb(tmp());
+  const a = db.create('/p', 'PREFIX');
+  db.append(a, 'user', 'Fix signup crash');
+  db.event(a, 'edit', 'signup.ts +2 −1');
+  const b = db.create('/p', 'PREFIX');
+  db.append(b, 'user', 'Newer one');
+  assert.equal(db.list('/p')[0].id, b);
+  db.pin(a, true);
+  assert.deepEqual(db.list('/p').map((c) => [c.id, c.pinned]), [[a, 1], [b, 0]], 'kept on top');
+  db.pin(a, false);
+  assert.equal(db.list('/p')[0].id, b);
+  const f = db.fork(a);
+  assert.equal(db.get(f)?.title, 'Fix signup crash (fork)');
+  assert.equal(db.get(f)?.prefix, 'PREFIX');
+  assert.deepEqual(db.messages(f).map((m) => m.content), ['Fix signup crash']);
+  assert.deepEqual(db.timeline(f).map((e) => e.text), ['signup.ts +2 −1', 'forked from "Fix signup crash"']);
+  assert.deepEqual(db.search('/p', 'signup').map((r) => r.id).sort(), [a, f].sort());
   db.close();
 });

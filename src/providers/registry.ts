@@ -3,6 +3,7 @@
 import type { Config, ProviderConfig } from '../core/config.ts';
 import * as anthropic from './anthropic.ts';
 import { call } from './http.ts';
+import * as llama from './llamacpp.ts';
 import * as openai from './openai.ts';
 import { PRESETS } from './presets.ts';
 import type { Conn, Model } from './types.ts';
@@ -17,7 +18,8 @@ export function keyOf(p: ProviderConfig, env = process.env) {
 
 export function connOf(name: string, p: ProviderConfig, base: string, env = process.env): Conn {
   const pre = presetOf(p);
-  return { name, wire: pre.wire, base: base.replace(/\/$/, ''), key: keyOf(p, env), local: pre.local || !!p.ssh, cache: pre.cache, llamacpp: pre.llamacpp, effortField: pre.effortField };
+  if (pre.llamacpp && base) llama.authorize(base, keyOf(p, env));
+  return { name, wire: pre.wire, base: base.replace(/\/$/, ''), key: keyOf(p, env), local: pre.local || !!p.ssh, cache: pre.cache, llamacpp: pre.llamacpp, effortField: pre.effortField, ...(p.probe?.tools ? { tools: p.probe.tools } : {}) };
 }
 
 // The first address that answers ("alias or IP", §2.4): a quick /health, then

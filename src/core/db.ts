@@ -1,7 +1,6 @@
 // ~/.rime/rime.db: every conversation, saved the moment things happen (SPEC §16).
 // There are no sessions to manage: `rime` reopens the project's last conversation.
 // Each write is its own small transaction, so quitting never waits for a save.
-// The list, search and timeline arrive in Phase 4b; the tables are here now.
 
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -12,10 +11,15 @@ import type { Block, Price, Usage } from '../providers/types.ts';
 
 export const DB_PATH = path.join(os.homedir(), '.rime', 'rime.db');
 
-export type Conversation = { id: number; project: string; title: string; created: number; updated: number; model: string | null; tokens: number; cost: number; prefix: string | null; prefix_hash: string | null; lock_pid: number | null; rules: string | null };
+export type Conversation = { id: number; project: string; title: string; created: number; updated: number; model: string | null; tokens: number; cost: number; pinned: number; prefix: string | null; prefix_hash: string | null; lock_pid: number | null; rules: string | null };
 // `usage`: what the reply cost (normalized usage, its price, local or not), so the
 // meter and /usage come back when the conversation is reopened.
 export type Stored = { seq: number; role: 'user' | 'assistant' | 'system'; content: string | Block[]; interrupted: boolean; usage?: { usage: Usage; price?: Price; local?: boolean } };
+
+// A list row: the conversation, its message count and its last timeline entry.
+const ROW = 'c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation = c.id) AS n, (SELECT t.text FROM timeline t WHERE t.conversation = c.id ORDER BY t.seq DESC LIMIT 1) AS last';
+
+export type Entry = { seq: number; at: number; kind: string; text: string; ref: string | null };
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS conversations (
@@ -42,7 +46,7 @@ export function projectOf(cwd: string) {
 
 // The title starts as the first line of the first message, trimmed by code.
 export const titleOf = (text: string) => {
-  const line = text.replace(/[-]/g, '').split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+  const line = text.replace(/[\uE000-\uF8FF]/g, '').split('\n').map((l) => l.trim()).find(Boolean) ?? '';
   return line.length > 60 ? line.slice(0, 59).replace(/\s+\S*$/, '') + '…' : line;
 };
 
@@ -85,11 +89,29 @@ export async function openDb(file = DB_PATH) {
   try {
     fs.chmodSync(file, 0o600);
   } catch {}
+  // Search (SPEC §16): FTS5 over titles, the timeline and message text. Each row's
+  // rowid is conversation × 1e6 + slot (0 the title, the message's seq, or 500000 +
+  // the timeline seq), so a row is replaced and a conversation dropped by rowid.
+  const indexed = !!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'search'").get();
+  if (!indexed) db.exec("CREATE VIRTUAL TABLE search USING fts5(title, timeline, body, tokenize = 'porter unicode61')");
+  const tx = <T>(fn: () => T): T => {
+    db.exec('BEGIN');
+    try {
+      const r = fn();
+      db.exec('COMMIT');
+      return r;
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  };
 
   const q = {
     last: db.prepare('SELECT * FROM conversations WHERE project = ? ORDER BY updated DESC, id DESC LIMIT 1'),
-    list: db.prepare('SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation = c.id) AS n FROM conversations c WHERE c.project = ? ORDER BY c.pinned DESC, c.updated DESC, c.id DESC LIMIT ?'),
-    listAll: db.prepare('SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation = c.id) AS n FROM conversations c ORDER BY c.pinned DESC, c.updated DESC, c.id DESC LIMIT ?'),
+    list: db.prepare(`SELECT ${ROW} FROM conversations c WHERE c.project = ? ORDER BY c.pinned DESC, c.updated DESC, c.id DESC LIMIT ?`),
+    listAll: db.prepare(`SELECT ${ROW} FROM conversations c ORDER BY c.pinned DESC, c.updated DESC, c.id DESC LIMIT ?`),
+    event: db.prepare('INSERT INTO timeline (conversation, seq, at, kind, text, ref) VALUES (?, ?, ?, ?, ?, ?)'),
+    timeline: db.prepare('SELECT seq, at, kind, text, ref FROM timeline WHERE conversation = ? ORDER BY seq'),
     create: db.prepare('INSERT INTO conversations (project, title, created, updated, model, prefix, prefix_hash, lock_pid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
     lock: db.prepare('UPDATE conversations SET lock_pid = ? WHERE id = ?'),
     unlock: db.prepare('UPDATE conversations SET lock_pid = NULL WHERE id = ? AND lock_pid = ?'),
@@ -101,14 +123,37 @@ export async function openDb(file = DB_PATH) {
     touch: db.prepare('UPDATE conversations SET updated = ? WHERE id = ?'),
     title: db.prepare("UPDATE conversations SET title = ? WHERE id = ? AND title = ''"),
     rename: db.prepare('UPDATE conversations SET title = ? WHERE id = ?'),
+    pin: db.prepare('UPDATE conversations SET pinned = ? WHERE id = ?'),
+    fork: db.prepare("INSERT INTO conversations (project, title, created, updated, model, prefix, prefix_hash, rules) SELECT project, title || ' (fork)', ?, ?, model, prefix, prefix_hash, rules FROM conversations WHERE id = ?"),
+    forkMessages: db.prepare('INSERT INTO messages (conversation, seq, role, content, interrupted, usage) SELECT ?, seq, role, content, interrupted, usage FROM messages WHERE conversation = ?'),
+    forkTimeline: db.prepare('INSERT INTO timeline (conversation, seq, at, kind, text, ref) SELECT ?, seq, at, kind, text, ref FROM timeline WHERE conversation = ?'),
     forget: [db.prepare('DELETE FROM messages WHERE conversation = ?'), db.prepare('DELETE FROM timeline WHERE conversation = ?'), db.prepare('DELETE FROM conversations WHERE id = ?')],
     usage: db.prepare('UPDATE conversations SET tokens = tokens + ?, cost = cost + ?, model = ? WHERE id = ?'),
     prefix: db.prepare('UPDATE conversations SET prefix = ?, prefix_hash = ? WHERE id = ?'),
     rules: db.prepare('UPDATE conversations SET rules = ? WHERE id = ?'),
     messages: db.prepare('SELECT seq, role, content, interrupted, usage FROM messages WHERE conversation = ? ORDER BY seq'),
     setUsage: db.prepare('UPDATE messages SET usage = ? WHERE conversation = ? AND seq = ?'),
+    unindex: db.prepare('DELETE FROM search WHERE rowid = ?'),
+    unindexAll: db.prepare('DELETE FROM search WHERE rowid BETWEEN ? AND ?'),
+    index: db.prepare('INSERT INTO search (rowid, title, timeline, body) VALUES (?, ?, ?, ?)'),
+    match: db.prepare('SELECT rowid / 1000000 AS id, bm25(search, 10, 3, 1) AS score FROM search WHERE search MATCH ?'),
+    ids: db.prepare('SELECT id FROM conversations WHERE project = ?'),
+    eventSeq: db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM timeline WHERE conversation = ?'),
     prompts: db.prepare("SELECT m.content FROM messages m JOIN conversations c ON c.id = m.conversation WHERE c.project = ? AND m.role = 'user' ORDER BY c.updated DESC, m.seq DESC LIMIT ?"),
   };
+
+  const T = 1_000_000, EVENTS = 500_000;
+  const put = (conv: number, slot: number, col: 'title' | 'timeline' | 'body', text: string) => {
+    q.unindex.run(conv * T + slot);
+    if (text.trim()) q.index.run(conv * T + slot, col === 'title' ? text : null, col === 'timeline' ? text : null, col === 'body' ? text : null);
+  };
+  const bodyOf = (role: string, c: string | Block[]) => (role === 'system' ? '' : typeof c === 'string' ? c : c.filter((b) => b.type === 'text').map((b) => String(b.text)).join('\n'));
+  if (!indexed)
+    tx(() => {
+      for (const c of db.prepare('SELECT id, title FROM conversations').all() as { id: number; title: string }[]) put(c.id, 0, 'title', c.title);
+      for (const m of db.prepare('SELECT conversation, seq, role, content FROM messages').all() as { conversation: number; seq: number; role: string; content: string }[]) put(m.conversation, m.seq, 'body', bodyOf(m.role, JSON.parse(m.content)));
+      for (const e of db.prepare('SELECT conversation, seq, text FROM timeline').all() as { conversation: number; seq: number; text: string }[]) put(e.conversation, EVENTS + e.seq, 'timeline', e.text);
+    });
 
   return {
     wal: mode.toLowerCase() === 'wal',
@@ -124,7 +169,7 @@ export async function openDb(file = DB_PATH) {
     // This project's conversations (or every project's), pinned first, then
     // newest; `other` when another live Rime window has it open.
     list(project: string | null, limit = 200) {
-      const rows = (project === null ? q.listAll.all(limit) : q.list.all(project, limit)) as (Conversation & { n: number })[];
+      const rows = (project === null ? q.listAll.all(limit) : q.list.all(project, limit)) as (Conversation & { n: number; last: string | null })[];
       return rows.map((c) => ({ ...c, other: !!c.lock_pid && c.lock_pid !== process.pid && alive(c.lock_pid) }));
     },
     // Opens a conversation from the list, unless another live window has it.
@@ -140,32 +185,81 @@ export async function openDb(file = DB_PATH) {
     },
     get: (id: number) => q.get.get(id) as Conversation | undefined,
     unlock: (id: number) => void q.unlock.run(id, process.pid),
-    // Appends one message (append-only, the exact blocks sent and received).
+    // Appends one message (append-only, the exact blocks sent and received), with
+    // its title and search index in the same transaction.
     append(conv: number, role: Stored['role'], content: string | Block[], interrupted = false) {
-      const seq = Number((q.next.get(conv) as { seq: number }).seq);
-      q.add.run(conv, seq, role, JSON.stringify(content), interrupted ? 1 : 0);
-      q.touch.run(Date.now(), conv);
-      if (role === 'user') q.title.run(titleOf(typeof content === 'string' ? content : String(content.find((b) => b.type === 'text')?.text ?? '')), conv);
-      return seq;
+      return tx(() => {
+        const seq = Number((q.next.get(conv) as { seq: number }).seq);
+        q.add.run(conv, seq, role, JSON.stringify(content), interrupted ? 1 : 0);
+        q.touch.run(Date.now(), conv);
+        put(conv, seq, 'body', bodyOf(role, content));
+        if (role === 'user') {
+          const title = titleOf(typeof content === 'string' ? content : String(content.find((b) => b.type === 'text')?.text ?? ''));
+          if (q.title.run(title, conv).changes) put(conv, 0, 'title', title);
+        }
+        return seq;
+      });
     },
     // A streaming reply is stored as it grows (interrupted until it ends).
     update(conv: number, seq: number, content: string | Block[], interrupted: boolean) {
-      q.set.run(JSON.stringify(content), interrupted ? 1 : 0, conv, seq);
-      q.touch.run(Date.now(), conv);
+      tx(() => {
+        q.set.run(JSON.stringify(content), interrupted ? 1 : 0, conv, seq);
+        q.touch.run(Date.now(), conv);
+        const role = (db.prepare('SELECT role FROM messages WHERE conversation = ? AND seq = ?').get(conv, seq) as { role: string } | undefined)?.role ?? 'assistant';
+        put(conv, seq, 'body', bodyOf(role, content));
+      });
     },
-    remove: (conv: number, seq: number) => void q.drop.run(conv, seq),
+    remove: (conv: number, seq: number) => tx(() => (q.drop.run(conv, seq), q.unindex.run(conv * T + seq))),
     // From the conversations window: a new title, or the whole conversation gone.
-    rename: (conv: number, title: string) => void q.rename.run(title, conv),
-    delete(conv: number) {
-      db.exec('BEGIN');
-      try {
+    rename: (conv: number, title: string) => tx(() => (q.rename.run(title, conv), put(conv, 0, 'title', title))),
+    delete: (conv: number) =>
+      tx(() => {
         for (const s of q.forget) s.run(conv);
-        db.exec('COMMIT');
-      } catch (e) {
-        db.exec('ROLLBACK');
-        throw e;
-      }
+        q.unindexAll.run(conv * T, conv * T + T - 1);
+      }),
+    pin: (conv: number, on: boolean) => void q.pin.run(on ? 1 : 0, conv),
+    // A copy to try another direction: the same messages, timeline and prefix.
+    fork(conv: number) {
+      const id = tx(() => {
+        const now = Date.now();
+        const id = Number(q.fork.run(now, now, conv).lastInsertRowid);
+        q.forkMessages.run(id, conv);
+        q.forkTimeline.run(id, conv);
+        const c = q.get.get(id) as Conversation;
+        put(id, 0, 'title', c.title);
+        for (const m of q.messages.all(id) as { seq: number; role: string; content: string }[]) put(id, m.seq, 'body', bodyOf(m.role, JSON.parse(m.content)));
+        for (const e of q.timeline.all(id) as Entry[]) put(id, EVENTS + e.seq, 'timeline', e.text);
+        return id;
+      });
+      this.event(id, 'pin', `forked from "${(q.get.get(conv) as Conversation).title}"`);
+      return id;
     },
+    // Conversations matching every word of `query` (each a prefix, stemmed), best
+    // first by bm25: the title weighs most, then the timeline, then the text.
+    search(project: string | null, query: string): { id: number; score: number }[] {
+      const words = query.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+      const mine = project === null ? null : new Set((q.ids.all(project) as { id: number }[]).map((r) => r.id));
+      let hits: Map<number, number> | null = null;
+      for (const w of words.slice(0, 8)) {
+        const found = new Map<number, number>();
+        for (const r of q.match.all(`"${w}"*`) as { id: number; score: number }[]) if (!mine || mine.has(r.id)) found.set(r.id, (found.get(r.id) ?? 0) + r.score);
+        if (!hits) hits = found;
+        else {
+          const both = new Map<number, number>();
+          for (const [id, sc] of hits) if (found.has(id)) both.set(id, sc + found.get(id)!);
+          hits = both;
+        }
+      }
+      return [...(hits ?? [])].map(([id, score]) => ({ id, score })).sort((a, b) => a.score - b.score);
+    },
+    // The timeline (SPEC §16): what happened, written by code (src/core/timeline.ts).
+    event: (conv: number, kind: string, text: string, ref?: string) =>
+      tx(() => {
+        const seq = Number((q.eventSeq.get(conv) as { seq: number }).seq);
+        q.event.run(conv, seq, Date.now(), kind, text, ref ?? null);
+        put(conv, EVENTS + seq, 'timeline', text);
+      }),
+    timeline: (conv: number) => q.timeline.all(conv) as Entry[],
     usage: (conv: number, tokens: number, cost: number, model: string) => void q.usage.run(tokens, cost, model, conv),
     setPrefix: (conv: number, prefix: string, hash?: string) => void q.prefix.run(prefix, hash ?? null, conv),
     setRules: (conv: number, rules: object) => void q.rules.run(JSON.stringify(rules), conv),

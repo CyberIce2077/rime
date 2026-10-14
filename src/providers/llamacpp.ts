@@ -1,7 +1,7 @@
 // llama.cpp hooks (docs/providers.md §4): effort/reasoning mapping, sampling, slot
 // pinning, and the server endpoints setup and /server use.
 
-import { call } from './http.ts';
+import { bearer, call } from './http.ts';
 import type { Controls, Effort, Message, Model } from './types.ts';
 
 type Sampling = Record<string, number>;
@@ -40,10 +40,16 @@ export function extras(m: Model, c: Controls, slot?: number) {
 }
 
 // llama.cpp serves its own endpoints next to /v1.
-export const rootOf = (base: string) => base.replace(/\/v1\/?$/, '');
+export const rootOf = (base: string) => base.replace(/\/v1\/?$/, '').replace(/\/$/, '');
 
-export const health = (root: string, timeout = 1500) => call(`${root}/health`, { timeout });
-export const props = (root: string) => call(`${root}/props`);
+// A server started with --api-key wants it on every endpoint, not only /v1. Each
+// connection registers its key here, so every helper below sends it.
+const keys = new Map<string, string>();
+export const authorize = (base: string, key?: string) => void (key ? keys.set(rootOf(base), key) : keys.delete(rootOf(base)));
+const auth = (root: string) => bearer(keys.get(rootOf(root)));
+
+export const health = (root: string, timeout = 1500) => call(`${root}/health`, { timeout, headers: auth(root) });
+export const props = (root: string) => call(`${root}/props`, { headers: auth(root) });
 
 export type ServerModel = { id: string; status: string; path?: string };
 
@@ -51,9 +57,10 @@ export type ServerModel = { id: string; status: string; path?: string };
 // server has no /models route (or answers with the OpenAI shape), which we treat
 // as "already loaded".
 export async function routerModels(root: string): Promise<ServerModel[] | null> {
-  const r = await call(`${root}/models`).catch(() => null);
+  const r = await call(`${root}/models`, { headers: auth(root) }).catch(() => null);
   if (!r || r.status !== 200 || !r.json) return null;
   const list: any[] = r.json.data ?? r.json.models ?? (Array.isArray(r.json) ? r.json : []);
+  if (!list.some((m) => m.status ?? m.state)) return null; // the OpenAI list: one model, loaded
   return list.map((m) => ({
     id: m.id ?? m.name ?? m.model,
     status: String(m.status?.value ?? m.status ?? m.state ?? 'unknown'),
@@ -61,8 +68,9 @@ export async function routerModels(root: string): Promise<ServerModel[] | null> 
   }));
 }
 
-export const loadModel = (root: string, model: string, signal?: AbortSignal) => call(`${root}/models/load`, { body: { model }, timeout: 15000, signal });
-export const unloadModel = (root: string, model: string) => call(`${root}/models/unload`, { body: { model }, timeout: 15000 });
+export const loadModel = (root: string, model: string, signal?: AbortSignal) => call(`${root}/models/load`, { body: { model }, timeout: 15000, signal, headers: auth(root) });
+export const unloadModel = (root: string, model: string) => call(`${root}/models/unload`, { body: { model }, timeout: 15000, headers: auth(root) });
+export const slots = (root: string) => call(`${root}/slots`, { timeout: 2000, headers: auth(root) });
 
 // Waits until `model` is loaded, reporting 0..1 progress from /models/sse
 // (download bytes, then loading stages) and polling /models as a fallback.
@@ -98,7 +106,7 @@ export async function waitLoaded(root: string, model: string, onProgress: (p: nu
     if (signal?.aborted) return fail(new Error('cancelled'));
     signal?.addEventListener('abort', () => fail(new Error('cancelled')), { once: true });
     // ponytail: the /models/sse event shape is read leniently (verify on b11514).
-    fetch(`${root}/models/sse`, { signal: ac.signal })
+    fetch(`${root}/models/sse`, { signal: ac.signal, headers: auth(root) })
       .then(async (res) => {
         if (!res.ok || !res.body) return;
         const dec = new TextDecoder();
@@ -133,11 +141,11 @@ export async function waitLoaded(root: string, model: string, onProgress: (p: nu
 
 // Ends the model's thinking early so it answers right away (esc, §4.3).
 export const endReasoning = (root: string, id: string) =>
-  call(`${root}/v1/chat/completions/control`, { body: { id, action: 'reasoning_end' }, timeout: 2000 }).catch(() => null);
+  call(`${root}/v1/chat/completions/control`, { body: { id, action: 'reasoning_end' }, timeout: 2000, headers: auth(root) }).catch(() => null);
 
 // True when every slot is taken (someone else is using the server).
 export async function busy(root: string) {
-  const r = await call(`${root}/slots?fail_on_no_slot=1`, { timeout: 1500 }).catch(() => null);
+  const r = await call(`${root}/slots?fail_on_no_slot=1`, { timeout: 1500, headers: auth(root) }).catch(() => null);
   return r?.status === 503;
 }
 
@@ -164,7 +172,7 @@ export async function templateSafety(root: string, m: Pick<Model, 'id' | 'effort
     { role: 'user', content: marker },
   ];
   const render = async (reasoning_effort?: string) => {
-    const r = await call(`${root}/apply-template`, { body: { model: m.id, messages, ...(reasoning_effort ? { reasoning_effort } : {}) }, timeout: 5000 });
+    const r = await call(`${root}/apply-template`, { body: { model: m.id, messages, ...(reasoning_effort ? { reasoning_effort } : {}) }, timeout: 5000, headers: auth(root) });
     if (r.status !== 200 || typeof r.json?.prompt !== 'string') throw new Error(`apply-template: ${r.status}`);
     return r.json.prompt as string;
   };

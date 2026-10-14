@@ -1,6 +1,16 @@
 // Wake-on-LAN: a magic packet (6 x 0xFF, then the MAC 16 times) as a UDP broadcast.
 
 import dgram from 'node:dgram';
+import os from 'node:os';
+
+// Whether an IPv4 address is on one of this computer's networks. A magic packet
+// doesn't leave the LAN, so waking anything else would only wait. A name (not an
+// address) can't be told, so it counts as maybe.
+export function onLan(ip: string, nets = Object.values(os.networkInterfaces()).flat()) {
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return true;
+  const n = (a: string) => a.split('.').reduce((x, o) => x * 256 + Number(o), 0);
+  return nets.some((i) => i && i.family === 'IPv4' && !i.internal && (n(i.address) & n(i.netmask)) >>> 0 === (n(ip) & n(i.netmask)) >>> 0);
+}
 
 export function magicPacket(mac: string) {
   const hex = mac.replace(/[^0-9a-f]/gi, '');

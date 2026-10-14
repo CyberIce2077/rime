@@ -2,7 +2,8 @@
 // `rime connect <url>`: what is it, does it need a key, which models does it serve.
 
 import { bearer, call } from './http.ts';
-import { props, routerModels } from './llamacpp.ts';
+import { authorize, props, routerModels, templateSafety } from './llamacpp.ts';
+import type { ProviderConfig } from '../core/config.ts';
 import type { ServerModel } from './llamacpp.ts';
 
 export type Probe = {
@@ -37,6 +38,7 @@ export async function probe(url: string, key?: string): Promise<Probe | null> {
     out.models = list.map((x) => ({ id: String(x.id ?? x.name), context: x.meta?.n_ctx_train ?? x.context_length ?? x.max_model_len }));
   }
 
+  if (key) authorize(root, key);
   const p = await props(root).catch(() => null);
   if (p?.status === 200 && (p.json?.build_info || p.json?.default_generation_settings)) {
     out.kind = 'llamacpp';
@@ -47,11 +49,47 @@ export async function probe(url: string, key?: string): Promise<Probe | null> {
     for (const x of out.server ?? out.models) {
       if (/\.gguf$|\//.test(x.id)) out.warnings.push(`${x.id} has no alias; add --alias so Rime can name it`);
     }
-    const s = await get(`${root}/slots`);
+    const s = await get(`${root}/slots`, key);
     if (s?.status === 501) out.warnings.push('/slots is disabled; Rime can\'t check whether the server is busy');
   } else if ((await get(`${root}/api/tags`))?.status === 200) out.kind = 'ollama';
   else if ((await get(`${root}/api/v0/models`))?.status === 200) out.kind = 'lmstudio';
   return out;
+}
+
+// One request with one tool (SPEC §12 Phase 4): does the server's chat template
+// turn the call into tool_calls (native), leave Qwen's <tool_call> text in the
+// reply (text), or neither (none)? null when the request fails.
+export async function toolSupport(base: string, model: string, key?: string): Promise<'native' | 'text' | 'none' | null> {
+  const tool = { type: 'function', function: { name: 'get_time', description: 'Returns the current time.', parameters: { type: 'object', properties: {} } } };
+  const r = await call(`${base.replace(/\/$/, '')}/chat/completions`, {
+    headers: bearer(key),
+    body: { model, messages: [{ role: 'user', content: 'What time is it? Use the get_time tool.' }], tools: [tool], max_tokens: 300, reasoning_effort: 'none' },
+    timeout: 60000,
+  }).catch(() => null);
+  const msg = r?.status === 200 ? r.json?.choices?.[0]?.message : null;
+  if (!msg) return null;
+  if (msg.tool_calls?.length) return 'native';
+  return /<tool_call>/.test(String(msg.content ?? '')) ? 'text' : 'none';
+}
+
+// What Rime knows about a llama.cpp server's template (cache safety, tool calls),
+// measured again when its build changes; null when what's saved still holds.
+// Until it's measured, effort and reasoning count as unsafe to change per message.
+export async function recheck(root: string, m: { id: string; efforts?: Record<string, string> }, saved: ProviderConfig['probe']): Promise<NonNullable<ProviderConfig['probe']> | null> {
+  const pr = await props(root).catch(() => null);
+  if (pr?.status !== 200) return null;
+  const build = String(pr.json?.build_info ?? '').match(/b\d+/)?.[0] ?? pr.json?.build_info;
+  if (saved && saved.build === build && saved.effortSafe !== undefined && saved.tools) return null;
+  const safety = await templateSafety(root, m as any).catch(() => null);
+  const tools = (await toolSupport(`${root}/v1`, m.id).catch(() => null)) ?? saved?.tools;
+  return {
+    ...saved,
+    build,
+    slots: pr.json?.total_slots,
+    ctx: pr.json?.default_generation_settings?.n_ctx,
+    ...(safety ? { effortSafe: safety.effort !== 'unsafe', reasoningSafe: safety.reasoning !== 'unsafe' } : {}),
+    ...(tools ? { tools } : {}),
+  };
 }
 
 // Local servers Rime looks for on "This computer" (llama.cpp, Ollama, LM Studio, vLLM).

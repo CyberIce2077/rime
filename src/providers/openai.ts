@@ -8,7 +8,9 @@ import type { Block, Event, Message, Request, Usage } from './types.ts';
 
 type Wire = Record<string, unknown>;
 
-export function toWire(system: string, messages: Message[]): Wire[] {
+// `textTools`: the server's template has no tool support, so tool results go back
+// in Qwen's own text form inside the user message instead of as role "tool".
+export function toWire(system: string, messages: Message[], textTools = false): Wire[] {
   const out: Wire[] = [{ role: 'system', content: system }];
   for (const m of messages) {
     if (m.role === 'system') continue; // Anthropic-only effort messages
@@ -19,11 +21,18 @@ export function toWire(system: string, messages: Message[]): Wire[] {
     const text = m.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
     if (m.role === 'assistant') {
       const reasoning = m.content.filter((b) => b.type === 'thinking').map((b) => b.thinking).join('');
-      const calls = m.content.filter((b) => b.type === 'tool_use').map((b) => ({
+      const calls = m.content.filter((b) => b.type === 'tool_use' && !b.textual).map((b) => ({
         id: b.id, type: 'function', function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
       }));
       out.push({ role: 'assistant', content: text, ...(reasoning ? { reasoning_content: reasoning } : {}), ...(calls.length ? { tool_calls: calls } : {}) });
     } else {
+      if (textTools) {
+        const t = m.content.flatMap((b) => (b.type === 'tool_result' ? [`<tool_response>\n${typeof b.content === 'string' ? b.content : JSON.stringify(b.content)}\n</tool_response>`] : b.type === 'text' ? [String(b.text)] : [])).join('\n');
+        if (t && !m.content.some((b) => b.type === 'image')) {
+          out.push({ role: 'user', content: t });
+          continue;
+        }
+      }
       for (const b of m.content.filter((b) => b.type === 'tool_result')) {
         const c = b.content;
         out.push({ role: 'tool', tool_call_id: b.tool_use_id, content: typeof c === 'string' ? c : JSON.stringify(c) });
@@ -62,25 +71,29 @@ export function body(req: Request): Wire {
   const { conn, model, controls } = req;
   const b: Wire = {
     model: model.id,
-    messages: toWire(req.system, req.messages),
+    messages: toWire(req.system, req.messages, !!conn.tools && conn.tools !== 'native'),
     stream: true,
     stream_options: { include_usage: true },
     ...(req.maxTokens ? { max_tokens: req.maxTokens } : {}),
   };
   if (req.tools?.length) b.tools = req.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } }));
   if (conn.llamacpp) return { ...b, ...extras(model, controls, req.slot) };
-  // ponytail: effort field names per host are from the design note; verify per preset.
+  // Each host takes effort in its own field, or not at all (presets.ts).
+  const effort = controls.effort === 'max' ? 'high' : controls.effort;
   if (conn.effortField === 'reasoning.effort') {
     if (!controls.reasoning) b.reasoning = { enabled: false };
-    else if (controls.effort) b.reasoning = { effort: controls.effort === 'max' ? 'high' : controls.effort };
-  } else if (!controls.reasoning) b.reasoning_effort = 'none';
-  else if (controls.effort) b.reasoning_effort = controls.effort === 'max' ? 'high' : controls.effort;
+    else if (effort) b.reasoning = { effort };
+  } else if (conn.effortField === 'reasoning_effort') {
+    if (!controls.reasoning) b.reasoning_effort = 'none';
+    else if (effort) b.reasoning_effort = effort;
+  } else if (conn.effortField === 'think' && !controls.reasoning) b.think = false;
+  else if (conn.effortField === 'chat_template_kwargs' && !controls.reasoning) b.chat_template_kwargs = { enable_thinking: false };
   return b;
 }
 
 export async function* stream(req: Request): AsyncGenerator<Event> {
   let text = '', reasoning = '', usage: Usage | null = null;
-  const calls: { id?: string; name?: string; args: string }[] = [];
+  const calls: { id?: string; name?: string; args: string; textual?: boolean }[] = [];
   let sentId = false;
   for await (const ch of await postStream(`${req.conn.base}/chat/completions`, bearer(req.conn.key), body(req), req.signal)) {
     if (ch.error) throw new Error(ch.error.message || String(ch.error));
@@ -104,16 +117,17 @@ export async function* stream(req: Request): AsyncGenerator<Event> {
       if (tc.id) slot.id = tc.id;
       if (tc.function?.name) slot.name = tc.function.name;
       if (tc.function?.arguments) slot.args += tc.function.arguments;
+      if (slot.name) yield { type: 'tool', name: slot.name, args: slot.args };
     }
     if (c?.finish_reason) yield { type: 'stop', reason: STOP[c.finish_reason] ?? c.finish_reason };
     usage = usageOf(ch.usage, ch.timings) ?? usage;
   }
   // A server whose chat template doesn't handle tools leaves Qwen's own
-  // <tool_call> XML in the text: read the calls from there instead.
+  // <tool_call> XML in the text: read the calls from there instead. The text is
+  // kept as written and the calls are marked `textual`, so the next request sends
+  // the same bytes back and llama.cpp's cache still matches.
   if (!calls.length && req.tools?.length && text.includes('<tool_call>')) {
-    const x = textToolCalls(text, req.tools.map((t) => t.name));
-    text = x.text;
-    for (const c of x.calls) calls.push({ id: c.id, name: c.name, args: JSON.stringify(c.input) });
+    for (const c of textToolCalls(text, req.tools).calls) calls.push({ id: c.id, name: c.name, args: JSON.stringify(c.input), textual: true });
   }
   const blocks: Block[] = [];
   if (reasoning) blocks.push({ type: 'thinking', thinking: reasoning, signature: '' });
@@ -123,7 +137,7 @@ export async function* stream(req: Request): AsyncGenerator<Event> {
     try {
       input = JSON.parse(tc.args || '{}');
     } catch {}
-    blocks.push({ type: 'tool_use', id: tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`, name: tc.name, input });
+    blocks.push({ type: 'tool_use', id: tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`, name: tc.name, input, ...(tc.textual ? { textual: true } : {}) });
   }
   if (calls.length) yield { type: 'stop', reason: 'tool_use' };
   yield { type: 'blocks', blocks };
@@ -131,18 +145,21 @@ export async function* stream(req: Request): AsyncGenerator<Event> {
 }
 
 // Qwen's tool-call text: <tool_call><function=bash><parameter=command>ls</parameter>
-// </function></tool_call>, or the JSON form {"name": …, "arguments": {…}}.
-export function textToolCalls(text: string, names: string[]) {
+// </function></tool_call>, or the JSON form {"name": …, "arguments": {…}}. A
+// parameter is read by the tool's schema: a string stays text (a file that holds
+// JSON, or `42`), anything else is parsed.
+export function textToolCalls(text: string, tools: { name: string; input_schema: Record<string, any> }[]) {
   const calls: { id: string; name: string; input: Record<string, unknown> }[] = [];
-  const lower = new Map(names.map((n) => [n.toLowerCase(), n]));
+  const lower = new Map(tools.map((t) => [t.name.toLowerCase(), t]));
   for (const [, body] of text.matchAll(/<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g)) {
     let name: string | undefined, input: Record<string, unknown> = {};
     const fn = /<function=([^>\s]+)>/.exec(body);
     if (fn) {
       name = fn[1];
+      const props = lower.get(name.toLowerCase())?.input_schema.properties ?? {};
       for (const [, k, v] of body.matchAll(/<parameter=([^>\s]+)>\n?([\s\S]*?)\n?<\/parameter>/g)) {
         try {
-          input[k] = /^\s*[[{0-9tfn-]/.test(v) && !/^\s*\d+[^\d.]/.test(v) ? JSON.parse(v) : v;
+          input[k] = props[k]?.type === 'string' ? v : /^\s*[[{0-9tfn-]/.test(v) && !/^\s*\d+[^\d.]/.test(v) ? JSON.parse(v) : v;
         } catch {
           input[k] = v;
         }
@@ -155,7 +172,7 @@ export function textToolCalls(text: string, names: string[]) {
       } catch {}
     }
     const known = name && lower.get(name.toLowerCase());
-    if (known) calls.push({ id: `call_${Math.random().toString(36).slice(2, 10)}`, name: known, input });
+    if (known) calls.push({ id: `call_${Math.random().toString(36).slice(2, 10)}`, name: known.name, input });
   }
   return { text: calls.length ? text.slice(0, text.indexOf('<tool_call>')).trimEnd() : text, calls };
 }

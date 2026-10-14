@@ -28,10 +28,18 @@ const ago = (s: number) => (s >= 86400 ? `${Math.floor(s / 86400)}d ${Math.floor
 type ServerHost = Host & { openSteps(name: string): void; ensure(name: string): void; down(name: string): void; promptRate(): number | undefined };
 type Confirm = { q: string; why: string; cmd: string; yes: string; no: string; run: (signal: AbortSignal, progress: (p: number | null) => void) => Promise<string>; label: string; stopped: string };
 
+// /server actions still running, per server: one moved to the background is
+// watched (and can be stopped) again by opening /server.
+type Running = { c: Confirm; ac: AbortController; progress: number | null; bg: boolean; done: Promise<string>; watcher: object };
+const running = new Map<string, Running>();
+
 export function createServer(h: ServerHost, name: string): Panel {
   const { st } = h;
   const p = h.cfg.providers[name];
   const host = p.ssh ?? name;
+  // A server added with /connect has no ssh: status, load and unload over HTTP only.
+  const sshy = !!p.ssh;
+  const direct = sshy ? '' : llama.rootOf([p.url ?? PRESETS[p.preset]?.url ?? ''].flat()[0] ?? '');
   const dim = (t: string) => ({ t, s: st.dim });
   const plain = (t: string) => ({ t, s: st.fg });
   const dot = (ok: boolean) => ({ t: '● ', s: ok ? st.ok : st.warn });
@@ -43,16 +51,16 @@ export function createServer(h: ServerHost, name: string): Panel {
   let pick = 0;
   let mode: 'list' | 'models' | 'confirm' | 'action' = 'list';
   let confirm: Confirm | null = null;
-  let action: { c: Confirm; ac: AbortController; progress: number | null; bg: boolean } | null = null;
+  let action: Running | null = null;
   let note: Line | null = null;
 
-  const root = () => `http://127.0.0.1:${h.tunnel(name).port}`;
+  const root = () => (sshy ? `http://127.0.0.1:${h.tunnel(name).port}` : direct);
 
   async function refresh() {
-    const t = h.tunnel(name);
-    const hp = t.port ? await llama.health(root()).catch(() => null) : null;
+    const port = sshy ? h.tunnel(name).port : 1;
+    const hp = port ? await llama.health(root()).catch(() => null) : null;
     online = !!hp && (hp.status === 200 || hp.status === 503);
-    const sv = sections((await ssh(host, STATUS, 15000)).out);
+    const sv: Record<string, string> = sshy ? sections((await ssh(host, STATUS, 15000)).out) : {};
     const out: Line[] = [];
     const g = parseGpu(sv.GPU ?? '');
     const maxT = (sv.TEMP ?? '').match(/(\d+)\s*C/)?.[1];
@@ -61,14 +69,14 @@ export function createServer(h: ServerHost, name: string): Panel {
       const pr = await llama.props(root()).catch(() => null);
       const build = String(pr?.json?.build_info ?? '').match(/b\d+/)?.[0];
       const up = Number(sv.UPTIME?.trim());
-      out.push([dot(true), plain('online '), dim(`· ${p.tunnel?.remote.split(':')[0] === '127.0.0.1' ? `${host} via tunnel 127.0.0.1:${t.port}` : root()}${build ? ` · llama.cpp ${build}` : ''}${up ? ` · up ${ago(up)}` : ''}`)]);
+      out.push([dot(true), plain('online '), dim(`· ${sshy && p.tunnel?.remote.split(':')[0] === '127.0.0.1' ? `${host} via tunnel 127.0.0.1:${port}` : root()}${build ? ` · llama.cpp ${build}` : ''}${up ? ` · up ${ago(up)}` : ''}`)]);
       const list = await llama.routerModels(root()).catch(() => null);
       models = list ?? [];
       loaded = list?.find((m) => m.status === 'loaded')?.id ?? (list ? undefined : p.model);
       const ctx = pr?.json?.default_generation_settings?.n_ctx;
       if (loaded) out.push([dot(true), { t: loaded, s: st.titleB }, plain(' loaded'), dim([ctx ? `${Math.round(ctx / 1000)}k context` : '', g ? `VRAM ${(g.memUsed / 1024).toFixed(1)} / ${Math.round(g.memTotal / 1024)} GB` : ''].filter(Boolean).map((x) => ` · ${x}`).join(''))]);
       else out.push([dot(false), plain('no model loaded'), dim(`${g ? ` · VRAM ${(g.memUsed / 1024).toFixed(1)} / ${Math.round(g.memTotal / 1024)} GB` : ''} · messages wait until one is loaded`)]);
-      const slots = loaded ? await fetch(`${root()}/slots`, { signal: AbortSignal.timeout(2000) }).then((r) => r.json()).catch(() => null) : null;
+      const slots = loaded ? await llama.slots(root()).then((r) => r.json).catch(() => null) : null;
       const s0 = Array.isArray(slots) ? slots[0] : null;
       const n = s0 ? (s0.n_past ?? s0.n_cache_tokens ?? s0.n_prompt_tokens_cache) : undefined;
       if (typeof n === 'number' && n > 0) {
@@ -76,7 +84,7 @@ export function createServer(h: ServerHost, name: string): Panel {
         const rate = h.promptRate();
         out.push([dim(`  main chat   ${(n / 1000).toFixed(1)}k tokens cached${rate ? ` (would take ~${Math.round(n / rate)} s to rebuild)` : ''}`)]);
       }
-    } else out.push([dot(false), plain(`${host} isn't answering `), dim('· start it below, or it may be off')]);
+    } else out.push([dot(false), plain(`${host} isn't answering `), dim(sshy ? '· start it below, or it may be off' : `at ${root()}`)]);
     if (g) out.splice(online ? 2 : 1, 0, [dot(g.temp < (Number(maxT) || 83) - 5), plain(`${g.name.replace(/^(NVIDIA|Tesla)\s+/g, '').replace(/-(PCIE|SXM\d?).*$/i, '')} `), { t: `${g.temp}°C`, s: st.title }, dim(` · ${Math.round(g.power)} W of ${Math.round(g.powerLimit)} W${maxT ? ` · throttles at ${maxT}°C` : ''}`)]);
     lines = out;
     if (pick >= actions().length) pick = 0;
@@ -121,7 +129,7 @@ export function createServer(h: ServerHost, name: string): Panel {
     const target = p.model ?? models[0]?.id;
     const others = models.filter((m) => m.id !== loaded);
     const list: Action[] = [];
-    if (!online) list.push({ n: 'Start', d: 'wake, connect, start and load, like at startup', go: () => (h.ensure(name), h.close()) });
+    if (!online) sshy && list.push({ n: 'Start', d: 'wake, connect, start and load, like at startup', go: () => (h.ensure(name), h.close()) });
     else {
       if (!loaded && target) list.push({ n: `Load ${target}`, d: 'POST /models/load', go: () => start(load(target)) });
       if (others.length > (loaded ? 0 : 1)) list.push({ n: 'Load another model', d: others.map((m) => m.id).join(', '), go: () => ((mode = 'models'), (pick = 0)) });
@@ -138,21 +146,24 @@ export function createServer(h: ServerHost, name: string): Panel {
           },
         }) });
       }
-      list.push({ n: 'Restart server', d: 'sudo systemctl restart llama-server', go: ask({
+      if (sshy) list.push({ n: 'Restart server', d: 'sudo systemctl restart llama-server', go: ask({
         q: 'Restart llama-server?', why: `${cacheNote()}The model loads again when the next message needs it.`, cmd: 'sudo systemctl restart llama-server', yes: 'Restart', no: 'Keep it running',
         label: 'restarting llama-server', stopped: 'The restart was stopped part-way; /server shows where it is.',
         run: async (signal) => (h.down(name), sshRun('sudo systemctl restart llama-server', 'llama-server was restarted.')(signal)),
       }) });
-      list.push({ n: 'Stop server', d: 'sudo systemctl stop llama-server', go: ask({
+      if (sshy) list.push({ n: 'Stop server', d: 'sudo systemctl stop llama-server', go: ask({
         q: 'Stop llama-server?', why: `${cacheNote()}Messages start it again when you send one.`, cmd: 'sudo systemctl stop llama-server', yes: 'Stop it', no: 'Keep it running',
         label: 'stopping llama-server', stopped: 'Stopping was cancelled part-way; /server shows where it is.',
         run: async (signal) => (h.down(name), sshRun('sudo systemctl stop llama-server', `llama-server was stopped; ${host} is still on.`)(signal)),
       }) });
     }
+    if (!sshy) return list;
     list.push({ n: `Power off ${host}`, d: 'sudo poweroff', go: ask({
       q: `Power off ${host}?`, why: `${cacheNote()}${p.wake?.mac ? `Rime wakes ${host} again the next time you send a message.` : `Turn ${host} on again yourself; Rime has no MAC address to wake it.`}`, cmd: 'sudo poweroff', yes: 'Power off', no: 'Keep it on',
       label: `powering off ${host}`, stopped: 'Power off was cancelled before it went through.',
-      run: async (signal) => (h.down(name), sshRun('sudo poweroff', `${host} is powering off.`)(signal).catch((e) => (signal.aborted ? Promise.reject(e) : `${host} is powering off.`))),
+      // A machine that powers off drops the ssh connection, so that "error" is
+      // success; ssh never connecting (refused, timed out, no key) is not.
+      run: async (signal) => (h.down(name), sshRun('sudo poweroff', `${host} is powering off.`)(signal).catch((e) => (signal.aborted || !/closed by remote host|connection reset|broken pipe|exit 255$/i.test((e as Error).message) ? Promise.reject(e) : `${host} is powering off.`))),
     }) });
     list.push({ n: 'Show log', d: 'journalctl -u llama-server, last 200 lines', go: () => void showLog() });
     list.push({ n: 'Edit steps', d: 'same list as in /setup', go: () => h.openSteps(name) });
@@ -165,20 +176,25 @@ export function createServer(h: ServerHost, name: string): Panel {
   }
 
   // Runs a confirmed action with progress; ctrl+c stops it, b moves it to the background.
-  async function start(c: Confirm) {
-    const a = { c, ac: new AbortController(), progress: null as number | null, bg: false };
+  function start(c: Confirm) {
+    const ac = new AbortController();
+    const a: Running = { c, ac, progress: null, bg: false, watcher: {}, done: Promise.resolve('') };
+    a.done = c.run(ac.signal, (pr) => ((a.progress = pr), h.redraw())).catch((e) => (ac.signal.aborted ? `Cancelled. ${c.stopped}` : (e as Error).message));
+    running.set(name, a);
+    void a.done.finally(() => running.get(name) === a && running.delete(name));
+    void watch(a);
+  }
+  async function watch(a: Running) {
+    const me = (a.watcher = {});
+    a.bg = false;
     action = a;
     mode = 'action';
     note = null;
     h.redraw();
     const tick = setInterval(() => h.redraw(), 350);
-    let msg: string;
-    try {
-      msg = await c.run(a.ac.signal, (pr) => ((a.progress = pr), h.redraw()));
-    } catch (e) {
-      msg = a.ac.signal.aborted ? `Cancelled. ${c.stopped}` : (e as Error).message;
-    }
+    const msg = await a.done;
     clearInterval(tick);
+    if (a.watcher !== me) return; // a later /server is watching it
     if (a.bg) return h.say({ kind: 'note', tone: 'dim', text: msg });
     action = null;
     mode = 'list';
@@ -188,6 +204,9 @@ export function createServer(h: ServerHost, name: string): Panel {
   }
 
   const legend: Line = [{ t: 'server', s: st.accent }, dim(` · ${host}`)];
+  // An action left running in the background: watch it again (ctrl+c stops it).
+  const left = running.get(name);
+  if (left) void watch(left);
 
   return {
     view() {

@@ -11,7 +11,7 @@ import { call } from '../providers/http.ts';
 import * as llama from '../providers/llamacpp.ts';
 import type { Controls, Model } from '../providers/types.ts';
 import { freePort, resolveHost, shell, ssh, tcpOpen } from './ssh.ts';
-import { wake } from './wol.ts';
+import { onLan, wake } from './wol.ts';
 
 export const STEPS: Step[] = ['wake', 'connect', 'tunnel', 'start', 'load', 'warm', 'test'];
 export const NAMES: Record<Step, string> = { wake: 'wake', connect: 'connect', tunnel: 'tunnel', start: 'start', load: 'load', warm: 'warm cache', test: 'test' };
@@ -32,7 +32,8 @@ export type Server = {
 
 export type StepView = { id: Step; cmd: string; note?: string; status: 'todo' | 'run' | 'done' | 'off' | 'fail' | 'stopped'; result: string; progress: number | null; detail?: string };
 // `opened`: Rime opened its own tunnel in this run (closed again on cancel).
-export type RunState = { steps: StepView[]; overall: number; done: boolean; error?: string; cancelled?: boolean; opened?: boolean };
+// `startSent`: the start command went out (a cancel may have left the server starting).
+export type RunState = { steps: StepView[]; overall: number; done: boolean; error?: string; cancelled?: boolean; opened?: boolean; startSent?: boolean };
 
 export function defaults(s: Server, port: number | string, effort = 'medium'): Record<Step, string> {
   return {
@@ -45,6 +46,9 @@ export function defaults(s: Server, port: number | string, effort = 'medium'): R
     test: `one short reply at ${effort} effort`,
   };
 }
+
+export const fillStep = (cmd: string, s: Server, port: number | string) =>
+  cmd.replace(/\{(host|port|model|mac)\}/g, (all, k) => String({ host: s.host, port: port || '', model: s.model ?? '', mac: s.mac ?? '' }[k as 'host'] || all));
 
 export const NOTES: Partial<Record<Step, (s: Server) => string>> = {
   wake: (s) => `(skipped if ${s.host} already answers)`,
@@ -130,6 +134,7 @@ export function runSteps(s: Server, o: Opts): Run {
       if (edited('wake')) await shell(v.cmd, 10000, signal);
       else {
         const h = await resolveHost(s.host);
+        if (!onLan(h.hostname)) throw new Error(`${s.host} is off, and Wake-on-LAN only works on the same network (${h.hostname} isn't on this computer's network)`);
         await wake(s.mac!, s.broadcast);
         if (!s.broadcast) await wake(s.mac!, h.hostname.replace(/\.\d+$/, '.255')).catch(() => {});
       }
@@ -160,7 +165,7 @@ export function runSteps(s: Server, o: Opts): Run {
       }
       const t0 = Date.now();
       if (!o.tunnel.port || o.tunnel.port === rport) o.tunnel.port = await freePort();
-      const cmd = edited('tunnel') ? v.cmd.replaceAll('{port}', String(o.tunnel.port)) : defaults(s, o.tunnel.port).tunnel;
+      const cmd = edited('tunnel') ? fillStep(v.cmd, s, o.tunnel.port) : defaults(s, o.tunnel.port).tunnel;
       v.cmd = cmd;
       const child = spawn('sh', ['-c', `exec ${cmd}`], { stdio: 'ignore' });
       o.tunnel.child = child;
@@ -176,6 +181,7 @@ export function runSteps(s: Server, o: Opts): Run {
     async start(v) {
       if (await answers()) return 'running';
       const t0 = Date.now();
+      state.startSent = true;
       const r = await ssh(s.host, v.cmd, 30000, undefined, signal);
       halt();
       if (r.code !== 0) throw new Error(`${v.cmd}: ${lastLine(r.err) || `exit ${r.code}`}`);
@@ -249,6 +255,8 @@ export function runSteps(s: Server, o: Opts): Run {
     for (const v of state.steps) {
       if (v.status === 'off') continue;
       v.status = 'run';
+      // An edited step's {host} {port} {model} {mac} are filled in as it starts.
+      if (edited(v.id)) v.cmd = fillStep(v.cmd, s, o.tunnel.port);
       update();
       try {
         v.result = await impl[v.id](v);
@@ -299,7 +307,7 @@ export function happened(s: Pick<Server, 'host' | 'model'>, state: RunState): st
       if (v.id === 'start' && v.result !== 'running') out.push('started llama-server');
       if (v.id === 'load' && v.result !== 'loaded') out.push(`loaded ${s.model ?? 'the model'}`);
     } else if (v.status === 'stopped') {
-      out.push(v.id === 'load' ? `loading ${s.model ?? 'the model'}, unloaded again` : v.id === 'wake' ? `stopped waiting for ${s.host} (it may still boot)` : `stopped at ${NAMES[v.id]}`);
+      out.push(v.id === 'load' ? `loading ${s.model ?? 'the model'}, unloaded again` : v.id === 'wake' ? `stopped waiting for ${s.host} (it may still boot)` : v.id === 'start' && state.startSent ? 'started llama-server (it may still be coming up)' : `stopped at ${NAMES[v.id]}`);
     }
   }
   return out;

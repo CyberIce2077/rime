@@ -4,7 +4,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 // xmlTools: answer tool calls as Qwen's text form, like a server without a tool template.
-export type MockOpts = { started?: boolean; loaded?: boolean; busy?: boolean; unsafeTemplate?: boolean; key?: string; xmlTools?: boolean };
+export type MockOpts = { started?: boolean; loaded?: boolean; busy?: boolean; unsafeTemplate?: boolean; key?: string; xmlTools?: boolean; guardAll?: boolean; single?: boolean };
 
 export async function startMock(o: MockOpts = {}) {
   const state = { started: o.started ?? true, loaded: o.loaded ?? true, busy: !!o.busy, requests: [] as { path: string; body: any }[], controls: [] as any[] };
@@ -22,10 +22,12 @@ export async function startMock(o: MockOpts = {}) {
     if (path === '/__start') return (state.started = true), send(res, 200, {});
     if (path === '/__stop') return (state.started = false), send(res, 200, {});
     if (!state.started) return void req.socket.destroy(); // the service isn't running
-    if (o.key && req.headers.authorization !== `Bearer ${o.key}` && path.startsWith('/v1/')) return send(res, 401, { error: { message: 'Invalid API Key' } });
+    // `guardAll`: like llama-server --api-key, every endpoint but /health needs it.
+    if (o.key && req.headers.authorization !== `Bearer ${o.key}` && (path.startsWith('/v1/') || (o.guardAll && path !== '/health'))) return send(res, 401, { error: { message: 'Invalid API Key' } });
     if (path === '/health') return send(res, 200, { status: 'ok' });
     if (path === '/props') return send(res, 200, { build_info: 'b11514-1a2b3c', total_slots: 1, default_generation_settings: { n_ctx: 262144 } });
-    if (path === '/models') return send(res, 200, { data: [{ id: MODEL, status: { value: state.loaded ? 'loaded' : 'unloaded' } }] });
+    // `single`: one model, no router: /models is the OpenAI list, with no status.
+    if (path === '/models') return send(res, 200, { data: [{ id: MODEL, ...(o.single ? {} : { status: { value: state.loaded ? 'loaded' : 'unloaded' } }) }] });
     if (path === '/models/load') {
       setTimeout(() => (state.loaded = true), 300);
       return send(res, 200, { success: true });
@@ -50,6 +52,12 @@ export async function startMock(o: MockOpts = {}) {
     if (path === '/v1/chat/completions/control') return state.controls.push(body), send(res, 200, { success: true });
     if (path === '/v1/chat/completions') {
       const timings = { prompt_n: 120, prompt_ms: 180, cache_n: 3000, predicted_n: 12, predicted_ms: 480, predicted_per_second: 25.1, prompt_per_second: 680 };
+      // The probe's one-tool test: a native tool call, or Qwen's text form.
+      if (!body.stream && body.tools?.length) {
+        const name = body.tools[0].function.name;
+        const message = o.xmlTools ? { content: `<tool_call>\n<function=${name}>\n</function>\n</tool_call>` } : { content: '', tool_calls: [{ id: 'call_p', type: 'function', function: { name, arguments: '{}' } }] };
+        return send(res, 200, { id: 'cmpl-1', choices: [{ message, finish_reason: o.xmlTools ? 'stop' : 'tool_calls' }], timings });
+      }
       if (!body.stream) return send(res, 200, { id: 'cmpl-1', choices: [{ message: { content: 'ready' }, finish_reason: 'stop' }], timings });
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       const chunk = (delta: any, extra: any = {}) => res.write(`data: ${JSON.stringify({ id: 'cmpl-1', model: MODEL, choices: [{ index: 0, delta, finish_reason: null }], ...extra })}\n\n`);
@@ -65,6 +73,18 @@ export async function startMock(o: MockOpts = {}) {
         if (o.xmlTools) chunk({ content: `Writing it.\n<tool_call>\n<function=write>\n<parameter=path>\n${args.path}\n</parameter>\n<parameter=content>\n${args.content}\n</parameter>\n</function>\n</tool_call>` });
         else chunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'write', arguments: JSON.stringify(args) } }] });
         return end(o.xmlTools ? 'stop' : 'tool_calls');
+      }
+      // "write slowly": a question in the text, then a long write whose arguments
+      // stream in pieces (what a local model does with a big file).
+      if (body.tools && last.role === 'user' && /write slowly/.test(JSON.stringify(last.content))) {
+        chunk({ content: 'I\'ll put it in site/ — or did you mean somewhere else?\n\n' });
+        const args = JSON.stringify({ path: 'site/index.html', content: '<p>love</p>\n'.repeat(400) });
+        const step = Math.ceil(args.length / 12);
+        for (let k = 0; k < args.length; k += step) {
+          chunk({ tool_calls: [{ index: 0, ...(k ? {} : { id: 'call_5', type: 'function' }), function: { ...(k ? {} : { name: 'write' }), arguments: args.slice(k, k + step) } }] });
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        return end('tool_calls');
       }
       // "list slowly": thinks for a moment, then runs ls; a message you queued meanwhile
       // arrives after the tool result, and the reply echoes it.

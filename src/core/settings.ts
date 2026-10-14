@@ -154,5 +154,8 @@ export function phrase(text: string): { key: string; value: string } | null {
   if (m) return { key: 'effort', value: m[1] };
   m = /^(?:turn )?reasoning (on|off)$|^turn (on|off) reasoning$/.exec(t);
   if (m) return { key: 'reasoning', value: m[1] ?? m[2] };
+  // A model or provider by name; the app checks it's one it knows.
+  m = /^(?:use|switch to|load) ([\w.:/@-]+)$/.exec(t);
+  if (m) return { key: 'use', value: m[1] };
   return null;
 }

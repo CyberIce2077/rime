@@ -26,34 +26,91 @@ export type Rule = { kind: Kind; pattern: string; from: 'you' | 'project' | 'con
 // Read-only commands that run without asking (like Codex's safe commands).
 export const SAFE = ['ls', 'pwd', 'cat', 'head', 'tail', 'wc', 'rg', 'grep', 'find', 'git status', 'git diff', 'git log', 'git show'];
 
+// The command a part really runs: `(`, `{`, `!`, `\` and shell keywords stripped,
+// leading VAR=… and wrappers (env, nohup, xargs, …) with their flags skipped, and
+// the program's folder dropped (`/bin/rm -rf x` → `rm -rf x`).
+const WRAPPERS = /^(env|time|nohup|exec|command|builtin|nice|xargs|stdbuf|timeout|caffeinate|if|then|else|elif|do|while|until|!)$/;
+export function normal(part: string) {
+  const words = part.trim().replace(/^[({!\s]+|[)};\s]+$/g, '').split(/\s+/).filter(Boolean);
+  for (;;) {
+    const w = (words[0] ?? '').replace(/^\\/, '').replace(/^.*\//, '');
+    if (/^\w+=/.test(words[0] ?? '')) words.shift();
+    else if (WRAPPERS.test(w)) {
+      words.shift();
+      // ponytail: a wrapper's flags and numbers are skipped, not their values (`env -u X cmd`).
+      while (/^(-|\d+[smhd]?$)/.test(words[0] ?? '')) words.shift();
+    } else break;
+  }
+  if (words.length) words[0] = words[0].replace(/^\\/, '').replace(/^['"]|['"]$/g, '').replace(/^.*\//, '');
+  return words.join(' ');
+}
+
+const unquote = (s: string) => s.replace(/^(['"])(.*)\1$/, '$2');
+
+// Where a part writes: redirects, and the files of programs that change them.
+function targets(p: string): string[] {
+  const out = [...p.matchAll(/>>?\|?\s*(\S+)/g)].map((m) => m[1]);
+  const words = p.split(/\s+/), prog = words[0], args = words.slice(1).filter((a) => !a.startsWith('-'));
+  if (/^(cp|mv|install|ln)$/.test(prog)) out.push(args.at(-1) ?? '');
+  else if (/^(tee|rm|rmdir|touch|mkdir|chmod|chown|chgrp|truncate|shred|unlink)$/.test(prog)) out.push(...args);
+  else if (/^(sed|perl)$/.test(prog) && /\s-[a-zA-Z]*i/.test(p)) out.push(...args.slice(1));
+  else if (prog === 'dd') out.push(...words.filter((a) => a.startsWith('of=')).map((a) => a.slice(3)));
+  return out.map(unquote).filter(Boolean);
+}
+
+// git's own options before the subcommand (`git -C . push`) don't hide a force push.
+function forcePush(words: string[]) {
+  if (words[0] !== 'git') return false;
+  let i = 1;
+  while (words[i]?.startsWith('-')) i += /^(-C|-c|--git-dir|--work-tree|--namespace)$/.test(words[i]) ? 2 : 1;
+  if (words[i] !== 'push') return false;
+  return words.slice(i + 1).some((w) => /^(--force(-with-lease|-if-includes)?(=.*)?|--mirror|-[a-zA-Z]*f[a-zA-Z]*)$/.test(w) || /^\+/.test(w));
+}
+
 // guard's always-ask list: asked even in auto mode, never covered by an allow rule.
 export function guarded(part: string, project: string): string | null {
-  const p = part.trim();
-  if (/^sudo\b/.test(p)) return 'sudo';
-  if (/^rm\b/.test(p) && /\s-[a-z]*r[a-z]*f|\s-[a-z]*f[a-z]*r|\s-r\b.*\s-f\b|\s-f\b.*\s-r\b|--recursive.*--force|--force.*--recursive/i.test(p)) return 'rm -rf';
-  if (/^git\s+push\b/.test(p) && /\s(--force(-with-lease)?|-f)\b/.test(p)) return 'force push';
-  if (/^(scp|rsync|sftp|ftp|nc|ncat|netcat)\b/.test(p) || (/^(curl|wget)\b/.test(p) && /\s(-T|--upload-file|-F|--form|--data-binary|-d|--data)\b/.test(p))) return 'sends files off this machine';
-  // Writes outside the project: a redirect, tee, cp or mv to a path elsewhere.
-  for (const m of p.matchAll(/(?:>>?|\btee\s+(?:-a\s+)?|\b(?:cp|mv)\s+(?:\S+\s+)+?)(\S+)\s*$|>>?\s*(\S+)/g)) {
-    const target = (m[1] ?? m[2] ?? '').replace(/^['"]|['"]$/g, '');
-    if (target && outside(target, project)) return 'writes outside the project';
-  }
+  const p = normal(part);
+  const words = p.split(/\s+/);
+  if (/^(sudo|doas)$/.test(words[0])) return 'sudo';
+  if (words[0] === 'rm' && /\s-[a-z]*r[a-z]*f|\s-[a-z]*f[a-z]*r|\s-r\b.*\s-f\b|\s-f\b.*\s-r\b|--recursive.*--force|--force.*--recursive/i.test(p)) return 'rm -rf';
+  if (forcePush(words)) return 'force push';
+  if (/^(scp|rsync|sftp|ftp|nc|ncat|netcat)$/.test(words[0]) || (/^(curl|wget)$/.test(words[0]) && /\s(-T|--upload-file|-F|--form|--data-binary|-d|--data)\b/.test(p))) return 'sends files off this machine';
+  if (targets(p).some((t) => outside(t, project))) return 'writes outside the project';
   return null;
 }
 
+// A path outside the project. One that starts with a variable ($HOME/x) can't be
+// known, so it counts as outside.
 export function outside(target: string, project: string) {
   if (target === '/dev/null' || target.startsWith('&')) return false;
-  const abs = path.resolve(project, target.replace(/^~(?=\/|$)/, os.homedir()));
-  return abs !== project && !abs.startsWith(project + path.sep);
+  if (target.startsWith('$')) return true;
+  const abs = real(path.resolve(project, expand(target))), root = real(project);
+  return abs !== root && !abs.startsWith(root + path.sep);
+}
+const expand = (p: string) => p.replace(/^~(?=\/|$)/, os.homedir());
+// A path with its links followed, so `h/.bashrc` where h → ~ is seen as ~/.bashrc:
+// the nearest folder that exists is resolved and the rest is added back.
+export function real(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    const up = path.dirname(p);
+    return up === p ? p : path.join(real(up), path.basename(p));
+  }
 }
 
 // A command split into the parts that run: `a && b`, `a; b`, `a | b`, `a || b`,
-// new lines, and what's inside $(…) and backticks. Quotes are respected.
+// new lines, and what's inside $(…), <(…), >(…), backticks (also inside double
+// quotes) and `sh -c '…'`. Quotes are respected; `2>&1` and `&>` are redirects.
 export function parts(cmd: string): string[] {
   const out: string[] = [];
   let cur = '', q = '';
   const push = () => {
-    if (cur.trim()) out.push(cur.trim());
+    if (cur.trim()) {
+      out.push(cur.trim());
+      const inner = /^(?:(?:ba|z|da|k)?sh\s+-\w*c\w*|eval)\s+(.+)$/.exec(normal(cur));
+      if (inner) out.push(...parts(unquote(inner[1])));
+    }
     cur = '';
   };
   for (let i = 0; i < cmd.length; i++) {
@@ -66,6 +123,13 @@ export function parts(cmd: string): string[] {
         cur += cmd.slice(i, end + 1);
         i = end;
         continue;
+      } else if (q === '"' && c === '`') {
+        const end = cmd.indexOf('`', i + 1);
+        const stop = end < 0 ? cmd.length : end;
+        out.push(...parts(cmd.slice(i + 1, stop)));
+        cur += cmd.slice(i, stop + 1);
+        i = stop;
+        continue;
       }
       cur += c;
       continue;
@@ -73,11 +137,12 @@ export function parts(cmd: string): string[] {
     if (c === "'" || c === '"') (q = c), (cur += c);
     else if (c === '\\' && i + 1 < cmd.length) (cur += c + cmd[i + 1]), i++;
     else if (two === '&&' || two === '||') push(), i++;
+    else if (c === '&' && (cmd[i - 1] === '>' || cmd[i + 1] === '>')) cur += c;
     else if (c === ';' || c === '|' || c === '\n' || c === '&') push();
-    else if (two === '$(') {
+    else if (two === '$(' || two === '<(' || two === '>(') {
       const end = matchParen(cmd, i + 1);
       out.push(...parts(cmd.slice(i + 2, end)));
-      cur += '$(…)';
+      cur += c + '(…)';
       i = end;
     } else if (c === '`') {
       const end = cmd.indexOf('`', i + 1);
@@ -99,29 +164,48 @@ function matchParen(s: string, open: number) {
   return s.length;
 }
 
-// Read-only on the built-in list: `find` only without -exec / -delete, and no
-// output redirect into a file.
+// Read-only on the built-in list: `find` only without -exec / -delete, no output
+// redirect into a file, and nothing that runs code ($(…), <(…), >(…), backticks).
 export function safe(part: string) {
   const p = part.trim();
-  if (/(^|[^>])>(?!&)|\btee\b/.test(p.replace(/2>&1|>\s*\/dev\/null/g, ''))) return false;
-  if (/^find\b/.test(p) && /\s-(exec|execdir|delete|ok|fprint)/.test(p)) return false;
+  if (/\$\(|<\(|>\(|`/.test(p)) return false;
+  if (/(^|[^>])>(?!&)|\btee\b/.test(p.replace(/\d*>&\d+|>&-|>\s*\/dev\/null/g, ''))) return false;
+  if (/^find\b/.test(p) && /\s-(exec|execdir|delete|ok|fprint|fls)/.test(p)) return false;
+  // Flags that run a program or write a file.
+  if (/^rg\b/.test(p) && /\s--pre(-glob)?\b/.test(p)) return false;
+  if (/^git\b/.test(p) && /\s(--output|--ext-diff|--textconv)\b/.test(p)) return false;
   return SAFE.some((s) => p === s || p.startsWith(s + ' '));
+}
+
+// A read-only command's path that's outside the project and wasn't dropped in.
+// ponytail: every argument that isn't a flag counts as a path (a grep pattern like /api asks too).
+function readsOutside(part: string, c: Ctx) {
+  for (const w of part.trim().split(/\s+/).slice(1)) {
+    const a = w.replace(/^['"]|['"]$/g, '');
+    if (!a || a.startsWith('-') || !outside(a, c.project)) continue;
+    if (!c.granted?.(path.resolve(c.project, expand(a)))) return a;
+  }
+  return '';
 }
 
 // `bash(npm test *)` matches `npm test` and `npm test -- --watch`; without the
 // star only the exact command. `edit(src/**)`, `read(*.md)` are globs on paths
 // relative to the project.
-export function matches(pattern: string, tool: string, value: string) {
+// A pattern that starts with / or ~ matches the absolute path (`read(~/.ssh/**)`).
+export function matches(pattern: string, tool: string, value: string, abs?: string) {
   const m = /^(\w+)\((.*)\)$/.exec(pattern.trim());
   if (!m || m[1] !== tool) return false;
-  const arg = m[2].trim();
+  let arg = m[2].trim();
   if (tool === 'bash') {
+    // FOO=1 npm test is npm test, like commandName.
+    (arg = arg.replace(/\s+/g, ' ')), (value = value.trim().replace(/\s+/g, ' ').replace(/^(\w+=\S*\s+)+/, ''));
     if (arg.endsWith(' *')) {
       const pre = arg.slice(0, -2);
       return value === pre || value.startsWith(pre + ' ');
     }
     return value === arg;
   }
+  if (/^[/~]/.test(arg)) return !!abs && glob(expand(arg)).test(abs);
   return glob(arg).test(value);
 }
 export const glob = (g: string) =>
@@ -133,9 +217,9 @@ export function ruleList(user: Rules = {}, project: Rules = {}, conversation: Ru
   return out;
 }
 // deny wins over ask, which wins over allow.
-function ruleFor(rules: Rule[], tool: string, value: string): Rule | undefined {
+function ruleFor(rules: Rule[], tool: string, value: string, abs?: string): Rule | undefined {
   for (const kind of ['deny', 'ask', 'allow'] as const) {
-    const r = rules.find((x) => x.kind === kind && matches(x.pattern, tool, value));
+    const r = rules.find((x) => x.kind === kind && matches(x.pattern, tool, value, abs));
     if (r) return r;
   }
 }
@@ -162,6 +246,7 @@ export type Decision = {
   why: string; // why it runs without asking, why it asks, or why it's refused
   parts?: PartState[];
   rule?: string; // what "don't ask again" would add, e.g. bash(npm test *)
+  rules?: string[]; // every rule it adds, one per asking command of a chain
   label?: string; // how that choice names it, e.g. npm test
 };
 
@@ -171,14 +256,15 @@ export function decide(tool: string, input: Record<string, any>, c: Ctx): Decisi
   if (tool === 'rime') return { verdict: 'allow', why: "Rime's own settings" };
   // God mode runs every command and edit without asking. Your deny rules still hold.
   if (c.mode === 'god') {
-    const values = tool === 'bash' ? parts(String(input.command ?? '')) : [path.relative(c.project, path.resolve(c.project, String(input.path ?? '')))];
+    const abs = path.resolve(c.project, String(input.path ?? ''));
+    const values = tool === 'bash' ? parts(String(input.command ?? '')) : [path.relative(c.project, abs)];
     const kind = tool === 'write' ? 'edit' : tool;
-    const denied = values.map((v) => ruleFor(c.rules, kind, v)).find((r) => r?.kind === 'deny');
+    const denied = values.map((v) => ruleFor(c.rules, kind, v, abs)).find((r) => r?.kind === 'deny');
     return denied ? { verdict: 'deny', why: `denied by ${denied.pattern}` } : { verdict: 'allow', why: 'god mode' };
   }
   if (tool === 'read') {
     const abs = path.resolve(c.project, String(input.path ?? ''));
-    const r = ruleFor(c.rules, 'read', path.relative(c.project, abs));
+    const r = ruleFor(c.rules, 'read', path.relative(c.project, abs), abs);
     if (r?.kind === 'deny') return { verdict: 'deny', why: `denied by ${r.pattern}` };
     if (!outside(abs, c.project) || c.granted?.(abs)) return { verdict: r?.kind === 'ask' ? 'ask' : 'allow', why: r?.kind === 'ask' ? `asks by ${r.pattern}` : 'reading inside the project' };
     return r?.kind === 'allow' ? { verdict: 'allow', why: `allowed by ${r.pattern}` } : { verdict: 'ask', why: 'reads outside the project', rule: `read(${abs})`, label: abs };
@@ -187,7 +273,7 @@ export function decide(tool: string, input: Record<string, any>, c: Ctx): Decisi
     const abs = path.resolve(c.project, String(input.path ?? ''));
     const relp = path.relative(c.project, abs);
     if (c.mode === 'plan') return { verdict: 'deny', why: 'plan mode is read-only' };
-    const r = ruleFor(c.rules, 'edit', relp);
+    const r = ruleFor(c.rules, 'edit', relp, abs);
     if (r?.kind === 'deny') return { verdict: 'deny', why: `denied by ${r.pattern}` };
     if (outside(abs, c.project)) return { verdict: 'ask', why: 'writes outside the project (always asks)' };
     if (r?.kind === 'ask') return { verdict: 'ask', why: `asks by ${r.pattern}` };
@@ -199,11 +285,14 @@ export function decide(tool: string, input: Record<string, any>, c: Ctx): Decisi
   const ps: PartState[] = parts(String(input.command ?? '')).map((text) => {
     const r = ruleFor(c.rules, 'bash', text);
     if (r?.kind === 'deny') return { text, state: 'deny', why: `denied by ${r.pattern}` };
+    if (c.mode === 'plan' && !safe(text)) return { text, state: 'deny', why: 'plan mode is read-only' };
     const g = guarded(text, c.project);
     if (g) return { text, state: 'guard', why: `${g} always asks` };
     if (r?.kind === 'ask') return { text, state: 'ask', why: `asks by ${r.pattern}` };
-    if (safe(text)) return { text, state: 'ok', why: 'read-only' };
-    if (c.mode === 'plan') return { text, state: 'deny', why: 'plan mode is read-only' };
+    if (safe(text)) {
+      const away = readsOutside(text, c);
+      return away ? { text, state: 'ask', why: `reads ${away}, outside the project` } : { text, state: 'ok', why: 'read-only' };
+    }
     if (r?.kind === 'allow') return { text, state: 'ok', why: `allowed by ${r.pattern}` };
     if (c.mode === 'auto') return { text, state: 'ok', why: 'auto mode' };
     return { text, state: 'ask', why: '' };
@@ -213,9 +302,9 @@ export function decide(tool: string, input: Record<string, any>, c: Ctx): Decisi
   if (denied) return { verdict: 'deny', why: denied.why, parts: ps };
   const asking = ps.filter((p) => p.state === 'ask' || p.state === 'guard');
   if (!asking.length) return { verdict: 'allow', why: ps.length > 1 ? 'every part is allowed' : ps[0].why, parts: ps };
-  const first = asking.find((p) => p.state === 'ask');
-  const label = first ? commandName(first.text) : undefined;
-  return { verdict: 'ask', why: asking.find((p) => p.state === 'guard')?.why ?? 'commands ask in this mode', parts: ps, ...(label && !asking.some((p) => p.state === 'guard') ? { rule: `bash(${label} *)`, label } : {}) };
+  const names = [...new Set(asking.map((p) => commandName(p.text)).filter(Boolean))];
+  const rules = names.map((n) => `bash(${n} *)`);
+  return { verdict: 'ask', why: asking.find((p) => p.state === 'guard')?.why ?? 'commands ask in this mode', parts: ps, ...(names.length && !asking.some((p) => p.state === 'guard') ? { rule: rules[0], rules, label: names.join(' and ') } : {}) };
 }
 
 // Project rules live in .rime/permissions.json (can be committed, so a team

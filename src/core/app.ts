@@ -5,7 +5,7 @@
 // are pinned to the bottom.
 // Models come from connected providers (docs/providers.md); /setup connects them.
 
-import { type Chip, type Kind, LONG_PASTE, blocksFor, chipChar, fromBlocks, chipFor, clipboardImage, fuzzy, isChip, label, listFiles, pastedPaths, textChip } from './attach.ts';
+import { type Chip, type Kind, LONG_PASTE, blocksFor, fmtK, chipChar, cleanPaste, fromBlocks, chipFor, clipboardImage, fuzzy, isChip, label, listFiles, pastedPaths, textChip } from './attach.ts';
 import { copy } from './clipboard.ts';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -13,20 +13,23 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
-import { type Decision, MODE_HELP, MODES, type Mode, decide, projectRules, removeProjectRule, ruleList } from './permissions.ts';
-import { type ToolResult, TOOLS, bash as bashTool, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, write as writeTool } from './tools.ts';
+import { type Decision, MODE_HELP, MODES, type Mode, addProjectRule, decide, projectRules, removeProjectRule, ruleList } from './permissions.ts';
+import { type ToolResult, TOOLS, bash as bashTool, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
 import { WHEN, createSettings, phrase } from './settings.ts';
 import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
+import { toolEvents } from './timeline.ts';
+import { parse as parseQuery, rank, suggestions } from './rank.ts';
 import { type Config, saveConfig } from './config.ts';
 import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } from './header.ts';
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
 import { colorMode } from './theme.ts';
 import { previewBox, sendLine, sendList } from './preview.ts';
-import { type BoxRow, type Hit, type Item, box, caretOf, footRows, layoutInput, listRow, offsetAt, prompt, renderItem, spaced, splitToolCalls, status, str, styles } from './view.ts';
-import { createMeter, fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
+import { type BoxRow, type Hint, type Hit, type Item, box, caretOf, footRows, hintLines, layoutInput, listRow, offsetAt, prompt, renderItem, spaced, splitToolCalls, status, str, styles } from './view.ts';
+import { type Turn, addTurns, createMeter, fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
 import * as llama from '../providers/llamacpp.ts';
 import { PRESETS } from '../providers/presets.ts';
-import { connOf, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
+import { connOf, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
+import { recheck } from '../providers/probe.ts';
 import { ApiError, type Block, type Conn, type Controls, type Effort, type Message, type Model, type Usage } from '../providers/types.ts';
 import { bar } from '../setup/loader.ts';
 import { createModelPicker, createServer, createSettingsPanel } from '../setup/panels.ts';
@@ -42,6 +45,7 @@ const CMDS: [string, string][] = [
   ['/permissions', 'permission mode and allow / ask / deny rules'],
   ['/connect', 'add a provider or URL: /connect <url>'],
   ['/clear', 'start a new conversation'],
+  ['/conversations', 'search, open, fork or delete your conversations'],
   ['/usage', 'token, cost and savings breakdown'],
   ['/exit', 'quit Rime'],
 ];
@@ -54,7 +58,7 @@ const KEYS: [string, string][] = [
   ['ctrl+c', 'cancel what is open or running'],
   ['ctrl+c twice', 'quit (only when nothing is open)'],
   ['↑ ↓', 'your earlier prompts (esc goes back to what you typed)'],
-  ['option+⌫ ctrl+w', 'delete the word before the cursor'],
+  ['ctrl+w', 'delete the word before the cursor'],
   ['tab', 'complete a command'],
   ['ctrl+v', 'paste an image from the clipboard (or drag in a file)'],
   ['@', 'mention a file or folder'],
@@ -72,7 +76,8 @@ const KEYS: [string, string][] = [
 const CLICK_KEYS: Record<string, Key> = {
   esc: { name: 'escape' }, enter: { name: 'enter' }, tab: { name: 'tab' }, space: { name: 'space' }, backspace: { name: 'backspace' },
   'ctrl+c': { name: 'c', ctrl: true }, 'ctrl+j': { name: 'j', ctrl: true }, 'ctrl+v': { name: 'v', ctrl: true }, 'ctrl+o': { name: 'o', ctrl: true },
-  'ctrl+r': { name: 'r', ctrl: true }, 'ctrl+d': { name: 'd', ctrl: true }, '→': { name: 'right' },
+  'ctrl+r': { name: 'r', ctrl: true }, 'ctrl+d': { name: 'd', ctrl: true }, '→': { name: 'right' }, '←': { name: 'left' }, '↑': { name: 'up' }, '↓': { name: 'down' }, 'shift+tab': { name: 'tab', shift: true },
+  'ctrl+p': { name: 'p', ctrl: true }, 'ctrl+f': { name: 'f', ctrl: true }, 'ctrl+e': { name: 'e', ctrl: true }, 'ctrl+s': { name: 's', ctrl: true }, 'ctrl+u': { name: 'u', ctrl: true },
 };
 
 // Frozen for the whole session: any byte change here would break the prompt cache.
@@ -134,7 +139,7 @@ export async function runApp(cfg: Config, version: string) {
   let browsing: { list: string[]; i: number; draft: string; edited?: boolean } | null = null;
   let navigated = false;
   const cwd = process.cwd();
-  let SYSTEM = system(cwd, agentsMd(projectOf(cwd)));
+  const SYSTEM = system(cwd, agentsMd(projectOf(cwd))); // the prefix for new conversations
 
   // ---- state ----
   let model: Model | undefined;
@@ -184,7 +189,7 @@ export async function runApp(cfg: Config, version: string) {
   // Helpers bound to one conversation. Work that's running uses its own set, so it
   // keeps writing to its conversation after you switch to another one.
   function bound(x: Session) {
-    const conversation = () => (x.convId ??= save((d) => d.create(project, SYSTEM, model?.ref, TOOLS_HASH)) ?? null);
+    const conversation = () => (x.convId ??= save((d) => d.create(project, x.system, model?.ref, TOOLS_HASH)) ?? null);
     return {
       conversation,
       // An Anthropic effort-only system message is kept as one output_config block.
@@ -201,6 +206,7 @@ export async function runApp(cfg: Config, version: string) {
         x.convRules = { ...x.convRules, [kind]: [...new Set([...(x.convRules[kind] ?? []), pattern])] };
         save((d) => d.setRules(conversation()!, x.convRules));
       },
+      event: (kind: string, text: string, ref?: string) => save((d) => d.event(conversation()!, kind, text, ref)),
       detail: (lines: Line[]) => x.items.push({ kind: 'lines', hug: true, lines: lines.map((l) => [{ t: '  ⎿ ', s: st.dim }, ...l]).map((l, i) => (i ? [{ t: '    ', s: '' }, ...l.slice(1)] : l)) }),
     };
   }
@@ -255,7 +261,7 @@ export async function runApp(cfg: Config, version: string) {
     waiting: { text: string; content: string | Block[] } | null; // a message held until the model is ready
     live: { seq: number; text: () => string } | null; // the reply being streamed
     lastUserSeq: number; // the stored row of the last user message, while it has no reply
-    continuing: { title: string; at: number } | null; // reopened, nothing sent yet
+    continuing: { title: string; at: number; cost: string } | null; // reopened, nothing sent yet
     resumeOk: boolean; // the last reply was cut off by quitting: enter continues it
     approval: { use: Block; decision: Decision; sel: number; done(a: 'yes' | 'always' | 'no' | 'stop'): void; diff?: ToolResult['diff'] } | null;
     // A question with options: from the ask tool (`tool`, the turn waits for it), or
@@ -269,10 +275,14 @@ export async function runApp(cfg: Config, version: string) {
     meter: ReturnType<typeof createMeter>; // its tokens, cost and savings
     nextStep: string; // suggested after a reply (tab takes it)
     title: string;
+    mark: string; // the model and effort last put on the timeline
+    planSaid: boolean; // the model was told plan mode is on
+    costItem: Item | null; // this turn's ↳ line, kept last as its requests add up
+    system: string; // its frozen system prompt: the stored one when reopened while the cache is warm
   };
   const newSession = (): Session => ({
     convId: null, messages: [], items: [headerItem], task: null, busy: null, waiting: null, live: null, lastUserSeq: 0,
-    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '',
+    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, costItem: null, system: SYSTEM,
   });
   let S = newSession();
   const sessions: Session[] = [S]; // open in this window; the ones not on screen keep working
@@ -288,19 +298,34 @@ export async function runApp(cfg: Config, version: string) {
     const s = (Date.now() - t) / 1000;
     return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : s < 86400 ? `${Math.floor(s / 3600)} h ago` : `${Math.floor(s / 86400)} days ago`;
   };
-  function headerInfo() {
-    const cont = S.continuing ? `continuing "${S.continuing.title}" · ${ago(S.continuing.at)}` : '';
-    if (!model) return { model: undefined, details: cont || (connected() ? 'no model selected' : 'no model connected') };
-    if (cont && !bg) return { model: model.label, details: `${model.provider} · ${cont}` };
-    const p = model.provider;
-    if (bg && bg.name === p && !bg.run.state.done) {
-      const s = bg.run.state;
-      const step = s.steps.find((v) => v.status === 'run' || v.status === 'fail');
-      if (step?.status === 'fail') return { model: model.label, details: `${p} · couldn't start: /server` };
-      const b = bar(s.overall, 6);
-      if (bg.stopping) return { model: model.label, details: `${p} · stopping…` };
-      return { model: model.label, details: `${p} · ${PHASE[step?.id ?? 'connect']} ${b.fill}${b.empty} ${b.pct.trim()} · ✕ stop` };
+  // What reopening costs (SPEC §16): the last prompt's size, re-read at the
+  // server's measured speed, or priced as a cache write.
+  function resumeCost(stored: Stored[]) {
+    const us = stored.flatMap((m) => (m.usage ? [m.usage] : []));
+    const last = us.at(-1);
+    if (!last) return '';
+    const size = last.usage.input + last.usage.cached + last.usage.written;
+    if (last.local) {
+      const timed = us.filter((u) => u.usage.promptMs && u.usage.input > 200).at(-1);
+      return timed ? `resume ~${fmtS((size * timed.usage.promptMs!) / timed.usage.input)}` : '';
     }
+    return last.price ? `resume ~${fmt$((size * (last.price.write || last.price.in)) / 1e6)}` : '';
+  }
+  function headerInfo() {
+    const cont = S.continuing ? [`continuing "${S.continuing.title}"`, ago(S.continuing.at), S.continuing.cost, '← conversations'].filter(Boolean).join(' · ') : '';
+    // A setup running in the background (any server, any model): its loader and ✕ stop.
+    if (bg && !bg.run.state.done) {
+      const s = bg.run.state, p = bg.name;
+      const label = model?.provider === p ? model.label : undefined;
+      const step = s.steps.find((v) => v.status === 'run' || v.status === 'fail');
+      if (step?.status === 'fail') return { model: label, details: `${p} · couldn't start: /server` };
+      const b = bar(s.overall, 6);
+      if (bg.stopping) return { model: label, details: `${p} · stopping…` };
+      return { model: label, details: `${p} · ${PHASE[step?.id ?? 'connect']} ${b.fill}${b.empty} ${b.pct.trim()} · ✕ stop` };
+    }
+    if (!model) return { model: undefined, details: cont || (connected() ? 'no model selected' : 'no model connected') };
+    if (cont) return { model: model.label, details: `${model.provider} · ${cont}` };
+    const p = model.provider;
     const ctx = model.context ? `${model.context >= 1000 ? Math.round(model.context / 1000) + 'k' : model.context} context` : '';
     const c = sentControls();
     const eff = !c.reasoning ? 'reasoning off' : c.effort ? `${conn?.llamacpp ? llama.effortsFor(model)[c.effort] : c.effort} effort` : '';
@@ -320,15 +345,17 @@ export async function runApp(cfg: Config, version: string) {
   function transcript(width: number) {
     const lines: string[] = [];
     const gears: { at: number; i: number }[] = [];
+    const pins: { at: number; i: number }[] = [];
     let prev: Item | undefined;
     S.items.forEach((it, i) => {
       if (spaced(prev, it)) lines.push('');
       if (it.kind === 'gear' && !it.note && !it.change.undone) gears.push({ at: lines.length, i });
       lines.push(...render(it, width));
+      if (it.kind === 'user') pins.push({ at: lines.length - 1, i });
       prev = it;
     });
     if (prev !== headerItem) lines.push(''); // the log's bottom margin
-    return { lines, gears };
+    return { lines, gears, pins };
   }
 
   // ---- boxes above the prompt ----
@@ -398,6 +425,7 @@ export async function runApp(cfg: Config, version: string) {
       row([{ t: 'Rime saved', s: st.ok }], '', savedCell, st.ok),
       row([{ t: '  prompt caching', s: st.fg }], '', fmt$(S.meter.saved.cache), st.fg),
       { line: [{ t: '  ' + why, s: st.dim }] },
+      ...(S.meter.saved.handled ? [row([{ t: '  handled in Rime', s: st.fg }], '', fmt$(S.meter.saved.handled), st.fg), { line: [{ t: '  requests answered with no API call', s: st.dim }] }] : []),
       { line: [], rule: 'inner' },
       ...foot.map((line) => ({ line })),
     ];
@@ -412,7 +440,7 @@ export async function runApp(cfg: Config, version: string) {
       const m = matches();
       sel = Math.min(sel, Math.max(0, m.length - 1));
       const rows: BoxRow[] = m.length
-        ? m.map(([n, h], i) => listRow(n, h, i === sel, st, `cmd:${i}`))
+        ? m.map(([n, h], i, all) => listRow(n, h, i === sel, st, `cmd:${i}`, Math.max(13, ...all.map(([x]) => x.length + 2))))
         : [{ line: [{ t: `no command matches ${buf}`, s: st.dim }] }];
       return box('commands', [...rows, ...footRows(['↑ ↓', ' choose · ', 'tab', ' complete · ', 'enter', ' run · ', 'esc', ' close'], st)], width, st, st.accent, 'key:esc');
     }
@@ -436,7 +464,8 @@ export async function runApp(cfg: Config, version: string) {
   }
 
   // The right end of the status line: the meter, then "esc to stop" while working.
-  const stoppable = () => !!(S.busy || S.declining);
+  // Not while a question box owns esc (it means "no" there).
+  const stoppable = () => !!(S.busy || S.declining) && !S.approval && !S.question?.tool;
   const rightLine = (): Line => (stoppable() ? [...meterLine(), { t: ' · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' to stop', s: st.dim }] : meterLine());
 
   // ---- chips ----
@@ -543,6 +572,7 @@ export async function runApp(cfg: Config, version: string) {
     // A command's argument, once it's chosen: `/model ` lists the models Rime knows.
     const arg = /^\/model\s+(\S*)$/.exec(buf);
     if (arg) {
+      askServed();
       const refs = knownModels().filter((r) => r.toLowerCase().includes(arg[1].toLowerCase()));
       sel = Math.min(sel, Math.max(0, refs.length - 1));
       return box([{ t: '/model', s: st.accent }, dim(' · pick one, or enter with nothing opens the list')], [
@@ -553,7 +583,24 @@ export async function runApp(cfg: Config, version: string) {
     if (/^\/connect\s+$/.test(buf)) return box('/connect', [{ line: [{ t: '<url> [name]', s: st.title }, dim('  a llama.cpp, Ollama, LM Studio or OpenAI-compatible server')] }], width, st);
     return null;
   }
-  const knownModels = () => [...new Set([model?.ref, cfg.model, ...Object.entries(cfg.providers).map(([n, p]) => (p.model ? `${n}/${p.model}` : undefined)), ...Object.keys(cfg.models)].filter((x): x is string => !!x))];
+  const knownModels = () => [...new Set([model?.ref, cfg.model, ...Object.entries(cfg.providers).map(([n, p]) => (p.model ? `${n}/${p.model}` : undefined)), ...Object.entries(served).flatMap(([n, ids]) => ids.map((i) => `${n}/${i}`)), ...Object.keys(cfg.models)].filter((x): x is string => !!x))];
+  // Each connected provider's own model list, for the /model hint (asked once a session).
+  const served: Record<string, string[]> = {};
+  let servedAsked = false;
+  function askServed() {
+    if (servedAsked) return;
+    servedAsked = true;
+    for (const [name, p] of Object.entries(cfg.providers))
+      void (async () => {
+        const t = p.ssh ? tunnel(name) : null;
+        const base = p.ssh ? (t!.port ? `http://127.0.0.1:${t!.port}/v1` : '') : await pickUrl([p.url ?? PRESETS[p.preset]?.url ?? ''].flat());
+        if (!base) return;
+        const c = connOf(name, p, base);
+        const ids = c.llamacpp ? (await llama.routerModels(llama.rootOf(base)).catch(() => null))?.map((m) => m.id) : null;
+        served[name] = ids ?? (await listModels(c).catch(() => ({ models: [] as { id: string }[] }))).models.map((m) => m.id);
+        schedule();
+      })().catch(() => {});
+  }
 
   // The preview above the prompt: a chip full size, under the mouse or at the
   // caret, else the "what gets sent" list when it's open.
@@ -605,9 +652,9 @@ export async function runApp(cfg: Config, version: string) {
     // The prompt grows to 10 rows (at most a third of the screen), then scrolls.
     const maxRows = Math.max(1, Math.min(10, Math.floor(height / 3), height - lines.length - 3 - (sent.length ? 1 : 0)));
     const p = prompt(buf, cur, width, maxRows, st, {
-      placeholder: panel?.placeholder?.() ?? (S.declining ? 'tell Rime what to do instead' : S.question ? 'pick one above, or type your own answer' : S.resumeOk ? 'enter continues the interrupted reply, or ask something new' : S.nextStep ? S.nextStep : example && !S.messages.length ? `Try "${example}"` : undefined),
+      placeholder: panel?.placeholder?.() ?? (S.declining ? 'tell Rime what to do instead' : S.question ? 'pick one above, or type your own answer' : S.resumeOk ? (pendingUses(S).length ? 'enter asks the open question again, or ask something new' : 'enter continues the interrupted reply, or ask something new') : S.nextStep ? S.nextStep : unloaded() ? `load ${unloaded()}` : example && !S.messages.length ? `Try "${example}"` : undefined),
       // A suggestion shows the key that takes it.
-      tabHint: !panel && !S.declining && !S.resumeOk && (buf ? !!ghost() : !!(S.nextStep || (example && !S.messages.length))),
+      tabHint: !panel && !S.declining && !S.resumeOk && (buf ? !!ghost() : !!(S.nextStep || unloaded() || (example && !S.messages.length))),
       masked: panel?.masked?.() ?? false,
       sel: range() ?? undefined,
       chip: chipView,
@@ -623,6 +670,7 @@ export async function runApp(cfg: Config, version: string) {
     }
 
     let left: Line, leftHits: Hit[] = [];
+    const more: { line: Line; hits: Hit[] }[] = []; // status parts that wrapped below
     const ps = panel?.status?.();
     if (quitting) left = [{ t: quitting, s: st.dim }];
     else if (quitArmed) left = [{ t: 'press ctrl+c again to quit', s: st.dim }];
@@ -671,20 +719,28 @@ export async function runApp(cfg: Config, version: string) {
         : ['⏵⏵⏵', 'auto', st.warn];
       parts.push({ line: [{ t: `${icon} ${name}`, s: ms }, dim(' shift+tab')], id: 'mode' });
       parts.push({ line: [key('←'), dim(' conversations')], id: 'conversations' });
-      parts.push({ line: [key('/'), dim(' commands')], id: '/' });
-      parts.push({ line: [key('?'), dim(' shortcuts')], id: '?' });
+      parts.push({ line: [key('/'), dim(' for commands')], id: '/' });
+      parts.push({ line: [key('?'), dim(' for shortcuts')], id: '?' });
+      // Parts are never cut: what doesn't fit beside the meter moves to a line
+      // below, whole, in the same order.
       const room = width - lineWidth(rightLine()) - 2;
-      left = [];
+      const rowsOut: { line: Line; hits: Hit[] }[] = [{ line: [], hits: [] }];
       for (const p of parts) {
-        const sep = left.length ? [dim(' · ')] : [];
-        if (lineWidth(left) + lineWidth([...sep, ...p.line]) > room) break;
-        left.push(...sep, ...p.line);
-        if (p.id) leftHits.push({ x0: lineWidth(left) - lineWidth(p.line) + 1, x1: lineWidth(left), id: p.id });
+        let r = rowsOut.at(-1)!;
+        const fits = (rowsOut.length === 1 ? room : width - 1) - lineWidth(r.line) - (r.line.length ? 3 : 0) >= lineWidth(p.line);
+        if (r.line.length && !fits) rowsOut.push((r = { line: [], hits: [] }));
+        if (r.line.length) r.line.push(dim(' · '));
+        r.line.push(...p.line);
+        if (p.id) r.hits.push({ x0: lineWidth(r.line) - lineWidth(p.line) + 1, x1: lineWidth(r.line), id: p.id });
       }
+      left = rowsOut[0].line;
+      leftHits = rowsOut[0].hits;
+      more.push(...rowsOut.slice(1));
     }
     const s = status(left, rightLine(), width, st, leftHits, stoppable() ? [{ x0: 1, x1: lineWidth(meterLine()), id: 'meter' }, { x0: lineWidth(meterLine()) + 4, x1: lineWidth(rightLine()), id: 'key:esc' }] : undefined);
     lines.push(s.line);
     rowHits.push(s.hits);
+    for (const m of more) lines.push(str(fit(m.line, width), st)), rowHits.push(m.hits);
     return { lines, rowHits, cursor: { row: top + p.cursor.row, col: p.cursor.col }, prompt: { rel: top + 1, first: p.first, shown: p.lines.length - 2, rows: p.rows } };
   }
 
@@ -703,7 +759,7 @@ export async function runApp(cfg: Config, version: string) {
       rows = v.lines.map((l) => truncAnsi(l, width));
       return paint(rows.map((l) => [l, '']), width, '');
     }
-    const { lines, gears } = transcript(width);
+    const { lines, gears, pins } = transcript(width);
     const u = ui(width, height);
     viewH = Math.max(0, height - u.lines.length);
     if (scrollOff > 0) scrollOff += lines.length - lastTotal; // hold still while scrolled up
@@ -741,6 +797,14 @@ export async function runApp(cfg: Config, version: string) {
     const l2 = r2 >= 1 && r2 <= viewH ? stripAnsi(rows[r2 - 1]) : '';
     const at = l2.indexOf('✕ stop');
     if (at >= 0) hits.push({ row: r2, x0: strWidth(l2.slice(0, at)) + 1, x1: strWidth(l2.slice(0, at)) + 6, id: 'stop' });
+    for (const p of pins) {
+      const row = p.at - start + 1;
+      const text = row >= 1 && row <= viewH ? stripAnsi(rows[row - 1]) : '';
+      const x = text.lastIndexOf('◆');
+      if (x >= 0) hits.push({ row, x0: strWidth(text.slice(0, x)) + 1, x1: strWidth(text.slice(0, x)) + 1, id: `pin:${p.i}` });
+    }
+    const back = l2.indexOf('← conversations');
+    if (back >= 0) hits.push({ row: r2, x0: strWidth(l2.slice(0, back)) + 1, x1: strWidth(l2.slice(0, back)) + 15, id: 'conversations' });
     const marks = rows.map(() => '');
     for (const { y, x0, x1 } of selectionSpans(width)) marks[y - 1] += `\x1b[${y};${x0}H${st.selection}${sliceCols(rows[y - 1], x0, x1).padEnd(x1 - x0 + 1)}${st.reset}`;
     paint(rows.map((l, i) => [l, marks[i]]), width, `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h`);
@@ -834,16 +898,36 @@ export async function runApp(cfg: Config, version: string) {
 
   // Brings an own server up (wake, tunnel, start, load, warm) with the compact
   // loader in the header; the prompt stays usable meanwhile.
+  // Rime's tunnel closing by itself (sleep, network change, ssh dropped): the
+  // connection goes and the next message opens it again, as after /server stop.
+  // Not reopened at once: after a power off that would wake the server.
+  const watched = new WeakSet<object>();
+  function watchTunnel(name: string) {
+    const t = tunnel(name), child = t.child;
+    if (!child || watched.has(child)) return;
+    watched.add(child);
+    child.once('exit', () => {
+      if (closing || t.child !== child) return;
+      t.child = null;
+      t.port = 0;
+      if (conn?.name !== name) return; // already down (/server stop, power off)
+      conn = undefined;
+      if (S.convId) bound(S).event('server', `${name} tunnel closed`);
+      note(`The tunnel to ${name} closed; the next message opens it again.`, 'dim');
+      schedule();
+    });
+  }
+
   function ensure(name: string, quiet = false) {
     const p = cfg.providers[name];
     if (!p?.ssh) return Promise.resolve();
     if (bg?.name === name && !bg.run.state.done && !bg.run.state.error) return bg.run.promise.then(() => {});
     const run = runSteps(
-      { name, host: p.ssh, remote: p.tunnel?.remote ?? '127.0.0.1:8080', mac: p.wake?.mac, broadcast: p.wake?.broadcast, model: p.model, router: !!p.model },
+      { name, host: p.ssh, remote: p.tunnel?.remote ?? '127.0.0.1:8080', mac: p.wake?.mac, broadcast: p.wake?.broadcast, model: p.model, router: p.router ?? !!p.model },
       {
         edited: p.steps,
         skip: [...(p.skip ?? []), 'test'], // the test reply belongs to /setup
-        system: SYSTEM,
+        system: S.system,
         model: model?.provider === name ? model : undefined,
         controls,
         tunnel: tunnel(name),
@@ -854,11 +938,13 @@ export async function runApp(cfg: Config, version: string) {
     schedule();
     return run.promise.then(
       (r) => {
+        watchTunnel(name);
         if (model?.provider === name) {
           conn = connOf(name, p, r.base);
           serverInfo();
         }
         const worked = run.state.steps.filter((v) => ['wake', 'start', 'load'].includes(v.id) && v.status === 'done' && !['on', 'running', 'loaded'].includes(v.result));
+        if (worked.length && S.convId) bound(S).event('server', `${name} ${worked.map((v) => `${NAMES[v.id]} ${v.result}`).join(' · ')}`);
         if (!quiet && worked.length) {
           S.items.push({ kind: 'lines', lines: [[{ t: '● ', s: st.ok }, { t: `${name} is ready · `, s: st.fg }, { t: model?.label ?? p.model ?? '', s: st.titleB }, { t: ` · ${worked.map((v) => `${NAMES[v.id]} ${v.result}`).join(' · ')}`, s: st.dim }]] });
         }
@@ -906,6 +992,17 @@ export async function runApp(cfg: Config, version: string) {
   function serverInfo() {
     if (!conn?.llamacpp) return;
     const m = model;
+    // Any llama.cpp server (also one added with /connect): its template is tested
+    // for cache safety and tool calls, and again when its build changes.
+    if (m) {
+      const p = cfg.providers[m.provider];
+      recheck(llama.rootOf(conn.base), m, p?.probe).then((pr) => {
+        if (!pr || cfg.providers[m.provider] !== p) return;
+        p.probe = pr;
+        settings.save();
+        if (model?.provider === m.provider && conn) conn = connOf(m.provider, p, conn.base);
+      }).catch(() => {});
+    }
     llama.props(llama.rootOf(conn.base)).then((pr) => {
       if (!m || m !== model) return;
       const ctx = pr?.json?.default_generation_settings?.n_ctx;
@@ -957,7 +1054,7 @@ export async function runApp(cfg: Config, version: string) {
   function cacheSafe() {
     if (!model || unsafe.has(model.ref)) return { effort: false, reasoning: false };
     const pr = cfg.providers[model.provider]?.probe;
-    if (conn?.llamacpp) return { effort: pr?.effortSafe !== false, reasoning: pr?.reasoningSafe !== false };
+    if (conn?.llamacpp) return { effort: pr?.effortSafe === true, reasoning: pr?.reasoningSafe === true };
     return { effort: true, reasoning: true };
   }
   function sentControls(): Controls {
@@ -986,6 +1083,12 @@ export async function runApp(cfg: Config, version: string) {
     return (C.lastUserSeq = store(C.messages.at(-1)!));
   }
 
+  // Tool calls of the last reply that never got results (Rime closed while asking).
+  const pendingUses = (C: Session) => {
+    const last = C.messages.at(-1);
+    return last?.role === 'assistant' && Array.isArray(last.content) ? last.content.filter((b) => b.type === 'tool_use') : [];
+  };
+
   // `text` is the prompt as typed (chips included); `content` is what goes to the
   // model: the text, or content blocks with the attachments.
   async function send(text: string, held = false, content: string | Block[] | Promise<Block[]> = text, C: Session = S) {
@@ -993,6 +1096,7 @@ export async function runApp(cfg: Config, version: string) {
     if (!held) {
       const labels = Object.fromEntries([...new Set([...text].filter(isChip))].flatMap((ch) => (chips.get(ch) ? [[ch, label(chips.get(ch)!)]] : [])));
       C.items.push({ kind: 'user', text, ...(Object.keys(labels).length ? { chips: labels } : {}) });
+      for (const l of Object.values(labels)) bound(C).event('attach', l.replace(/^\[|\]$/g, ''));
       history.push(text);
       schedule();
     }
@@ -1027,17 +1131,41 @@ export async function runApp(cfg: Config, version: string) {
       store(C.messages.at(-1)!);
       C.task.sentEffort = c.effort;
     }
-    const userSeq = pushUser(content, C);
-    C.continuing = null;
-    C.resumeOk = false;
-    C.nextStep = '';
-    if (!C.question?.tool) C.question = null; // a picker from the last reply is answered or moot now
-
     const ac = new AbortController();
     const m = model, cn = conn;
     // Files you attached: `[file a.ts] src/a.ts (40 lines)` heads in the message.
     const attached = (Array.isArray(content) ? content : []).flatMap((b) => (b.type === 'text' ? [...String(b.text).matchAll(/^\[file [^\]]+\] (.+?) \(\d+ lines\)\n/g)].map((x) => x[1]) : []));
     const did: Did = { wrote: [], ran: [], about: attached };
+    // Tool calls still waiting for your answer when Rime closed are asked again
+    // first (SPEC §17); their results go ahead of your words.
+    const pending = pendingUses(C);
+    if (pending.length) {
+      const me = { abort: () => ac.abort(), esc: () => ac.abort() };
+      C.busy = me;
+      C.resumeOk = false;
+      schedule();
+      const results = await runTools(pending, ac.signal, did, C);
+      if (C.busy === me) C.busy = null;
+      if (ac.signal.aborted) {
+        C.messages.push({ role: 'user', content: results });
+        C.lastUserSeq = store(C.messages.at(-1)!);
+        return note('stopped', 'dim');
+      }
+      content = [...results, ...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content)];
+    }
+    // Plan mode is told to the model in the message (the system prompt stays frozen).
+    if ((mode === 'plan') !== C.planSaid) {
+      C.planSaid = mode === 'plan';
+      const say = C.planSaid ? '[Rime: plan mode is on. Only read-only tools run; investigate and propose a plan instead of changing files.]' : '[Rime: plan mode is off. You can edit files and run commands again.]';
+      content = [...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content), { type: 'text', text: say }];
+    }
+    const userSeq = pushUser(content, C);
+    C.costItem = null;
+    C.continuing = null;
+    C.resumeOk = false;
+    C.nextStep = '';
+    if (!C.question?.tool) C.question = null; // a picker from the last reply is answered or moot now
+
     let said = ''; // the last reply's text, for the next-step suggestion
     let esc = () => ac.abort();
     const me = { abort: () => ac.abort(), esc: () => esc() };
@@ -1058,6 +1186,14 @@ export async function runApp(cfg: Config, version: string) {
         C.lastUserSeq = store(C.messages.at(-1)!);
         if (ac.signal.aborted) {
           note('stopped', 'dim');
+          break;
+        }
+        // No compaction yet (Phase 6): stop before the context overflows, with the
+        // tool results saved so "continue" picks up from here.
+        const ctx = m.context ?? cfg.providers[m.provider]?.probe?.ctx;
+        const used = C.task?.lastPrompt ?? 0;
+        if (ctx && used > ctx * 0.9) {
+          note(`This conversation fills ${Math.round((used / ctx) * 100)}% of ${m.label}'s context (${fmtT(used)} of ${fmtT(ctx)} tokens), so Rime stopped before the next step. Say "continue" to go on anyway, or /clear to start fresh.`);
           break;
         }
       }
@@ -1104,7 +1240,10 @@ export async function runApp(cfg: Config, version: string) {
 
   // One streamed reply. Returns its blocks, or ok: false when it was stopped or failed.
   async function streamOnce(m: Model, cn: Conn, c: Controls, ac: AbortController, userSeq: number, setEsc: (f: () => void) => void, C: Session): Promise<{ ok: boolean; blocks: Block[] }> {
-    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
+    const { conversation, store, note, drop, addConvRule, detail, event } = bound(C);
+    // The model and effort go on the timeline when they change.
+    const mark = `${m.label} · ${!c.reasoning ? 'reasoning off' : `${c.effort ?? 'default'} effort`}`;
+    if (mark !== C.mark) (C.mark = mark), event('model', mark);
     const root = llama.rootOf(cn.base);
     const thinking: Extract<Item, { kind: 'think' }> = { kind: 'think', text: '', start: Date.now(), open: showThinking };
     C.items.push(thinking);
@@ -1137,10 +1276,24 @@ export async function runApp(cfg: Config, version: string) {
     let stop = '';
     let flush: NodeJS.Timeout | null = null;
     let replySeq = 0; // the stored reply, which keeps what it cost
+    // A tool call being written (a long file can take a minute on a local model):
+    // one live row with its name, path and size, so the reply doesn't look finished.
+    let drafting: Extract<Item, { kind: 'lines' }> | null = null;
+    const draft = (name: string, args: string) => {
+      settle();
+      const field = (k: string) => new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`).exec(args)?.[1] ?? new RegExp(`<parameter=${k}>\\s*([^<\\n]+)`).exec(args)?.[1];
+      const { verb, rest } = describe({ type: 'tool_use', name, input: { path: field('path') ?? '', command: field('command') ?? '', question: field('question') ?? '' } });
+      const size = args.length >= 1000 ? `${(args.length / 1000).toFixed(1)}k characters` : `${args.length} characters`;
+      const line: Line = [{ t: '● ', s: st.accent }, { t: verb, s: st.titleB }, { t: field('path') || field('command') || field('question') ? ` ${rest}` : '', s: st.fg }, { t: ` · writing… ${size}`, s: st.dim }];
+      if (!drafting) C.items.push((drafting = { kind: 'lines', lines: [line] }));
+      else drafting.lines = [line];
+      cache.delete(drafting);
+      schedule();
+    };
     const charge = () => {
       if (!usage) return;
       const turn = C.meter.charge(usage, m.price, cn.local);
-      C.items.push({ kind: 'cost', turn });
+      addCost(C, turn);
       if (replySeq) save((d) => d.setUsage(C.convId!, replySeq, { usage: usage!, ...(m.price ? { price: m.price } : {}), ...(cn.local ? { local: true } : {}) }));
       save((d) => d.usage(C.convId!, turn.in + turn.out, turn.spent ?? 0, m.ref));
       if (cn.local && usage.promptMs && usage.input > 500) promptRate = usage.input / (usage.promptMs / 1000);
@@ -1150,7 +1303,7 @@ export async function runApp(cfg: Config, version: string) {
       const changed = C.task?.lastControls && (C.task.lastControls.effort !== c.effort || C.task.lastControls.reasoning !== c.reasoning);
       if (C.task && changed && C.task.lastPrompt > 2000 && usage.cached < C.task.lastPrompt * 0.5) {
         unsafe.add(m.ref);
-        C.task.controls = { ...S.task!.lastControls! };
+        C.task.controls = { ...C.task.lastControls! };
         note(`Changing effort reset ${m.provider}'s cache, so effort and reasoning stay fixed until /clear.`, 'dim');
       }
       if (C.task) Object.assign(C.task, { lastPrompt: prompt, lastControls: c });
@@ -1165,11 +1318,12 @@ export async function runApp(cfg: Config, version: string) {
       C.lastUserSeq = 0;
     };
     try {
-      for await (const ev of streamFor(cn)({ conn: cn, model: m, system: SYSTEM, tools: TOOLS, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal: ac.signal, slot: cn.llamacpp ? 0 : undefined })) {
+      for await (const ev of streamFor(cn)({ conn: cn, model: m, system: C.system, tools: TOOLS, messages: C.messages, controls: cn.wire === 'anthropic' ? C.task!.controls : c, signal: ac.signal, slot: cn.llamacpp ? 0 : undefined })) {
         if (ev.type === 'id') completionId = ev.id;
         else if (ev.type === 'blocks') blocks = ev.blocks;
         else if (ev.type === 'usage') usage = ev.usage;
         else if (ev.type === 'stop') stop = ev.reason;
+        else if (ev.type === 'tool') draft(ev.name, ev.args);
         else if (ev.type === 'thinking') {
           if (thinking.ms === undefined) thinking.text += ev.text;
         } else if (ev.type === 'text') {
@@ -1188,6 +1342,9 @@ export async function runApp(cfg: Config, version: string) {
             }
           }
           reply.text += ev.text;
+          // Qwen's own <tool_call> XML in the text (no native tools): the same live row.
+          const at = reply.text.indexOf('<tool_call>');
+          if (at >= 0) draft(/<function=([^>\s]+)>/.exec(reply.text.slice(at))?.[1] ?? /"name"\s*:\s*"([^"]+)"/.exec(reply.text.slice(at))?.[1] ?? 'tool', reply.text.slice(at));
           schedule();
         }
       }
@@ -1235,6 +1392,7 @@ export async function runApp(cfg: Config, version: string) {
     } finally {
       clearInterval(spin);
       if (flush) clearInterval(flush);
+      if (drafting) drop(drafting); // the real tool row replaces it
       C.live = null;
       schedule();
     }
@@ -1256,10 +1414,20 @@ export async function runApp(cfg: Config, version: string) {
     };
   }
 
+  // One ↳ line per turn (SPEC: transcript order): each request of the turn adds to
+  // it and moves it below the turn's latest text and tool rows.
+  function addCost(C: Session, turn: Turn) {
+    const prev = C.costItem?.kind === 'cost' ? C.costItem.turn : null;
+    if (C.costItem) bound(C).drop(C.costItem);
+    C.costItem = { kind: 'cost', turn: prev ? addTurns(prev, turn) : turn };
+    C.items.push(C.costItem);
+  }
+
   // A saved message as you sent it: attachments as chips, not their contents.
   const userItem = (blocks: Block[]): Item => {
     const labels: Record<string, string> = {};
-    const text = fromBlocks(blocks, (c) => {
+    // Rime's own notes to the model ([Rime: plan mode is on…]) aren't yours.
+    const text = fromBlocks(blocks.filter((b) => !(b.type === 'text' && String(b.text).startsWith('[Rime: '))), (c) => {
       const ch = chipChar(chipSeq++);
       chips.set(ch, c);
       labels[ch] = label(c);
@@ -1271,7 +1439,11 @@ export async function runApp(cfg: Config, version: string) {
   // ---- tools (Phase 4) and permissions (SPEC §17) ----
 
   const result = (id: unknown, content: string, error = false): Block => ({ type: 'tool_result', tool_use_id: id, content, ...(error ? { is_error: true } : {}) });
-  const permCtx = () => ({ mode, project, rules: ruleList(cfg.permissions, projectRules(project), S.convRules), granted: (p: string) => [...chips.values()].some((c) => c.path && (p === c.path || p.startsWith(c.path + path.sep))) });
+  // The rules of the conversation the tools run for, and the paths dropped into it.
+  const permCtx = (C: Session) => {
+    const dropped = C.items.flatMap((it) => (it.kind === 'user' ? [...it.text].filter(isChip).map((ch) => chips.get(ch)?.path ?? '') : [])).filter(Boolean);
+    return { mode, project, rules: ruleList(cfg.permissions, projectRules(project), C.convRules), granted: (p: string) => dropped.some((d) => p === d || p.startsWith(d + path.sep)) };
+  };
   const describe = (u: Block) => {
     const i = (u.input ?? {}) as Record<string, any>;
     const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime', ask: 'Asked' }[String(u.name)] ?? String(u.name);
@@ -1284,7 +1456,7 @@ export async function runApp(cfg: Config, version: string) {
   // Runs each tool call in order. Every call gets a result, also when it's
   // refused, declined or stopped, so the history stays valid.
   async function runTools(uses: Block[], signal: AbortSignal, did: Did, C: Session): Promise<Block[]> {
-    const { conversation, store, note, drop, addConvRule, detail } = bound(C);
+    const { conversation, store, note, drop, addConvRule, detail, event } = bound(C);
     const out: Block[] = [];
     let skip = '';
     for (const u of uses) {
@@ -1329,7 +1501,7 @@ export async function runApp(cfg: Config, version: string) {
         schedule();
         continue;
       }
-      const d = decide(String(u.name), input, permCtx());
+      const d = decide(String(u.name), input, permCtx(C));
       decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why });
       decisions.length = Math.min(decisions.length, 50);
       if (d.verdict === 'deny') {
@@ -1362,10 +1534,10 @@ export async function runApp(cfg: Config, version: string) {
           continue;
         }
         if (answer === 'always') {
-          if (u.name === 'write' || u.name === 'edit') setMode('auto-edit');
-          else if (d.rule) {
-            addConvRule('allow', d.rule);
-            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${d.label} commands in this conversation · /permissions`, s: st.dim }]] });
+          const edits = u.name === 'write' || u.name === 'edit';
+          if (edits || d.rule) {
+            for (const r of edits ? ['edit(**)'] : (d.rules ?? [d.rule!])) addConvRule('allow', r);
+            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${edits ? 'edits' : `${d.label} commands`} in this conversation · /permissions`, s: st.dim }]] });
           }
         }
       }
@@ -1378,8 +1550,9 @@ export async function runApp(cfg: Config, version: string) {
         r = { content: (e as Error).message, error: true, summary: (e as Error).message };
       }
       if (u.name === 'write' || u.name === 'edit') !r.error && did.wrote.push(rel(cwd, path.resolve(cwd, String(input.path))));
-      if (u.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error });
+      if (u.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error, out: r.output });
       if (u.name === 'read' && !r.error) (did.about ??= []).push(rel(cwd, path.resolve(cwd, String(input.path))));
+      for (const e of toolEvents(String(u.name), input, r, rel(cwd, path.resolve(cwd, String(input.path ?? ''))))) event(e.kind, e.text, e.ref);
       // What it did, short: the diff of an edit, the end of a command's output.
       if (r.diff) detail(r.diff.map((x) => [{ t: x.n ? `${String(x.n).padStart(4)} ` : '     ', s: st.dim }, { t: x.sign === ' ' ? x.text : `${x.sign} ${x.text}`, s: x.sign === '+' ? st.ok : x.sign === '-' ? st.del : st.dim }]));
       else if (r.output?.length) {
@@ -1461,7 +1634,7 @@ export async function runApp(cfg: Config, version: string) {
       if (u.name === 'edit') {
         const e = planEdit(cwd, input as { path: string; old: string; new: string });
         if (!('error' in e)) diff = diffOf(e.before, e.at, input.old, input.new, 8);
-      } else if (u.name === 'write') diff = String(input.content ?? '').split('\n').slice(0, 8).map((t, i) => ({ sign: '+' as const, n: i + 1, text: t }));
+      } else if (u.name === 'write') diff = textOf(input.content).split('\n').slice(0, 8).map((t, i) => ({ sign: '+' as const, n: i + 1, text: t }));
       C.approval = { use: u, decision: d, sel: 0, done, diff };
       schedule();
     });
@@ -1536,7 +1709,7 @@ export async function runApp(cfg: Config, version: string) {
           } else if (r.kind === 'rule') {
             const k = r.rule!;
             out.push(listRow(`${k.kind} ${k.pattern}`, `${k.from === 'conversation' ? 'this conversation' : k.from === 'project' ? 'this project (.rime/permissions.json)' : 'you (~/.rime/config)'} · d removes`, i === pick, st, `pick:${i}`, 40));
-          } else out.push(listRow(adding ? 'Type the rule below' : '+ Add a rule', adding ? 'e.g. allow bash(npm run build *) · deny edit(.env)' : 'allow / ask / deny bash(…), edit(…), read(…)', i === pick, st, `pick:${i}`, 22));
+          } else out.push(listRow(adding ? 'Type the rule below' : '+ Add a rule', adding ? 'e.g. allow bash(npm run build *) · add "for the team" to share it' : 'allow / ask / deny bash(…), edit(…), read(…)', i === pick, st, `pick:${i}`, 22));
         });
         if (error) out.push({ line: [{ t: error, s: st.warn }] });
         out.push({ line: [] }, { line: [dim('Recent decisions')] });
@@ -1572,9 +1745,12 @@ export async function runApp(cfg: Config, version: string) {
         return true;
       },
       submit(v) {
-        const m = /^(allow|ask|deny)\s+((?:bash|edit|read|fetch)\(.+\))$/.exec(v.trim());
-        if (!m) return void (error = 'A rule looks like: allow bash(npm test *), ask edit(src/**), deny read(.env)');
-        addConvRule(m[1] as 'allow', m[2]);
+        // "… for the team" goes to the project's .rime/permissions.json (it can be
+        // committed); otherwise the rule is this conversation's.
+        const m = /^(allow|ask|deny)\s+((?:bash|edit|read|fetch)\(.+\))(\s+for the team)?$/.exec(v.trim());
+        if (!m) return void (error = 'A rule looks like: allow bash(npm test *), ask edit(src/**), deny read(.env), optionally ending "for the team"');
+        if (m[3]) addProjectRule(project, m[1] as 'allow', m[2]);
+        else addConvRule(m[1] as 'allow', m[2]);
         adding = false;
         error = '';
         host.setBuffer('');
@@ -1629,10 +1805,10 @@ export async function runApp(cfg: Config, version: string) {
     const opts = approvalOptions();
     opts.forEach((n, i) => {
       const on = S.approval!.sel === n;
-      rows.push({ line: [{ t: on ? '› ' : '  ', s: st.accent }, { t: `${i + 1} `, s: st.dim }, { t: labels[n], s: on ? st.accent : st.fg }], bg: on ? st.panelBg : undefined, hit: `dec:${n}` });
+      rows.push({ line: [{ t: on ? '› ' : '  ', s: st.accent }, { t: `${i + 1} `, s: st.dim }, { t: labels[n], s: on ? st.accent : st.fg }], bg: on ? st.panelBg : undefined, hit: `dec:${n}`, hang: 4 });
     });
     rows.push(...footRows(['↑ ↓', ' choose · ', 'enter', ' or ', opts.map((_, i) => i + 1).join(' '), ' · ', 'esc', ' no · ', 'shift+tab', ' mode'], st));
-    return box([{ t: title, s: st.warn }, dim(` · ${MODE_HELP[mode]}`)], rows, width, st, st.warn);
+    return box([{ t: title, s: st.warn }, dim(` · ${MODE_HELP[mode]}`)], rows, width, st, st.warn, 'key:ctrl+c');
   }
 
   // Starts a new conversation; the current one stays in the list.
@@ -1663,19 +1839,37 @@ export async function runApp(cfg: Config, version: string) {
   // ---- the conversations window (SPEC §16) ----
   // ← on an empty prompt (or /conversations, or a click on "← conversations")
   // fills the screen with your conversations: a dot on the ones working (blue,
-  // pulsing), waiting for you (yellow) or open in another Rime window (dim), and a
-  // preview of the highlighted one. ctrl+r renames the highlighted one, ctrl+d
-  // deletes it (after asking). The timeline, pin and fork come in Phase 4b.
-  type ListRow = { id: number | null; title: string; project: string; updated: number; model: string | null; n: number; other: boolean; session?: Session };
+  // pulsing), waiting for you (yellow) or open in another Rime window (dim), and
+  // the highlighted one's timeline. Typing searches (describe it, src/core/rank.ts),
+  // so the actions are ctrl keys that work while you type: ctrl+r rename, ctrl+d
+  // delete (asks; ctrl+u undoes it for 10 s), ctrl+p keep on top, ctrl+f fork,
+  // ctrl+e export, ctrl+s sort. With the search empty, space selects, n starts a
+  // new conversation and a shows all projects.
+  type ListRow = { id: number | null; title: string; project: string; updated: number; created: number; model: string | null; n: number; tokens: number; pinned: boolean; last: string | null; other: boolean; session?: Session };
   // `on`: the highlighted conversation, so the highlight stays on it when the list reorders.
   // `edit`: the new title being typed (`fresh`: still the old one, selected, so
-  // typing replaces it); `confirm`: the conversation about to be deleted.
-  let list: { pick: number; on: number | Session | null; filter: string; all: boolean; rows: ListRow[]; at: number; edit?: string; fresh?: boolean; confirm?: boolean } | null = null;
+  // typing replaces it); `confirm`: the conversations about to be deleted;
+  // `why`: why each search result matched; `picked`: rows selected with space.
+  let list: {
+    pick: number; on: number | Session | null; filter: string; all: boolean; rows: ListRow[]; at: number; sort: number; picked: Set<number>;
+    found?: { q: string; at: number; ids: number[]; why: Map<number, { reason: string; hits: number[] }> }; edit?: string; fresh?: boolean; confirm?: ListRow[];
+  } | null = null;
+  // Deleted, but `u` brings them back for 10 s; then they're gone for good.
+  let undoDelete: { rows: ListRow[]; left: number; t: NodeJS.Timeout } | null = null;
+  const SORTS = ['last used', 'created', 'title', 'size'];
   const keyOf = (r: ListRow) => r.id ?? r.session ?? null;
-  const previews = new Map<number, { at: number; items: Item[] }>();
+  const previews = new Map<number, { at: number; items: Item[]; cost: string }>();
+  const timelines = new Map<number, { at: number; entries: { kind: string; text: string; at: number }[] }>();
+  const timelineOf = (id: number, updated: number) => {
+    const c = timelines.get(id);
+    if (c && c.at === updated) return c.entries;
+    const entries = save((d) => d.timeline(id)) ?? [];
+    timelines.set(id, { at: updated, entries });
+    return entries;
+  };
 
   function openList() {
-    list = { pick: 0, on: S.convId ?? S, filter: '', all: false, rows: [], at: 0 };
+    list = { pick: 0, on: S.convId ?? S, filter: '', all: false, rows: [], at: 0, sort: 0, picked: new Set() };
     listRows();
     schedule();
   }
@@ -1684,14 +1878,33 @@ export async function runApp(cfg: Config, version: string) {
     const L = list!;
     if (Date.now() - L.at > 1000) {
       const stored = save((d) => d.list(L.all ? null : project)) ?? [];
-      const rows: ListRow[] = stored.filter((c) => c.n > 0).map((c) => ({ id: c.id, title: c.title || 'untitled', project: c.project, updated: c.updated, model: c.model, n: c.n, other: c.other, session: sessions.find((x) => x.convId === c.id) }));
+      const rows: ListRow[] = stored
+        .filter((c) => c.n > 0)
+        .map((c) => ({ id: c.id, title: c.title || 'untitled', project: c.project, updated: c.updated, created: c.created, model: c.model, n: c.n, tokens: c.tokens, pinned: !!c.pinned, last: c.last, other: c.other, session: sessions.find((x) => x.convId === c.id) }));
       // Open here but not saved yet (nothing sent): the new conversation you're in.
-      for (const x of sessions) if (x.convId === null && x === S) rows.unshift({ id: null, title: 'New conversation', project, updated: Date.now(), model: model?.ref ?? null, n: 0, other: false, session: x });
+      for (const x of sessions) if (x.convId === null && x === S) rows.unshift({ id: null, title: 'New conversation', project, updated: Date.now(), created: Date.now(), model: model?.ref ?? null, n: 0, tokens: 0, pinned: false, last: null, other: false, session: x });
       L.rows = rows;
       L.at = Date.now();
     }
-    const f = L.filter.toLowerCase();
-    const shown = f ? L.rows.filter((r) => `${r.title} ${r.project}`.toLowerCase().includes(f)) : L.rows;
+    const gone = new Set(undoDelete?.rows.map((r) => r.id));
+    const rows = L.rows.filter((r) => !gone.has(r.id));
+    const f = L.filter.trim().toLowerCase();
+    let shown: ListRow[];
+    if (f) {
+      // Search (SPEC §16): describe it in plain JS, message text from FTS5.
+      if (L.found?.q !== f || L.found.at !== L.at) {
+        const Q = parseQuery(f);
+        const scope = L.all ? null : project;
+        const convs = rows.filter((r) => r.id !== null).map((r) => ({ id: r.id!, title: r.title, updated: r.updated, model: r.model, timeline: timelineOf(r.id!, r.updated) }));
+        const ranked = rank(Q, convs, (w) => new Set((save((d) => d.search(scope, w)) ?? []).map((x) => x.id)));
+        L.found = { q: f, at: L.at, ids: ranked.map((x) => x.id), why: new Map(ranked.map((x) => [x.id, x])) };
+      }
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      shown = [...rows.filter((r) => r.id === null && r.title.toLowerCase().includes(f)), ...L.found.ids.flatMap((id) => byId.get(id) ?? [])];
+    } else {
+      const key = [(r: ListRow) => -r.updated, (r: ListRow) => -r.created, (r: ListRow) => r.title.toLowerCase(), (r: ListRow) => -r.tokens][L.sort];
+      shown = [...rows].sort((a, b) => (a.id === null ? -1 : b.id === null ? 1 : +b.pinned - +a.pinned || (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0)));
+    }
     const at = shown.findIndex((r) => keyOf(r) === L.on);
     L.pick = at >= 0 ? at : Math.min(L.pick, Math.max(0, shown.length - 1));
     L.on = shown[L.pick] ? keyOf(shown[L.pick]) : null;
@@ -1706,7 +1919,8 @@ export async function runApp(cfg: Config, version: string) {
     const cached = previews.get(r.id);
     if (cached && cached.at === r.updated) return cached.items;
     const items: Item[] = [];
-    for (const m of save((d) => d.messages(r.id!)) ?? []) {
+    const stored = save((d) => d.messages(r.id!)) ?? [];
+    for (const m of stored) {
       const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;
       const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
       if (m.role === 'user' && text) items.push(userItem(blocks));
@@ -1715,7 +1929,7 @@ export async function runApp(cfg: Config, version: string) {
         for (const u of blocks.filter((b) => b.type === 'tool_use')) items.push(toolLine(u));
       }
     }
-    previews.set(r.id, { at: r.updated, items });
+    previews.set(r.id, { at: r.updated, items, cost: resumeCost(stored) });
     return items;
   }
 
@@ -1723,6 +1937,10 @@ export async function runApp(cfg: Config, version: string) {
     const day = 86400000, start = new Date().setHours(0, 0, 0, 0);
     return t >= start ? 'Today' : t >= start - day ? 'Yesterday' : t >= start - 6 * day ? 'This week' : 'Older';
   };
+  // A timeline entry's mark.
+  const KIND: Record<string, string> = { edit: '±', test: '▸', command: '▸', error: '✗', commit: '⎇', pin: '◆', server: '●', model: '◇', attach: '+' };
+  const markOf = (kind: string) => KIND[kind] ?? '·';
+  const hhmm = (t: number) => new Date(t).toTimeString().slice(0, 5);
 
   // The dot before a conversation's title.
   function dotOf(r: ListRow): Line[number] {
@@ -1733,6 +1951,18 @@ export async function runApp(cfg: Config, version: string) {
     return { t: '  ', s: '' };
   }
 
+  // What the search field suggests for its last word (tab takes the first).
+  function listSuggestions() {
+    const L = list!;
+    if (!L.filter.trim() || L.edit !== undefined) return [];
+    const convs = L.rows.filter((r) => r.id !== null).map((r) => ({ id: r.id!, title: r.title, updated: r.updated, model: r.model, timeline: timelineOf(r.id!, r.updated) }));
+    return suggestions(L.filter, convs);
+  }
+  function takeSuggestion(s: string) {
+    const L = list!;
+    L.filter = L.filter.replace(/\S*$/, s) + (s.endsWith(':') ? '' : ' ');
+  }
+
   function frameList(width: number, height: number) {
     const L = list!;
     const rows = listRows();
@@ -1740,73 +1970,108 @@ export async function runApp(cfg: Config, version: string) {
     const dim = (t: string) => ({ t, s: st.dim });
     const wide = width >= 100;
     const lw = wide ? Math.floor(width * 0.48) : width;
-    const pw = width - lw - 3;
+    const pw = wide ? width - lw - 3 : width - 2;
+    const searching = !!L.filter.trim();
+    const sugg = listSuggestions();
+    const suggHits: { x0: number; x1: number; id: string }[] = [];
+    const suggLine: Line = [{ t: '   ', s: '' }];
+    if (sugg.length) {
+      suggLine.push({ t: 'tab ', s: st.accentB });
+      sugg.forEach((x, i) => {
+        const x0 = lineWidth(suggLine) + 1;
+        suggLine.push({ t: x, s: i ? st.dim : st.accent });
+        suggHits.push({ x0, x1: x0 + strWidth(x) - 1, id: `sugg:${i}` });
+        suggLine.push({ t: '  ', s: '' });
+      });
+    }
     const top: Line[] = [
       [
         { t: ' conversations', s: st.titleB },
         // What just happened (renamed, deleted, why not), in place of the project
         // for a moment, since the status line is hidden here.
-        ...(flash ? (flash.text.startsWith('✓') ? [{ t: ' · ✓', s: st.ok }, dim(flash.text.slice(1))] : [{ t: ` · ${flash.text}`, s: st.warn }]) : [dim(L.all ? ' · all projects' : ` · ${tildify(project)}`)]),
+        ...(flash ? (flash.text.startsWith('✓') ? [{ t: ' · ✓', s: st.ok }, dim(flash.text.slice(1))] : [{ t: ` · ${flash.text}`, s: st.warn }]) : [dim(`${L.all ? ' · all projects' : ` · ${tildify(project)}`} · ${searching ? 'searching' : SORTS[L.sort]}`)]),
       ],
-      [{ t: ' › ', s: st.accentB }, L.filter ? { t: L.filter, s: st.title } : { t: 'type to search', s: st.placeholder }],
+      [{ t: ' › ', s: st.accentB }, L.filter ? { t: L.filter, s: st.title } : { t: 'search, or describe the conversation', s: st.placeholder }],
+      ...(sugg.length ? [suggLine] : []),
       [{ t: '─'.repeat(width), s: st.line }],
     ];
     // The footer's keys are clickable, like every footer (SPEC §5.1).
     const sel = rows[L.pick];
+    const confirm = L.confirm ?? [];
     const parts: [string, string, string?][] =
       L.edit !== undefined ? [['enter', ' save · '], ['esc', ' cancel'], ['', '   type the new title']]
-      : L.confirm ? [['', `delete "${sel?.title ?? ''}"? `, 'warn'], ['enter', ' delete · '], ['esc', ' keep it']]
-      : [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ['ctrl+r', ' rename · '], ['ctrl+d', ' delete · '], ['n', ' new · '], ['a', L.all ? ' this project · ' : ' all projects · '], ['esc', ' back']];
-    const footLine: Line = [{ t: ' ', s: '' }];
-    const footHits: { x0: number; x1: number; id: string }[] = [];
-    for (const [k, label, tone] of parts) {
-      if (k) {
-        const x0 = lineWidth(footLine) + 1;
-        footLine.push({ t: k, s: st.accentB });
-        if (k !== '↑ ↓') footHits.push({ x0, x1: x0 + strWidth(k) - 1, id: `key:${k}` });
-      }
-      footLine.push({ t: label, s: tone === 'warn' ? st.warn : st.dim });
-    }
-    if (L.edit === undefined && !L.confirm) footLine.push(dim(' · '), { t: '● ', s: st.accentB }, dim('working '), { t: '● ', s: st.warn }, dim('needs you '), { t: '● ', s: st.dim }, dim('another window'));
-    const foot: Line[] = [[{ t: '─'.repeat(width), s: st.line }], footLine];
+      : confirm.length ? [['', `delete ${confirm.length > 1 ? `${confirm.length} conversations` : `"${confirm[0].title}"`}? Its messages and timeline go too. `, 'warn'], ['enter', ' delete · '], ['esc', ' keep it']]
+      : undoDelete ? [['', `deleted ${undoDelete.rows.length > 1 ? `${undoDelete.rows.length} conversations` : `"${undoDelete.rows[0].title}"`} · `, 'warn'], ['ctrl+u', ` undo (${undoDelete.left} s) · `], ['↑ ↓', ' choose · '], ['enter', ' open · '], ['esc', ' back']]
+      : searching ? [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ...(sugg.length ? [['tab', ' suggestion · '] as [string, string]] : []), ['ctrl+r', ' rename · '], ['ctrl+d', ' delete · '], ['esc', ' clear']]
+      : [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ['ctrl+r', ' rename · '], ['ctrl+d', ' delete · '], ['ctrl+p', sel?.pinned ? ' unpin · ' : ' keep on top · '], ['ctrl+f', ' fork · '], ['ctrl+e', ' export · '], ['ctrl+s', ' sort · '], ['space', ' select · '], ['n', ' new · '], ['a', L.all ? ' this project · ' : ' all projects · '], ['esc', ' back']];
+    // Keys wrap onto more lines when narrow, never cut off; the dot legend comes
+    // last and only when it fits on the last line.
+    const fh = hintLines(parts.map(([k, label, tone]): Hint => [k, label, tone === 'warn' ? st.warn : undefined]), width - 2, st);
+    const legend: Line = [dim(' · '), { t: '● ', s: st.accentB }, dim('working '), { t: '● ', s: st.warn }, dim('needs you '), { t: '● ', s: st.dim }, dim('another window')];
+    if (L.edit === undefined && !confirm.length && lineWidth(fh.lines.at(-1)!) + lineWidth(legend) <= width - 2) fh.lines.at(-1)!.push(...legend);
+    const foot: Line[] = [[{ t: '─'.repeat(width), s: st.line }], ...fh.lines.map((l): Line => [{ t: ' ', s: '' }, ...l])];
     const bodyH = Math.max(1, height - top.length - foot.length);
-    // The list, grouped by day, scrolled to keep the highlight in view.
+    // Narrow: the preview goes under the list.
+    const listH = wide ? bodyH : Math.max(3, Math.ceil(bodyH * 0.55));
+    const pvH = wide ? bodyH : Math.max(0, bodyH - listH - 1);
+    // The list, grouped by day (kept-on-top first), scrolled to keep the highlight in view.
     const left: { line: Line; i?: number }[] = [];
     let g = '';
     rows.forEach((r, i) => {
-      if (dayOf(r.updated) !== g) left.push({ line: [dim(` ${(g = dayOf(r.updated))}`)] });
-      const sel = i === L.pick;
-      const meta = [ago(r.updated), r.model?.split('/').pop(), r.n ? `${r.n} messages` : '', L.all && r.project !== project ? tildify(r.project) : ''].filter(Boolean).join(' · ');
-      const tw = Math.max(8, lw - 4 - Math.min(meta.length, Math.floor(lw / 2)) - 2);
+      const group = searching ? '' : r.pinned ? 'Kept on top' : L.sort === 0 ? dayOf(r.updated) : '';
+      if (group && group !== g) left.push({ line: [dim(` ${(g = group)}`)] });
+      const on = i === L.pick;
+      const why = r.id !== null ? L.found?.why.get(r.id) : undefined;
+      const when = ago(r.updated);
+      const meta: Line = searching && why
+        ? [{ t: why.reason, s: st.accent }]
+        : [dim([L.all && r.project !== project ? tildify(r.project) : '', r.model?.split('/').pop(), r.tokens ? `${fmtK(r.tokens)} tokens` : '', r.last ? `${markOf(timelineOf(r.id!, r.updated).at(-1)?.kind ?? '')} ${r.last}` : ''].filter(Boolean).join(' · '))];
+      const tw = Math.max(8, Math.min(strWidth(r.title) + 1, lw - 4 - when.length - 2 - 12));
       const title =
-        sel && L.edit !== undefined ? [{ t: L.edit.slice(-(tw - 1)), s: L.fresh ? st.selection : st.title }, { t: '▏', s: st.accent }]
-        : fit([{ t: r.title, s: sel && L.confirm ? st.del : sel ? st.accentB : r.session === S ? st.titleB : st.title }], tw);
-      left.push({ line: [{ t: sel ? '›' : ' ', s: st.accent }, dotOf(r), ...title, { t: '  ', s: '' }, ...fit([dim(meta)], lw - 3 - tw - 2)], i });
+        on && L.edit !== undefined ? [{ t: L.edit.slice(-(tw - 1)), s: L.fresh ? st.selection : st.title }, { t: '▏', s: st.accent }]
+        : fit([{ t: r.title, s: on && confirm.includes(r) ? st.del : on ? st.accentB : r.session === S ? st.titleB : st.title }], tw);
+      const mark = r.id !== null && L.picked.has(r.id) ? { t: '✓', s: st.ok } : { t: on ? '›' : ' ', s: st.accent };
+      const head: Line = [mark, dotOf(r), ...title, { t: ' ', s: '' }, dim(when), { t: '  ', s: '' }];
+      left.push({ line: [...head, ...fit(meta, Math.max(0, lw - lineWidth(head)))], i });
     });
-    if (!rows.length) left.push({ line: [dim(L.filter ? ` no conversation matches "${L.filter}"` : ' No conversations yet. n starts one.')] });
+    if (!rows.length) left.push({ line: [dim(L.filter ? ' No conversation matches. Try fewer words, or a file name.' : ' No conversations yet. n starts one.')] });
     const selAt = left.findIndex((l) => l.i === L.pick);
-    const from = Math.max(0, Math.min(selAt - Math.floor(bodyH / 2), left.length - bodyH));
-    const shown = left.slice(from, from + bodyH);
-    // The preview: the highlighted conversation's last lines.
+    const from = Math.max(0, Math.min(selAt - Math.floor(listH / 2), left.length - listH));
+    const shown = left.slice(from, from + listH);
+    // The preview: the highlighted conversation's timeline, then its last lines.
     const r = rows[L.pick];
-    // Ready-made rows for the right column (styled strings).
     let right: string[] = [];
-    if (wide && r) {
+    if (r && pvH > 0) {
       const state: Line = r.session && needsYou(r.session) ? [{ t: '● waiting for you', s: st.warn }] : r.session?.busy ? [{ t: '● working', s: st.accentB }] : r.other ? [dim('open in another Rime window')] : [];
-      const head = [str([{ t: r.title, s: st.titleB }], st), str([dim([ago(r.updated), r.model ?? '', tildify(r.project)].filter(Boolean).join(' · ')), ...(state.length ? [dim(' · '), ...state] : [])], st), ''];
+      const head = [
+        str([{ t: r.title, s: st.titleB }], st),
+        str([dim([tildify(r.project), r.model?.split('/').pop() ?? '', r.tokens ? `${fmtK(r.tokens)} tokens` : '', `started ${ago(r.created)}`, r.id !== null && !r.session ? (previewItems(r), previews.get(r.id)?.cost) : ''].filter(Boolean).join(' · ')), ...(state.length ? [dim(' · '), ...state] : [])], st),
+        '',
+      ];
+      const hits = new Set(r.id !== null ? (L.found?.why.get(r.id)?.hits ?? []) : []);
+      const tl = r.id !== null ? timelineOf(r.id, r.updated) : [];
+      const tlRows = tl.map((e, k) => str(fit([dim(`${hhmm(e.at)} `), { t: `${markOf(e.kind)} `, s: e.kind === 'error' ? st.warn : e.kind === 'pin' ? st.warn : st.accent }, { t: e.text, s: hits.has(k) ? st.accentB : st.fg }], pw), st));
+      const shownTl = tlRows.slice(-Math.max(0, Math.min(tlRows.length, Math.floor((pvH - head.length) / 2))));
       const body = previewItems(r).flatMap((it, k, all) => [...(spaced(all[k - 1], it) ? [''] : []), ...render(it, pw)]);
-      right = [...head, ...body.slice(-Math.max(0, bodyH - head.length))];
+      const rest = pvH - head.length - shownTl.length - (shownTl.length ? 1 : 0);
+      right = [...head, ...shownTl, ...(shownTl.length ? [str([dim('─'.repeat(Math.min(pw, 24)))], st)] : []), ...body.slice(-Math.max(0, rest))];
+      if (!wide) right = right.slice(0, pvH);
     }
     const lines: string[] = [];
     const rowHits: { row: number; x0: number; x1: number; id: string }[] = [];
     for (const l of top) lines.push(str(fit(l, width), st));
-    for (let k = 0; k < bodyH; k++) {
+    if (sugg.length) rowHits.push(...suggHits.filter((h) => h.x1 <= width).map((h) => ({ ...h, row: 3 })));
+    for (let k = 0; k < listH; k++) {
       const l = shown[k];
       lines.push(str(fit(l?.line ?? [], lw), st) + (wide ? str([{ t: ' │ ', s: st.line }], st) + truncAnsi(right[k] ?? '', pw) : ''));
       if (l?.i !== undefined) rowHits.push({ row: top.length + k + 1, x0: 1, x1: lw, id: `conv:${l.i}` });
     }
+    if (!wide && pvH > 0) {
+      lines.push(str([{ t: '─'.repeat(width), s: st.line }], st));
+      for (let k = 0; k < pvH; k++) lines.push(' ' + truncAnsi(right[k] ?? '', pw));
+    }
     for (const l of foot) lines.push(str(fit(l, width), st));
-    rowHits.push(...footHits.filter((h) => h.x1 <= width).map((h) => ({ ...h, row: lines.length })));
+    fh.segs.forEach((segs, i) => rowHits.push(...segs.map((h) => ({ x0: h.x0 + 1, x1: h.x1 + 1, id: h.id, row: lines.length - fh.lines.length + i + 1 }))));
     return { lines, rowHits };
   }
 
@@ -1828,14 +2093,16 @@ export async function runApp(cfg: Config, version: string) {
       if ((k.name === 'char' && k.ch && !k.ctrl) || k.name === 'space') return void (L.edit = (fresh ? '' : L.edit) + (k.ch ?? ' '));
       return;
     }
-    // Deleting asks first: enter deletes, anything else keeps it.
+    // Deleting asks first: enter deletes, anything else keeps them.
     if (L.confirm) {
-      L.confirm = false;
-      if (k.name === 'enter') deleteRow(r);
+      const gone = L.confirm;
+      L.confirm = undefined;
+      if (k.name === 'enter') deleteRows(gone);
       return;
     }
     if (k.name === 'escape' || (k.ctrl && k.name === 'c')) {
       if (L.filter && k.name === 'escape') return void (L.filter = '');
+      if (L.picked.size && k.name === 'escape') return void L.picked.clear();
       return void (list = null);
     }
     if (k.ctrl && k.name === 'r' && r) {
@@ -1843,10 +2110,11 @@ export async function runApp(cfg: Config, version: string) {
       return void ((L.edit = r.title === 'untitled' ? '' : r.title), (L.fresh = true));
     }
     if (k.ctrl && k.name === 'd' && r) {
-      if (r.id === null) return say("nothing to delete: it isn't saved until you send something");
-      if (r.other) return say("it's open in another Rime window; close it there first");
-      if (r.session && (r.session.busy || r.session.waiting || r.session.approval)) return say("it's still working; stop it first");
-      return void (L.confirm = true);
+      const many = L.picked.size ? rows.filter((x) => x.id !== null && L.picked.has(x.id)) : [r];
+      if (many.some((x) => x.id === null)) return say("nothing to delete: it isn't saved until you send something");
+      if (many.some((x) => x.other)) return say("it's open in another Rime window; close it there first");
+      if (many.some((x) => x.session && (x.session.busy || x.session.waiting || x.session.approval))) return say("it's still working; stop it first");
+      return void (L.confirm = many);
     }
     const go = (i: number) => {
       L.pick = Math.max(0, Math.min(rows.length - 1, i));
@@ -1856,9 +2124,32 @@ export async function runApp(cfg: Config, version: string) {
     if (k.name === 'down') return go(L.pick + 1);
     // ← opened the list; → (or enter) opens the conversation it's on.
     if (k.name === 'enter' || k.name === 'right') return openRow(rows[L.pick]);
+    if (k.name === 'tab' && !k.shift) {
+      const s = listSuggestions()[0];
+      return void (s && takeSuggestion(s));
+    }
     if (k.name === 'backspace') return void (L.filter = L.filter.slice(0, -1));
-    if (k.name === 'char' && k.ch === 'n' && !L.filter) return void ((list = null), newConversation());
-    if (k.name === 'char' && k.ch === 'a' && !L.filter) return void ((L.all = !L.all), (L.at = 0));
+    if (k.ctrl && k.name === 'u') return void (undoDelete ? undoDeleteNow() : (L.filter = ''));
+    if (k.ctrl && k.name === 's') return void (L.sort = (L.sort + 1) % SORTS.length);
+    if (k.ctrl && k.name === 'p' && r?.id != null) {
+      save((d) => d.pin(r.id!, !r.pinned));
+      L.at = 0;
+      return say(r.pinned ? '✓ back in date order' : '✓ kept on top');
+    }
+    if (k.ctrl && k.name === 'f' && r?.id != null) {
+      const id = save((d) => d.fork(r.id!));
+      if (!id) return;
+      L.at = 0;
+      L.on = id;
+      return say('✓ forked: the copy has the same messages, ready to try another direction');
+    }
+    if (k.ctrl && k.name === 'e' && r) return exportRows(L.picked.size ? rows.filter((x) => x.id !== null && L.picked.has(x.id)) : [r]);
+    // With the search empty, a few keys act instead of typing (no search starts with them).
+    if (!L.filter) {
+      if (k.name === 'char' && k.ch === 'n' && !k.ctrl) return void ((list = null), newConversation());
+      if (k.name === 'char' && k.ch === 'a' && !k.ctrl) return void ((L.all = !L.all), (L.at = 0));
+      if (k.name === 'space') return void (r?.id != null && (L.picked.has(r.id) ? L.picked.delete(r.id) : L.picked.add(r.id), go(L.pick + 1)));
+    }
     if ((k.name === 'char' && k.ch && !k.ctrl) || k.name === 'space') return void (L.filter += k.ch ?? ' ');
   }
 
@@ -1874,18 +2165,71 @@ export async function runApp(cfg: Config, version: string) {
     say(`✓ renamed to "${t}"`);
   }
 
-  function deleteRow(r?: ListRow) {
-    if (!r || r.id === null) return;
-    const x = r.session;
-    if (x) {
+  // Deleted rows leave the list at once; the database forgets them after 10 s
+  // unless `u` brings them back (or at once when Rime quits).
+  function deleteRows(rows: ListRow[]) {
+    if (undoDelete) finishDelete();
+    for (const r of rows) {
+      const x = r.session;
+      if (!x) continue;
       sessions.splice(sessions.indexOf(x), 1);
-      x.convId = null; // nothing of it is saved any more
+      if (x.convId) save((d) => d.unlock(x.convId!));
       if (x === S) show(newSession()); // you were in it: a fresh one takes its place
+      r.session = undefined;
     }
-    save((d) => d.delete(r.id!));
-    previews.delete(r.id);
-    list!.at = 0;
-    say(`✓ deleted "${r.title}"`);
+    list?.picked.clear();
+    const t = setInterval(() => {
+      if (!undoDelete || --undoDelete.left > 0) return schedule();
+      finishDelete();
+      schedule();
+    }, 1000);
+    undoDelete = { rows, left: 10, t };
+  }
+  function finishDelete() {
+    if (!undoDelete) return;
+    clearInterval(undoDelete.t);
+    for (const r of undoDelete.rows) {
+      save((d) => d.delete(r.id!));
+      previews.delete(r.id!);
+      timelines.delete(r.id!);
+    }
+    undoDelete = null;
+    if (list) list.at = 0;
+  }
+  function undoDeleteNow() {
+    if (!undoDelete) return;
+    clearInterval(undoDelete.t);
+    const n = undoDelete.rows.length;
+    undoDelete = null;
+    if (list) list.at = 0;
+    say(`✓ ${n > 1 ? `${n} conversations are` : 'it is'} back`);
+  }
+
+  // e: a conversation as Markdown, saved in the project folder.
+  function exportRows(rows: ListRow[]) {
+    const out: string[] = [];
+    for (const r of rows) {
+      if (r.id === null) continue;
+      const md = [`# ${r.title}`, '', `_${[r.model, new Date(r.updated).toISOString().slice(0, 10), 'exported from Rime'].filter(Boolean).join(' · ')}_`, ''];
+      for (const m of save((d) => d.messages(r.id!)) ?? []) {
+        const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;
+        const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('\n').trim();
+        const tools = blocks.filter((b) => b.type === 'tool_use').map((u) => `> ${describe(u).verb} ${describe(u).rest}`);
+        if (m.role === 'user' && text) md.push('## You', '', text, '');
+        else if (m.role === 'assistant' && (text || tools.length)) md.push('## Rime', '', ...(text ? [splitToolCalls(text).text.trim(), ''] : []), ...(tools.length ? [...tools, ''] : []));
+      }
+      const slug = r.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'conversation';
+      let file = path.join(r.project, `${slug}.md`);
+      for (let i = 2; fs.existsSync(file); i++) file = path.join(r.project, `${slug}-${i}.md`);
+      try {
+        fs.writeFileSync(file, md.join('\n'));
+        out.push(rel(cwd, file));
+      } catch (e) {
+        return say(`can't export: ${(e as Error).message}`);
+      }
+    }
+    list?.picked.clear();
+    say(`✓ exported to ${out.join(', ')}`);
   }
 
   function openRow(r?: ListRow) {
@@ -1915,7 +2259,7 @@ export async function runApp(cfg: Config, version: string) {
     st,
     cfg,
     get system() {
-      return SYSTEM;
+      return S.system;
     },
     redraw: () => schedule(),
     close: () => {
@@ -1984,7 +2328,10 @@ export async function runApp(cfg: Config, version: string) {
     // The server stopped serving its model (unload, stop, power off): the next
     // message brings it back up first.
     down: (name) => {
-      if (model?.provider === name) conn = undefined;
+      // Over ssh the next message brings it back up first; a direct server loads
+      // the model itself when a request asks for it.
+      if (model?.provider === name && cfg.providers[name]?.ssh) conn = undefined;
+      if (S.convId) bound(S).event('server', `${name} stopped serving its model`);
     },
     openSteps: (name) => {
       panel = createSetup(host, 'steps', name);
@@ -2009,13 +2356,42 @@ export async function runApp(cfg: Config, version: string) {
   // ---- commands ----
 
   // A short, exact request ("effort high") runs in Rime with no API call.
+  // Returns false when it isn't Rime's to handle after all (`use tabs`).
+  // Your server is set up but has no model loaded (unloaded or stopped in /server).
+  const unloaded = () => (model && cfg.providers[model.provider]?.ssh && !conn && !(bg && !bg.run.state.done) ? model.id : '');
+
   function local(text: string, ph: { key: string; value: string }) {
+    if (ph.key === 'use') {
+      const v = ph.value.toLowerCase();
+      const refs = knownModels();
+      const ref = refs.find((r) => r.toLowerCase() === v) ?? refs.find((r) => r.split('/').pop()!.toLowerCase() === v) ?? refs.find((r) => r.split('/')[0].toLowerCase() === v);
+      if (!ref) return false;
+      S.items.push({ kind: 'user', text });
+      history.push(text);
+      S.nextStep = '';
+      if (ref === model?.ref && conn) S.items.push({ kind: 'note', tone: 'dim', text: `Already using ${model.label}.` });
+      else {
+        cfg.model = ref;
+        settings.save();
+        useRef(ref);
+      }
+      handled();
+      return;
+    }
     S.items.push({ kind: 'user', text });
     history.push(text);
     const c = settings.set(ph.key, ph.value);
     const d = settings.list().find((x) => x.key === ph.key)!;
     S.items.push(c ? { kind: 'gear', change: c } : { kind: 'gear', change: { key: ph.key, label: d.label.toLowerCase(), from: ph.value, to: ph.value, applies: d.applies, at: Date.now() }, note: `${d.label.toLowerCase()} is already ${ph.value}` });
-    S.items.push({ kind: 'lines', lines: [[{ t: '  ↳ handled in Rime · no API call', s: st.dim }]] });
+    handled();
+  }
+  // The ↳ line, and the turn it saved on the meter: the context re-read from cache
+  // plus a short reply, at this model's price. Local models cost nothing anyway.
+  function handled() {
+    const p = model?.price;
+    const d = p && !conn?.local ? (Math.max(S.task?.lastPrompt ?? 0, 1000) * p.read + 50 * p.out) / 1e6 : 0;
+    if (d) S.meter.credit(d);
+    S.items.push({ kind: 'lines', lines: [[{ t: `  ↳ handled in Rime · no API call${d ? ` · saved ~${fmt$(d)}` : ''}`, s: st.dim }]] });
   }
 
   function submit() {
@@ -2067,7 +2443,7 @@ export async function runApp(cfg: Config, version: string) {
     if (!v.startsWith('/')) {
       scrollOff = 0;
       const ph = [...v].some(isChip) ? null : phrase(v);
-      if (ph) return local(v, ph);
+      if (ph && local(v, ph) !== false) return;
       return void send(v, false, [...v].some(isChip) ? blocksFor(v, chips, cwd, see) : v);
     }
     const [c, ...args] = v.split(/\s+/);
@@ -2084,9 +2460,12 @@ export async function runApp(cfg: Config, version: string) {
     else if (c === '/setup') panel = bg?.panel && !bg.run.state.done ? bg.panel : createSetup(host);
     else if (c === '/connect') panel = args[0] ? createSetup(host, 'connect', args[1], args[0]) : createSetup(host);
     else if (c === '/server') {
-      const name = model && cfg.providers[model.provider]?.ssh ? model.provider : Object.keys(cfg.providers).find((n) => cfg.providers[n].ssh);
+      // Your own server: the one in use, else one set up over ssh, else any llama.cpp server.
+      const own = (n: string) => !!cfg.providers[n]?.ssh || cfg.providers[n]?.preset === 'llamacpp';
+      const names = Object.keys(cfg.providers);
+      const name = model && own(model.provider) ? model.provider : (names.find((n) => cfg.providers[n].ssh) ?? names.find(own));
       if (name) panel = createServer(host, name);
-      else note('No own server is set up. /setup connects one.', 'dim');
+      else note('No llama.cpp server is connected. /setup connects one.', 'dim');
     } else if (c === '/settings') panel = createSettingsPanel(host);
     else if (c === '/permissions') panel = createPermissions();
     else if (c === '/conversations') openList();
@@ -2186,7 +2565,10 @@ export async function runApp(cfg: Config, version: string) {
   const addChip = (c: Chip) => {
     const ch = chipChar(chipSeq++);
     chips.set(ch, c);
-    insert(ch);
+    // A space on each side, so typed words don't run into the chip.
+    const r = range();
+    const a = r ? r[0] : cur, b = r ? r[1] : cur;
+    insert(`${a && !/\s/.test(buf[a - 1]) ? ' ' : ''}${ch}${/\s/.test(buf[b] ?? '') ? '' : ' '}`);
   };
   function say(text: string) {
     if (flash) clearTimeout(flash.t);
@@ -2209,7 +2591,7 @@ export async function runApp(cfg: Config, version: string) {
       }
       return;
     }
-    const clean = t.replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f-]/g, '');
+    const clean = cleanPaste(t);
     if (clean.split('\n').length > LONG_PASTE.lines || clean.length > LONG_PASTE.chars) return addChip(textChip(clean, nextN));
     insert(clean);
   }
@@ -2224,7 +2606,7 @@ export async function runApp(cfg: Config, version: string) {
   function act(id: string) {
     if (id.startsWith('key:')) {
       const label = id.slice(4);
-      const k = CLICK_KEYS[label] ?? (/^[a-z]$/.test(label) ? { name: 'char', ch: label } : null);
+      const k = CLICK_KEYS[label] ?? (/^[a-z0-9]$/.test(label) ? { name: 'char', ch: label } : null);
       if (k) onKey({ type: 'key', ...k });
       return;
     }
@@ -2232,8 +2614,17 @@ export async function runApp(cfg: Config, version: string) {
     if (id === 'mode') return cycleMode();
     if (id === 'conversations') return openList();
     if (id.startsWith('conv:') && list) return openRow(listRows()[+id.slice(5)]);
+    if (id.startsWith('sugg:') && list) return takeSuggestion(listSuggestions()[+id.slice(5)] ?? '');
     if (id.startsWith('dec:') && S.approval) return void answer(+id.slice(4));
     if (id.startsWith('q:') && S.question) return S.question.done(S.question.options[+id.slice(2)].label);
+    if (id.startsWith('pin:')) {
+      const it = S.items[+id.slice(4)];
+      if (it?.kind !== 'user' || it.pinned || S.convId === null) return;
+      it.pinned = true;
+      cache.delete(it);
+      bound(S).event('pin', plainOf(it.text).split('\n')[0].trim().slice(0, 80));
+      return say('◆ pinned to the timeline');
+    }
     if (id.startsWith('undo:')) {
       const it = S.items[+id.slice(5)];
       if (it?.kind === 'gear') settings.undo(it.change);
@@ -2298,14 +2689,15 @@ export async function runApp(cfg: Config, version: string) {
       if (rsearch || atPick) return void (rsearch = atPick = null);
       if (boxKind) return void (boxKind = null);
       if (big || listPinned) return void ((big = null), (listPinned = listOpen = false));
-      if (S.busy) S.busy.abort();
-      else if (buf) {
+      if (S.busy) return S.busy.abort();
+      if (buf) {
         buf = '';
         cur = 0;
         anchor = null;
         return;
-      } else if (bg && !bg.run.state.done && !bg.stopping) return stopBg();
-      else if (quitArmed) return quit();
+      }
+      if (bg && !bg.run.state.done && !bg.stopping) return stopBg();
+      if (quitArmed) return quit();
       if (quitArmed) clearTimeout(quitArmed);
       quitArmed = setTimeout(() => {
         quitArmed = null;
@@ -2359,7 +2751,7 @@ export async function runApp(cfg: Config, version: string) {
       return void (sel = (sel + (k.name === 'down' ? 1 : n - 1)) % n);
     }
     // On an empty prompt, tab or → takes the suggestion (the next step, or the example).
-    if (!buf && !panel && !S.declining && (k.name === 'tab' || (k.name === 'right' && !k.shift)) && (S.nextStep || (example && !S.messages.length))) return insert(S.nextStep || example);
+    if (!buf && !panel && !S.declining && (k.name === 'tab' || (k.name === 'right' && !k.shift)) && (S.nextStep || unloaded() || (example && !S.messages.length))) return insert(S.nextStep || (unloaded() ? `load ${unloaded()}` : example));
     // tab, or → at the end, takes the ghost text.
     const g = ghost();
     if (g && (k.name === 'tab' || (k.name === 'right' && !k.shift && !k.ctrl))) return insert(g);
@@ -2605,7 +2997,9 @@ export async function runApp(cfg: Config, version: string) {
 
   // ---- lifecycle ----
 
+  let closing = false;
   const killTunnels = () => {
+    closing = true;
     for (const t of Object.values(tunnels)) t.child?.kill();
   };
   const restore = () => {
@@ -2621,6 +3015,7 @@ export async function runApp(cfg: Config, version: string) {
   function quit() {
     if (quitting) return;
     quitting = 'bye';
+    finishDelete(); // a delete waiting for undo is done now
     // Every open conversation: a reply being streamed is kept as interrupted.
     for (const x of sessions) {
       if (x.live && x.convId) save((d) => d.update(x.convId!, x.live!.seq, [{ type: 'text', text: x.live!.text() }], true));
@@ -2649,9 +3044,10 @@ export async function runApp(cfg: Config, version: string) {
     } catch {
       C.convRules = {};
     }
+    C.mark = save((d) => d.timeline(c.id).filter((e) => e.kind === 'model').at(-1)?.text) ?? '';
     // The stored prefix is reused when it's recent and was sent with today's tools.
-    if (c.prefix && c.prefix_hash === TOOLS_HASH && Date.now() - c.updated < 86400000) SYSTEM = c.prefix;
-    else save((d) => d.setPrefix(c.id, SYSTEM, TOOLS_HASH));
+    if (c.prefix && c.prefix_hash === TOOLS_HASH && Date.now() - c.updated < 86400000) C.system = c.prefix;
+    else save((d) => d.setPrefix(c.id, C.system, TOOLS_HASH));
     const stored: Stored[] = save((d) => d.messages(c.id)) ?? [];
     for (const m of stored) {
       const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content;
@@ -2664,6 +3060,7 @@ export async function runApp(cfg: Config, version: string) {
       const text = blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
       if (m.role === 'user') {
         if (text) {
+          C.costItem = null;
           const it = userItem(blocks);
           C.items.push(it);
           if (it.kind === 'user' && !it.chips) history.push(it.text);
@@ -2673,12 +3070,12 @@ export async function runApp(cfg: Config, version: string) {
         if (thought.trim()) C.items.push({ kind: 'think', text: thought, start: 0, ms: 0, open: showThinking });
         if (splitToolCalls(text).text.trim()) C.items.push({ kind: 'reply', text: text + (m.interrupted ? '…' : ''), done: true });
         // What it cost comes back too: the ↳ line, the meter and /usage.
-        if (m.usage) C.items.push({ kind: 'cost', turn: C.meter.charge(m.usage.usage, m.usage.price, m.usage.local) });
+        if (m.usage) addCost(C, C.meter.charge(m.usage.usage, m.usage.price, m.usage.local));
         for (const u of blocks.filter((b) => b.type === 'tool_use')) C.items.push(toolLine(u));
       }
     }
     if (!stored.length) return;
-    C.continuing = { title: c.title || 'untitled', at: c.updated };
+    C.continuing = { title: c.title || 'untitled', at: c.updated, cost: resumeCost(stored) };
     // Pick up from the last reply: if it offered something, that's the suggestion.
     const lastReply = stored.at(-1)!;
     if (lastReply.role === 'assistant' && !lastReply.interrupted) {
@@ -2686,16 +3083,14 @@ export async function runApp(cfg: Config, version: string) {
       C.nextStep = nextFor(t, { wrote: [], ran: [] }, project);
       offerChoices(t, C);
     }
-    // Tool calls left without results when Rime closed get them now.
+    // Tool calls left without results when Rime closed are asked again by the
+    // next message (send), so the question you left open comes back.
     const last = C.messages.at(-1);
-    const open = last?.role === 'assistant' && Array.isArray(last.content) ? last.content.filter((b) => b.type === 'tool_use') : [];
-    if (open.length) {
-      C.messages.push({ role: 'user', content: open.map((u) => result(u.id, 'Not run: Rime was closed before this ran.', true)) });
-      C.lastUserSeq = store(C.messages.at(-1)!);
-    } else if (stored.at(-1)!.role === 'user') C.lastUserSeq = stored.at(-1)!.seq;
-    if (stored.at(-1)!.interrupted || C.messages.at(-1)?.role === 'user') {
+    const open = last?.role === 'assistant' && Array.isArray(last.content) && last.content.some((b) => b.type === 'tool_use');
+    if (!open && stored.at(-1)!.role === 'user') C.lastUserSeq = stored.at(-1)!.seq;
+    if (open || stored.at(-1)!.interrupted || C.messages.at(-1)?.role === 'user') {
       C.resumeOk = true;
-      C.items.push({ kind: 'lines', lines: [[{ t: '  ↻ ', s: st.warn }, { t: 'interrupted when you quit · nothing was lost · ', s: st.dim }, { t: 'enter', s: st.accentB }, { t: ' continue', s: st.dim }]] });
+      C.items.push({ kind: 'lines', lines: [[{ t: '  ↻ ', s: st.warn }, { t: open ? 'waiting for your answer when you quit · ' : 'interrupted when you quit · nothing was lost · ', s: st.dim }, { t: 'enter', s: st.accentB }, { t: open ? ' asks again' : ' continue', s: st.dim }]] });
     }
   }
 

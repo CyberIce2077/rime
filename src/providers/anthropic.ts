@@ -41,7 +41,10 @@ export async function* stream(req: Request): AsyncGenerator<Event> {
         b.thinking = ((b.thinking as string) || '') + d.thinking;
         yield { type: 'thinking', text: d.thinking };
       } else if (d.type === 'signature_delta') b.signature = ((b.signature as string) || '') + d.signature;
-      else if (d.type === 'input_json_delta') b._json = ((b._json as string) || '') + d.partial_json;
+      else if (d.type === 'input_json_delta') {
+        b._json = ((b._json as string) || '') + d.partial_json;
+        yield { type: 'tool', name: String(b.name), args: b._json as string };
+      }
     } else if (ev.type === 'content_block_stop') {
       const b = blocks[ev.index];
       if (b?.type === 'tool_use') {

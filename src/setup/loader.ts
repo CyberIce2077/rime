@@ -14,14 +14,16 @@ const W = SPRITE[0].length;
 // Sprite pixels in freezing order: bottom row first, left to right.
 const PIX = SPRITE.flatMap((row, y) => [...row].map((k, x) => ({ x, y, k })).filter((p) => p.k !== '.')).sort((a, b) => b.y - a.y || a.x - b.x);
 
-export function createLoader(rnd = Math.random) {
+// RIME_NO_ANIMATION (like the header): no snow and no shimmer; the cube still
+// freezes with the progress.
+export function createLoader(rnd = Math.random, still = !!process.env.RIME_NO_ANIMATION) {
   let flakes: { x: number; y: number }[] = [];
   const ground = new Array(COLS).fill(0);
   let last = 0;
 
   // Snow falls beside him (never over his face) and settles up to two deep.
   function tick(now: number, falling: boolean) {
-    if (now - last < 180) return;
+    if (still || now - last < 180) return;
     last = now;
     flakes = flakes
       .map((f) => ({ ...f, y: f.y + 1 }))
@@ -46,7 +48,7 @@ export function createLoader(rnd = Math.random) {
     PIX.forEach((p, i) => {
       let c: RGB;
       if (i < n) c = blink && p.k === 'D' && SPRITE[p.y - 1][p.x] !== 'D' ? PALETTE.A : PALETTE[p.k];
-      else c = Math.sin(now / 260 + (p.x + p.y) * 0.9) > 0.35 ? WATER2 : WATER;
+      else c = Math.sin((still ? 0 : now) / 260 + (p.x + p.y) * 0.9) > 0.35 ? WATER2 : WATER;
       g[SY + p.y][SX + p.x] = c;
     });
     ground.forEach((h, x) => {

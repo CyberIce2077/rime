@@ -53,6 +53,8 @@ export const rel = (cwd: string, p: string) => {
   return r && !r.startsWith('..') && !path.isAbsolute(r) ? r : p;
 };
 const fail = (content: string): ToolResult => ({ content, error: true, summary: content });
+// A model that sends a JSON object as a file's content gets it written as JSON.
+export const textOf = (v: unknown) => (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v, null, 2) + '\n');
 
 // read: a line range with line numbers and "N more lines".
 export function read(cwd: string, input: { path: string; offset?: number; limit?: number }): ToolResult {
@@ -80,13 +82,15 @@ export function write(cwd: string, input: { path: string; content: string }): To
   const p = path.resolve(cwd, input.path ?? '');
   const existed = fs.existsSync(p);
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, input.content ?? '');
-  const n = (input.content ?? '').split('\n').length;
+  const text = textOf(input.content);
+  fs.writeFileSync(p, text);
+  const n = text.split('\n').length;
   return { content: `${existed ? 'Replaced' : 'Created'} ${rel(cwd, p)} (${n} lines).`, summary: `${existed ? 'replaced' : 'created'} · ${n} lines` };
 }
 
 // The text an edit would produce, or why it can't (used by the approval prompt too).
 export function planEdit(cwd: string, input: { path: string; old: string; new: string }): { error: string } | { before: string; after: string; at: number } {
+  input.new ??= ''; // no `new`: the old text is removed
   const p = path.resolve(cwd, input.path ?? '');
   if (!fs.existsSync(p)) return { error: `${input.path}: no such file (use write to create it)` };
   const before = fs.readFileSync(p, 'utf8');
@@ -125,12 +129,18 @@ export function clean(out: string) {
   return stripAnsi(out.replace(/\r\n/g, '\n')).split('\n').map((l) => l.split('\r').filter(Boolean).at(-1) ?? '').join('\n');
 }
 
-// Long output keeps its first 50 and last 100 lines, saying what was cut.
+// Long output keeps its first 50 and last 100 lines, each at most 2000 characters,
+// and about 30 KB in all, saying what was cut.
+const TOTAL = 30000;
 export function cap(text: string) {
-  const lines = text.replace(/\n+$/, '').split('\n');
-  if (lines.length <= HEAD + TAIL) return lines;
-  return [...lines.slice(0, HEAD), `… ${lines.length - HEAD - TAIL} lines cut …`, ...lines.slice(-TAIL)];
+  let lines = text.replace(/\n+$/, '').split('\n').map((l) => (l.length > LINE_MAX ? `${l.slice(0, LINE_MAX)}… ${l.length - LINE_MAX} chars cut` : l));
+  if (lines.length > HEAD + TAIL) lines = [...lines.slice(0, HEAD), `… ${lines.length - HEAD - TAIL} lines cut …`, ...lines.slice(-TAIL)];
+  const all = lines.join('\n');
+  if (all.length <= TOTAL) return lines;
+  return `${all.slice(0, TOTAL / 3)}\n… ${all.length - TOTAL} chars cut …\n${all.slice(-(TOTAL * 2) / 3)}`.split('\n');
 }
+// What a command printed, kept to a few MB while it runs (the start and the end).
+const keep = (s: string) => (s.length > 4e6 ? `${s.slice(0, 1e6)}\n… output cut …\n${s.slice(-2e6)}` : s);
 
 export function bash(cwd: string, input: { command: string; timeout?: number }, signal?: AbortSignal): Promise<ToolResult> {
   return new Promise((resolve) => {
@@ -147,8 +157,8 @@ export function bash(cwd: string, input: { command: string; timeout?: number }, 
     const t = setTimeout(() => kill(`timed out after ${limit / 1000} s`), limit);
     const stop = () => kill('stopped');
     signal?.addEventListener('abort', stop, { once: true });
-    p.stdout.on('data', (d) => (out += d));
-    p.stderr.on('data', (d) => (out += d));
+    p.stdout.on('data', (d) => (out = keep(out + d)));
+    p.stderr.on('data', (d) => (out = keep(out + d)));
     p.on('error', (e) => (out += e.message));
     p.on('close', (code) => {
       clearTimeout(t);

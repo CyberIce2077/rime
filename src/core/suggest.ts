@@ -10,9 +10,9 @@ import { listFiles } from './attach.ts';
 
 // What a turn did with its tools; `about`: the files it was about (attached by
 // you, or read by the model).
-export type Did = { wrote: string[]; ran: { cmd: string; ok: boolean }[]; about?: string[] };
+export type Did = { wrote: string[]; ran: { cmd: string; ok: boolean; out?: string[] }[]; about?: string[] };
 
-const TESTS = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?test\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+test\b|\bvitest\b|\bjest\b|\bnode\s+--test\b|\bmake\s+test\b/;
+export const TESTS = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?test\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+test\b|\bvitest\b|\bjest\b|\bnode\s+--test\b|\bmake\s+test\b/;
 
 // The reply's last sentence, without code blocks or markdown.
 function lastSentence(text: string) {
@@ -97,7 +97,10 @@ export function changed(project: string): string[] | null {
 // After a reply: the next step, or '' when the obvious next thing is yours to say.
 export function nextStep(reply: string, did: Did, project: string): string {
   const failed = [...did.ran].reverse().find((r) => TESTS.test(r.cmd));
-  if (failed && !failed.ok) return 'fix the failing tests';
+  if (failed && !failed.ok) {
+    const file = (failed.out ?? []).join('\n').match(/[\w./-]+\.(?:test|spec)\.\w+|[\w./-]*test_\w+\.py|[\w./-]+_test\.(?:go|py)/)?.[0];
+    return file ? `fix the failing test in ${path.basename(file)}` : 'fix the failing tests';
+  }
   const offer = offerOf(reply);
   if (offer) return offer;
   if (offer === '') return ''; // it asked a question only you can answer

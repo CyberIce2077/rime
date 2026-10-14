@@ -2,20 +2,23 @@
 // /setup. Own server (llama.cpp over ssh), this computer, or a hosted provider.
 // Rime writes ~/.rime/config itself at the end; nobody edits it by hand.
 
-import type { ChildProcess } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { Config, ProviderConfig, Step } from '../core/config.ts';
 import { type Key, type Line, fit, lineWidth, wrap } from '../core/term.ts';
 import type { BoxRow, Item, Styles } from '../core/view.ts';
 import { listRow, settingRow } from '../core/view.ts';
 import * as llama from '../providers/llamacpp.ts';
 import { HOSTED, PRESETS } from '../providers/presets.ts';
-import { type Probe, findLocal, probe } from '../providers/probe.ts';
+import { type Probe, findLocal, probe, toolSupport } from '../providers/probe.ts';
 import { connOf, keyOf, listModels, modelOf, prettyLabel } from '../providers/registry.ts';
 import type { Effort, Model } from '../providers/types.ts';
 import { bar, createLoader } from './loader.ts';
 import * as sshx from './ssh.ts';
 import { BUILTIN, Cancelled, NAMES, type Run, type RunState, STEPS, type Server, defaults, happened, runSteps } from './steps.ts';
-import { broadcastFor, wake } from './wol.ts';
+import { broadcastFor, onLan, wake } from './wol.ts';
 
 export type PanelView = { legend: Line; rows: BoxRow[]; foot: string[]; warn?: boolean };
 
@@ -62,6 +65,9 @@ type Mark = 'ok' | 'warn' | 'run' | 'fail';
 type Check = { mark: Mark; text: Line };
 
 const EFF: Effort[] = ['low', 'medium', 'high'];
+// What "this computer" starts when llama-server is installed but not running
+// (router mode: models from its cache; edit it to name one).
+const LOCAL_START = 'llama-server --port 8080';
 const QUIT: [ProviderConfig['onQuit'] & string, string][] = [['keep', 'keep running'], ['stop', 'stop the server'], ['poweroff', 'power off {host}']];
 // Own-server screens and their place in "setup · n of 4".
 const ORDER = ['start', 'where', 'model', 'steps'] as const;
@@ -114,6 +120,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
   let keyError = '';
   let provModels: { id: string; label?: string; context?: number; price?: Model['price'] }[] = [];
   let provBase = '';
+  let provWarnings: string[] = []; // what the probe found wrong with a /connect server
   let provName = '';
   let fromLocal = false;
 
@@ -143,7 +150,11 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     skip = new Set(p.skip);
     models = p.model ? [{ id: p.model, help: '' }] : [];
     const [rh, rp] = (p.tunnel?.remote ?? '127.0.0.1:8080').split(':');
-    unit = { router: !!p.model, host: rh, port: +rp, args: [] };
+    unit = { router: p.router ?? !!p.model, host: rh, port: +rp, args: [] };
+    // Its saved settings, so finishing again keeps them.
+    settings.quit = Math.max(0, QUIT.findIndex(([q]) => q === p.onQuit));
+    settings.save = p.saveCache === false ? 1 : 0;
+    settings.wake = skip.has('wake') ? 1 : 0;
     screen = 'steps';
   }
 
@@ -154,8 +165,13 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     return c;
   };
 
+  // The where screen's own checks (survey, wake wait): esc or ctrl+c stop them at once.
+  let whereAc = new AbortController();
+  const stopWhere = () => (whereAc.abort(), (whereAc = new AbortController()), (checking = false));
+
   // Where does it run? Each check appears as it finishes.
   async function survey(woken = false) {
+    const signal = whereAc.signal;
     checking = true;
     checked = needMac = needWake = false;
     if (!woken) checks = [];
@@ -181,22 +197,26 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         return;
       }
       const c = add('run', plain(`connecting to ${host}…`));
-      const t = await sshx.ssh(host, 'true', 20000);
+      const t = await sshx.ssh(host, 'true', 20000, undefined, signal);
+      if (signal.aborted) return;
       if (t.code !== 0) {
         Object.assign(c, { mark: 'fail', text: [plain(`ssh ${host} failed `), dim(`· ${t.err.trim().split('\n').at(-1) ?? `exit ${t.code}`}`)] });
         return;
       }
       checks.splice(checks.indexOf(c), 1);
       if (inConfig) hostLine.text.push(dim(' · key login'));
-      const sv = sshx.sections((await sshx.ssh(host, sshx.SURVEY, 20000)).out);
+      const sv = sshx.sections((await sshx.ssh(host, sshx.SURVEY, 20000, undefined, signal)).out);
+      if (signal.aborted) return;
       mac = sv.MAC?.trim() || mac;
       unit = sshx.parseUnit(sv.UNIT ?? '');
       gpu = sshx.parseGpu(sv.GPU ?? '');
       if (unit) {
-        const more = sshx.sections((await sshx.ssh(host, sshx.detailsScript(unit), 20000)).out);
+        const more = sshx.sections((await sshx.ssh(host, sshx.detailsScript(unit), 20000, undefined, signal)).out);
+        if (signal.aborted) return;
         build = sshx.buildOf(more.VERSION ?? '');
         presets = sshx.parseIni(more.PRESETS ?? '');
         add('ok', plain('llama-server.service '), dim(`· ${unit.router ? 'router mode' : 'single model'} · ${unit.host}:${unit.port}${build ? ` · llama.cpp ${build}` : ''}`));
+        for (const w of sshx.unitWarnings(unit)) add('warn', plain(w));
       } else add('warn', plain('no llama-server.service '), dim('· edit the start step to run your server'));
       models = Object.entries(presets)
         .filter(([k, v]) => k !== '*' && (v.model || v.m))
@@ -212,19 +232,22 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
       else if (presetNote) add('ok', plain(presetNote));
       checked = true;
     } catch (e) {
-      add('fail', plain((e as Error).message));
+      if (!signal.aborted) add('fail', plain((e as Error).message));
     } finally {
-      checking = false;
+      if (!signal.aborted) checking = false;
       h.redraw();
     }
   }
 
   async function wakeUp(port: number) {
+    const signal = whereAc.signal;
     checks = [add('ok', plain(`${host} was off `), dim(`· woken after you said yes (Wake-on-LAN ${mac})`))];
+    if (!onLan(hostname)) throw new Error(`Wake-on-LAN only works on the same network, and ${hostname} isn't on this computer's network. Turn ${host} on and press enter.`);
     const c = add('run', plain(`waking ${host}`));
     const t0 = Date.now();
     await wake(mac!, broadcastFor(hostname));
     while (!(await sshx.tcpOpen(hostname, port, 1500))) {
+      if (signal.aborted) throw new Error('stopped');
       const s = Math.round((Date.now() - t0) / 1000);
       if (s > 120) throw new Error(`${host} didn't answer within 120 s; Wake-on-LAN only works on the same network`);
       c.text = [plain(`waking ${host} `), dim(`· ${s} s, usually ~30 s`)];
@@ -305,13 +328,19 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     const root = llama.rootOf(r.base);
     const pr = await llama.props(root).catch(() => null);
     const safety = s.model ? await llama.templateSafety(root, { id: s.model }).catch(() => null) : null;
+    const tools = s.model ? await toolSupport(r.base, s.model).catch(() => null) : null;
     const quit = QUIT[settings.quit][0];
+    // Merged into what was saved, so keys Rime doesn't set here (a key, a URL) stay.
     h.cfg.providers[s.name] = {
+      ...h.cfg.providers[s.name],
+      steps: undefined,
+      skip: undefined,
       preset: 'llamacpp',
       ssh: s.host,
       tunnel: { remote: s.remote },
       ...(s.mac ? { wake: { mac: s.mac, broadcast: s.broadcast } } : {}),
       ...(s.model ? { model: s.model } : {}),
+      router: s.router,
       ...(Object.keys(edits).length ? { steps: edits } : {}),
       ...(skip.size ? { skip: [...skip] } : {}),
       onQuit: quit,
@@ -321,6 +350,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         slots: pr?.json?.total_slots,
         ctx: pr?.json?.default_generation_settings?.n_ctx,
         ...(safety ? { effortSafe: safety.effort !== 'unsafe', reasoningSafe: safety.reasoning !== 'unsafe' } : {}),
+        ...(tools ? { tools } : {}),
       },
     };
     const ref = `${s.name}/${s.model ?? 'default'}`;
@@ -372,7 +402,36 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     local = await findLocal();
     looking = false;
     pick = 0;
+    if (!local.length && hasLlama()) h.setBuffer(LOCAL_START);
     h.redraw();
+  }
+  // Nothing running here but llama-server is installed: Rime starts it with the
+  // command on the prompt line (editable, like a step), waits for /health, then
+  // looks again. ponytail: only the start step runs locally, not the full list;
+  // the server keeps running after Rime quits, like one you started yourself.
+  const hasLlama = () => (process.env.PATH ?? '').split(path.delimiter).some((d) => d && fs.existsSync(path.join(d, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server')));
+  let starting = '';
+  async function startLocal(cmd: string) {
+    const signal = whereAc.signal;
+    starting = cmd;
+    h.setBuffer('');
+    h.redraw();
+    fs.mkdirSync(path.join(os.homedir(), '.rime'), { recursive: true });
+    const log = fs.openSync(path.join(os.homedir(), '.rime', 'llama-server.log'), 'a');
+    const p = spawn(process.platform === 'win32' ? 'cmd' : 'sh', process.platform === 'win32' ? ['/c', cmd] : ['-c', cmd], { detached: true, stdio: ['ignore', log, log] });
+    p.on('error', () => {});
+    p.unref();
+    fs.closeSync(log);
+    const port = Number(/--port[ =](\d+)/.exec(cmd)?.[1] ?? 8080);
+    for (let i = 0; i < 120 && !signal.aborted && p.exitCode === null; i++) {
+      const r = await llama.health(`http://127.0.0.1:${port}`, 1000).catch(() => null);
+      if (r?.status === 200) break;
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+    starting = '';
+    if (signal.aborted) return;
+    await lookLocal();
+    if (!local.length) h.setBuffer(cmd);
   }
 
   // /connect <url>: what is it, does it need a key, which models.
@@ -386,6 +445,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
     const hostOf = new URL(p.base).hostname;
     provName = serverName ?? (/^[\d.]+$|^localhost$/.test(hostOf) ? (hostOf === 'localhost' || hostOf === '127.0.0.1' ? 'local' : 'server') : hostOf.split('.')[0]);
     provBase = p.base;
+    provWarnings = p.warnings;
     fromLocal = true; // saved with its URL
     if (p.needKey) {
       keyError = key ? 'That key was refused. Paste it again.' : '';
@@ -552,7 +612,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         const known = sshx.sshHosts();
         const rows: BoxRow[] = [
           { line: [plain('Where does it run? '), accent('› '), title(typed || '…')] },
-          ...why('Rime only checks over ssh here and changes nothing. If the machine is off, it asks before waking it.'),
+          ...why('Rime only checks over ssh here and changes nothing. If the machine is off, it asks before waking it. No ssh? Type its URL (http://host:8080) and Rime talks to it directly.'),
           blank,
           ...checks.map((c) => ({ line: [MARK[c.mark], plain(' '), ...c.text] })),
         ];
@@ -598,13 +658,15 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
       }
       if (screen === 'local') {
         const rows: BoxRow[] = [];
-        if (looking) rows.push({ line: [accent('● '), plain('looking for llama.cpp, Ollama, LM Studio and vLLM on this computer…')] });
+        if (starting) rows.push({ line: [accent('● '), plain('starting '), dim(starting)] }, { line: [dim('its output goes to ~/.rime/llama-server.log')] });
+        else if (looking) rows.push({ line: [accent('● '), plain('looking for llama.cpp, Ollama, LM Studio and vLLM on this computer…')] });
+        else if (!local.length && hasLlama()) rows.push({ line: [plain('No local server answered on ports 8080, 9931, 11434, 1234 or 8000.')] }, { line: [dim('Enter starts llama-server with the command below (edit it to add a model, e.g. -m model.gguf), or clear the line to look again.')] });
         else if (!local.length) rows.push({ line: [plain('No local server answered on ports 8080, 9931, 11434, 1234 or 8000.')] }, { line: [dim('Start llama-server (or Ollama, LM Studio) and press enter to look again.')] });
         else {
           rows.push({ line: [dim('Servers on this computer')] });
           local.forEach((l, i) => rows.push(listRow(`${PRESETS[l.probe.kind === 'openai' ? 'generic' : l.probe.kind === 'llamacpp' ? 'llamacpp' : l.probe.kind].label} :${l.port}`, [l.probe.build, l.probe.models.map((m) => m.id).join(', ')].filter(Boolean).join(' · '), i === pick, st, `pick:${i}`, 22)));
         }
-        return { legend: legend('this computer'), rows, foot: ['↑ ↓', ' choose · ', 'enter', local.length ? ' next · ' : ' look again · ', ...BACK, ...CANCEL] };
+        return { legend: legend('this computer'), rows, foot: ['↑ ↓', ' choose · ', 'enter', local.length ? ' next · ' : hasLlama() ? ' start / look again · ' : ' look again · ', ...BACK, ...CANCEL] };
       }
       if (screen === 'providers') {
         const list = filtered(HOSTED, (p) => PRESETS[p].label);
@@ -632,15 +694,15 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
       const offset = Math.max(0, pick - 8);
       return {
         legend: legend(`${provName} · model`),
-        rows: shown.length
+        rows: [...provWarnings.map((w): BoxRow => ({ line: [{ t: '! ', s: st.warn }, dim(w)] })), ...(provWarnings.length ? [blank] : [])].concat(shown.length
           ? shown.map((m, i) => listRow(m.label ?? prettyLabel(m.id), [m.id, m.context ? `${Math.round(m.context / 1000)}k context` : ''].filter(Boolean).join(' · '), offset + i === pick, st, `pick:${offset + i}`, 22))
-          : [{ line: [dim(filter ? `no model matches ${filter}` : 'no models listed')] }],
+          : [{ line: [dim(filter ? `no model matches ${filter}` : 'no models listed')] }]),
         foot: ['↑ ↓', ' choose · ', 'enter', ' use it · type to filter · ', ...BACK, ...CANCEL],
       };
     },
 
     placeholder() {
-      if (screen === 'where') return needMac ? 'MAC address to wake it, e.g. 00:11:22:33:44:55' : needWake ? `Enter wakes ${host}` : 'gpubox, a host name, or an IP address';
+      if (screen === 'where') return needMac ? 'MAC address to wake it, e.g. 00:11:22:33:44:55' : needWake ? `Enter wakes ${host}` : 'gpubox, a host name, an IP address, or a URL like http://host:8080';
       if (screen === 'steps') return editing ? 'Edit the command, enter saves' : 'Enter runs every step';
       if (screen === 'running') return 'You can type; it sends once the model is ready';
       if (screen === 'key') return `${PRESETS[preset]?.label ?? 'API'} key`;
@@ -675,6 +737,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         return h.close();
       }
       editing = null;
+      stopWhere();
       if (screen === 'where' || screen === 'model' || screen === 'steps') {
         keepDraft(screen);
         say(`Setup cancelled. ${woke ? `Rime woke ${host}; nothing else was` : 'Nothing was'} changed or saved. /setup picks up where you left off.`);
@@ -722,7 +785,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         return false;
       }
       if (screen === 'where') {
-        if (k.name === 'escape') return (screen = 'start', pick = 0, h.setBuffer(''), true);
+        if (k.name === 'escape') return (stopWhere(), (screen = 'start'), (pick = 0), h.setBuffer(''), true);
         return false; // typing and enter go to submit()
       }
       if (screen === 'model') {
@@ -796,10 +859,11 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
         return true;
       }
       if (screen === 'local') {
-        if (k.name === 'escape') return (screen = 'start', pick = 1, true);
+        if (k.name === 'escape') return (stopWhere(), (starting = ''), h.setBuffer(''), (screen = 'start'), (pick = 1), true);
+        if (starting || looking) return true;
         if (nav(local.length)) return true;
         if (k.name === 'enter') {
-          if (!local.length) return (lookLocal(), true);
+          if (!local.length) return (buf.trim() ? void startLocal(buf.trim()) : void lookLocal()), true;
           const l = local[pick];
           const kind = l.probe.kind === 'openai' ? 'generic' : l.probe.kind;
           provName = kind === 'llamacpp' ? 'local' : kind;
@@ -811,7 +875,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
           pick = 0;
           return true;
         }
-        return true;
+        return !!local.length || !hasLlama(); // with nothing found, typing edits the start command
       }
       if (screen === 'providers') {
         const list = filtered(HOSTED, (p) => PRESETS[p].label);
@@ -863,7 +927,9 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
           needMac = needWake = false;
           checking = true;
           woke = true;
-          wakeUp(wakePort).then(() => survey(true), (e) => {
+          const signal = whereAc.signal;
+          wakeUp(wakePort).then(() => void (signal.aborted || survey(true)), (e) => {
+            if (signal.aborted) return;
             add('fail', plain((e as Error).message));
             checking = false;
           });
@@ -876,6 +942,16 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
           return;
         }
         if (!v || checking) return;
+        // A URL (or host:port) is a server Rime talks to directly, with no ssh:
+        // the /connect flow (probe, key if it asks for one, pick a model).
+        if (/^https?:\/\//i.test(v) || /^[\w.-]+:\d+(\/.*)?$/.test(v)) {
+          connectUrl = v;
+          screen = 'models';
+          provModels = [];
+          h.setBuffer('');
+          connectProbe();
+          return;
+        }
         host = v;
         survey();
         return;
@@ -924,7 +1000,7 @@ export function createStopped(h: Host, r: { name: string; host: string; model?: 
   const done0 = r.startup ? `Stopped bringing ${r.name} up.` : 'Setup cancelled.';
   const dim = (t: string) => ({ t, s: st.dim });
   const plain = (t: string) => ({ t, s: st.fg });
-  const started = r.state.steps.some((v) => v.id === 'start' && v.status === 'done' && v.result !== 'running');
+  const started = !!r.state.startSent || r.state.steps.some((v) => v.id === 'start' && v.status === 'done' && v.result !== 'running');
   const cut = r.state.steps.find((v) => v.status === 'stopped');
   const opts: ['leave' | 'stop' | 'off' | 'continue', string, string][] = [
     ['leave', 'Leave it as it is', started ? 'llama-server keeps running' : `${r.host} stays as it is`],

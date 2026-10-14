@@ -35,7 +35,7 @@ export const str = (l: Line, st: Styles) => serialize(l, st.reset);
 
 export type Item =
   | { kind: 'header'; lines: () => string[] }
-  | { kind: 'user'; text: string; chips?: Record<string, string> } // chip char -> its label
+  | { kind: 'user'; text: string; chips?: Record<string, string>; pinned?: boolean } // chip char -> its label; pinned to the timeline
   | { kind: 'reply'; text: string; done: boolean }
   // The model's thinking: live, its last lines under a timer; done, one line
   // ("Thought for 6s") that ctrl+o opens.
@@ -199,11 +199,13 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
       // Chips keep their look in the transcript (and their preview on hover).
       const body = (p: string): Line => [...p].map((ch) => (item.chips?.[ch] ? run(`[${item.chips[ch]}]`, st.chip) : run(ch, st.title)));
       const lines = item.text.split('\n').flatMap((p, i) =>
-        wrap(i === 0 ? [run('› ', st.accentB), ...body(p)] : body(p), w));
+        wrap(i === 0 ? [run('› ', st.accentB), ...body(p)] : body(p), w - 2));
+      // Its ◆: a click pins the message to the conversation's timeline.
+      lines[lines.length - 1] = [...lines[lines.length - 1], run(' ◆', item.pinned ? st.warn : st.line)];
       return all(lines);
     }
     case 'reply':
-      return all(indent(markdown(splitToolCalls(item.text).text, st, width - 2), 2));
+      return all(indent(markdown(splitToolCalls(item.text).text.trimEnd(), st, width - 2), 2));
     case 'think': {
       const live = item.ms === undefined && !!item.start;
       const secs = (ms: number) => `${Math.max(1, Math.round(ms / 1000))}s`;
@@ -217,21 +219,22 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
       const head: Line = [run('✻ ', st.dim), run(item.ms ? `Thought for ${secs(item.ms)}` : 'Thought', st.dim), run(' · ', st.dim), run(item.open ? 'ctrl+o to hide' : 'ctrl+o to show', st.accent)];
       return all([head, ...(item.open ? gutter(body) : [])]);
     }
-    case 'tool': // the screen cuts it to width
-      return all([[run('● ', st.accent), run(item.verb, st.titleB), ...(item.rest ? [run(' ' + item.rest, st.dim)] : []), ...(item.extra || [])]]);
+    case 'tool': // wraps at the edge, under its text
+      return all(hang([run('● ', st.accent), run(item.verb, st.titleB), ...(item.rest ? [run(' ' + item.rest, st.dim)] : []), ...(item.extra || [])], width, 2));
     case 'cost': {
       const c = item.turn;
       const head = `  ↳ ${fmtT(c.in)} in · ${fmtT(c.cached)} cached · ${fmtT(c.out)} out · `;
       if (c.local) {
         // Local: no dollars; prompt time and what the cache saved instead.
         const prompt = c.promptMs !== undefined ? `${fmtS(c.promptMs)} prompt` : '';
-        return all([[run(head + 'local' + (prompt ? ` · ${prompt}` : ''), st.dim), ...(c.savedMs && c.savedMs >= 500 ? [run(' (cache saved ', st.dim), run(`~${fmtS(c.savedMs)}`, st.ok), run(')', st.dim)] : [])]]);
+        return all(hang([run(head + 'local' + (prompt ? ` · ${prompt}` : ''), st.dim), ...(c.savedMs && c.savedMs >= 500 ? [run(' (cache saved ', st.dim), run(`~${fmtS(c.savedMs)}`, st.ok), run(')', st.dim)] : [])], width, 4));
       }
-      if (c.spent === undefined) return all([[run(head + 'price unknown', st.dim)]]);
-      return all([[run(head + `${fmt$(c.spent)} · `, st.dim), run(`saved ${fmt$(c.saved)}`, st.ok)]]);
+      if (c.spent === undefined) return all(hang([run(head + 'price unknown', st.dim)], width, 4));
+      return all(hang([run(head + `${fmt$(c.spent)} · `, st.dim), run(`saved ${fmt$(c.saved)}`, st.ok)], width, 4));
     }
     case 'lines':
-      return item.lines.map((l) => str(l, st));
+      // Wrapped, not cut off at the edge (tool rows, the live "writing…" row).
+      return item.lines.flatMap((l) => (lineWidth(l) > width ? hang(l, width, Math.min(4, lineWidth(l.slice(0, 1)))) : [l])).map((l) => str(l, st));
     case 'gear': {
       // ⚙ effort high (was medium) · from the next message · undo
       const c = item.change;
@@ -249,7 +252,55 @@ export function renderItem(item: Item, width: number, st: Styles): string[] {
 
 // ---- Boxes ----
 
-export type BoxRow = { line: Line; bg?: string; rule?: 'inner' | 'full'; hit?: string; segs?: Hit[] };
+export type BoxRow = { line: Line; bg?: string; rule?: 'inner' | 'full'; hit?: string; segs?: Hit[]; hints?: Hint[]; hang?: number }; // hang: wrap, not cut, indenting by this
+
+// Wraps a line, its continuation lines indented by `n` (under the text after
+// a "● " or "  ↳ " lead).
+export function hang(l: Line, width: number, n: number): Line[] {
+  if (lineWidth(l) <= width) return [l];
+  return wrap(l, width, Math.max(1, width - n)).map((x, i) => (i ? [run(' '.repeat(n)), ...x] : x));
+}
+
+// Key hints that wrap instead of being cut off: [key, label, label style] pairs.
+// ' · ' in a label ends a group (`ctrl+r rename`); a label without it joins the
+// next pair to its group (`→ or enter open`). Groups never split: one that doesn't
+// fit moves to the next line. Every key is a hit (`key:<key>`, one per key of
+// `↑ ↓` or `1 2 3`), 1-based columns relative to the line.
+export type Hint = [key: string, label: string, style?: string];
+export function hintLines(hints: Hint[], width: number, st: Styles): { lines: Line[]; segs: Hit[][] } {
+  type G = { line: Line; keys: { x: number; k: string }[] };
+  const groups: G[] = [];
+  let g: G | null = null;
+  const open = () => (g ??= { line: [], keys: [] });
+  for (const [k, label, s] of hints) {
+    if (k) {
+      const c = open();
+      c.keys.push({ x: lineWidth(c.line), k });
+      c.line.push(run(k, st.accentB));
+    }
+    label.split(' · ').forEach((piece, i) => {
+      if (i && g) groups.push(g), (g = null);
+      if (piece.trim()) open().line.push(run(piece, s ?? st.dim));
+    });
+  }
+  if (g) groups.push(g);
+  const lines: Line[] = [[]], segs: Hit[][] = [[]];
+  for (const gr of groups) {
+    let l = lines.at(-1)!;
+    if (l.length && lineWidth(l) + 3 + lineWidth(gr.line) > width) lines.push((l = [])), segs.push([]);
+    if (l.length) l.push(run(' · ', st.dim));
+    const x = lineWidth(l);
+    for (const { x: kx, k } of gr.keys) {
+      let p = x + kx + 1;
+      for (const t of k.split(' ')) {
+        if (t) segs.at(-1)!.push({ x0: p, x1: p + strWidth(t) - 1, id: `key:${t}` });
+        p += strWidth(t) + 1;
+      }
+    }
+    l.push(...gr.line);
+  }
+  return { lines, segs };
+}
 
 // A rounded frame with a legend in the top border, like the prototype's
 // .cmds / .usage boxes. Rows get one cell of padding on each side. `hits` holds
@@ -265,6 +316,13 @@ export function box(legend: string | Line, rows: BoxRow[], width: number, st: St
   const top = [run('╭─ ', color), ...lg, run(' ' + '─'.repeat(Math.max(0, inner - lineWidth(lg) - 3 - lineWidth(x))), color), ...x, run('╮', color)];
   const lines: string[] = [str(fit(top, width, false), st)];
   const hits: Hit[][] = [closeId ? [{ x0: width - 4, x1: width - 2, id: closeId }] : []];
+  // Hint rows become as many lines as the keys need.
+  rows = rows.flatMap((r) => {
+    if (r.hang !== undefined && lineWidth(r.line) > inner - 2) return hang(r.line, inner - 2, r.hang).map((line, i) => ({ ...r, line, hang: undefined, segs: i ? undefined : r.segs }));
+    if (!r.hints) return [r];
+    const h = hintLines(r.hints, inner - 2, st);
+    return h.lines.map((line, i) => ({ line, segs: h.segs[i] }));
+  });
   for (const r of rows) {
     if (r.rule === 'full') lines.push(str([run('├', color), run('─'.repeat(inner), st.line), run('┤', color)], st));
     else if (r.rule === 'inner') lines.push(str([run('│ ', color), run('─'.repeat(inner - 2), st.line), run(' │', color)], st));
@@ -284,7 +342,7 @@ export function box(legend: string | Line, rows: BoxRow[], width: number, st: St
 // marker, then a 2ch gap.
 export function listRow(name: string, help: string | Line, selected: boolean, st: Styles, hit?: string, nameWidth = 13): BoxRow {
   const n = fit([run(selected ? '› ' : '  ', selected ? st.accent : st.title), run(name, selected ? st.accent : st.title)], nameWidth, false);
-  return { line: [...n, run('  '), ...(typeof help === 'string' ? [run(help, st.dim)] : help)], bg: selected ? st.panelBg : undefined, hit };
+  return { line: [...n, run('  '), ...(typeof help === 'string' ? [run(help, st.dim)] : help)], bg: selected ? st.panelBg : undefined, hit, hang: nameWidth + 2 };
 }
 
 // A setting: dim label (26ch), then ‹ value › with the value centred in 17ch.
@@ -301,21 +359,17 @@ export function settingRow(label: string, value: string, selected: boolean, st: 
 // The box foot: a rule, then dim text where `keys` (bold accent) and plain parts
 // alternate, e.g. ['↑ ↓', ' choose · ', 'enter', ' next']. Every key is also
 // clickable (SPEC §5.1): its hit id is `key:<key>`.
+// The box wraps it onto more lines when it's narrow (hintLines).
 export function footRows(text: string | string[], st: Styles): BoxRow[] {
-  const parts = typeof text === 'string' ? [text] : text;
-  const segs: Hit[] = [];
-  let x = 1;
-  parts.forEach((t, i) => {
-    const w = strWidth(t);
-    if (parts.length > 1 && i % 2 === 0 && t) segs.push({ x0: x, x1: x + w - 1, id: `key:${t}` });
-    x += w;
-  });
-  return [{ line: [], rule: 'full' }, { line: parts.map((t, i) => run(t, parts.length > 1 && i % 2 === 0 ? st.accentB : st.dim)), segs }];
+  const parts = typeof text === 'string' ? ['', text] : text;
+  const hints: Hint[] = [];
+  for (let i = 0; i < parts.length; i += 2) hints.push([parts[i], parts[i + 1] ?? '']);
+  return [{ line: [], rule: 'full' }, { line: [], hints }];
 }
 
 // ---- Prompt ----
 
-const PLACEHOLDER_TEXT = 'ask Rime to change some code, or / for commands';
+const PLACEHOLDER_TEXT = 'ask Rime to change some code, @ a file, paste a screenshot, or / for commands';
 
 // How wide a character is in the prompt: chips (private-use characters) show as
 // their [label].

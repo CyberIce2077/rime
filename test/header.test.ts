@@ -100,3 +100,12 @@ test('every split cell is ▄ with an underline, so it fills the cell', () => {
   assert.ok(!scene.includes('▀'), 'no ▀ in a settled scene');
   assert.equal(scene.split('▄').length - 1, scene.split('\x1b[4m▄').length - 1);
 });
+
+test('every snowfall lasts 3 to 10 s at 120 ms a frame (SPEC §4.1)', () => {
+  for (let seed = 1; seed <= 300; seed++) {
+    const snow = createSnow(seed);
+    let ticks = 1;
+    while (!snow.step()) ticks++;
+    assert.ok(ticks * 120 >= 3000 && ticks * 120 <= 10000, `seed ${seed}: ${ticks * 120} ms`);
+  }
+});

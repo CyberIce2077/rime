@@ -118,3 +118,14 @@ test('"don\'t ask again" names the command, not a flag value or a URL', () => {
   assert.equal(commandName('NODE_ENV=test node --test'), 'node');
   assert.equal(decide('bash', { command: 'curl -m 10 https://x.dev' }, { mode: 'ask', project: '/p', rules: [] }).rule, 'bash(curl *)');
 });
+
+test('A-5: bash output is capped per line and in total', async () => {
+  const d = dir();
+  const one = await bash(d, { command: `node -e "process.stdout.write('x'.repeat(1000000))"` });
+  assert.ok(one.content.length < 32000, `one huge line: ${one.content.length}`);
+  assert.match(one.content, /chars cut/);
+  const many = await bash(d, { command: `node -e "for (let i = 0; i < 400; i++) console.log(String(i).padEnd(1500, 'y'))"` });
+  assert.ok(many.content.length <= 32000, `many long lines: ${many.content.length}`);
+  assert.match(many.content, /^exit 0\n0y/);
+  assert.match(many.content, /399y+$/);
+});

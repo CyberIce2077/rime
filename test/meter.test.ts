@@ -33,3 +33,9 @@ test('an unknown price shows tokens only', () => {
   assert.equal(m.charge({ input: 10, cached: 0, written: 0, output: 5 }, undefined).spent, undefined);
   assert.equal(m.unpriced(), true);
 });
+
+test('A-9: requests of one turn add up to one line', async () => {
+  const { addTurns } = await import('../src/plugins/token-kit/meter.ts');
+  const t = addTurns({ in: 100, cached: 50, out: 10, saved: 0.1, spent: 1, local: false }, { in: 200, cached: 150, out: 5, saved: 0.2, spent: undefined, local: false });
+  assert.deepEqual([t.in, t.cached, t.out, t.spent], [300, 200, 15, undefined]);
+});

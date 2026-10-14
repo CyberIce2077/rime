@@ -72,6 +72,8 @@ const TEXT = {
 // background flakes fall behind him at half speed. Each run gets a fresh random
 // seed, so both the fall and the settled piles differ every time. Pass a seed to
 // replay a run exactly.
+const MIN_TICKS = 26; // 3.1 s at the default 120 ms a frame
+
 export function createSnow(seed = randomSeed()) {
   const { COLS, ROWS, TOP } = SCENE;
   const rnd = seededRandom(seed);
@@ -89,7 +91,9 @@ export function createSnow(seed = randomSeed()) {
     return o;
   };
 
-  // Advances one tick. Returns true once every flake has settled.
+  // Advances one tick. Returns true once every flake has settled, and never
+  // before MIN_TICKS: with little snow, faint flakes keep falling behind him so
+  // a run lasts the spec's 3 s at the least.
   function step() {
     tick++;
     const nn: Flake[] = [];
@@ -116,8 +120,8 @@ export function createSnow(seed = randomSeed()) {
       if (p.cap) cres[p.c]++; else res[p.c]++;
       near.push({ c: p.c, r: 0, b: rnd() < 0.3, cap: p.cap });
     }
-    if (o.length && rnd() < 0.05 + 0.35 * share) far.push({ c: Math.floor(rnd() * COLS), r: 0 });
-    return !o.length && !near.length && !far.length;
+    if ((o.length || tick < MIN_TICKS - ROWS * 2) && rnd() < 0.05 + 0.35 * Math.max(share, 0.3)) far.push({ c: Math.floor(rnd() * COLS), r: 0 });
+    return tick >= MIN_TICKS && !o.length && !near.length && !far.length;
   }
 
   return { step, state: (): SnowState => ({ near, far, heights: h, cap }) };

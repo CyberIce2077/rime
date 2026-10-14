@@ -33,7 +33,10 @@ export const LONG_PASTE = { lines: 20, chars: 2000 };
 
 // ---- chips in the buffer ----
 
-export const isChip = (ch: string | undefined) => !!ch && ch.length === 1 && ch >= '' && ch <= '';
+export const isChip = (ch: string | undefined) => !!ch && ch.length === 1 && ch >= '\uE000' && ch <= '\uF8FF';
+// Pasted text as typed: tabs become two spaces; control characters and Rime's own
+// chip characters go. Escapes, not literal characters, so copies of the source keep them.
+export const cleanPaste = (t: string) => t.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f\uE000-\uF8FF]/g, '');
 export function chipChar(i: number) {
   return String.fromCharCode(0xe000 + (i % 6400));
 }
@@ -66,7 +69,7 @@ export function label(c: Chip, blind = false): string {
   }
   if (c.kind === 'text') return `text ${c.n} · ${c.lines} lines · ${tok}`;
   if (c.kind === 'file') return `file · ${c.name} · ${c.lines} lines · ${tok}`;
-  if (c.kind === 'folder') return `folder · ${c.name} · ${c.files} files · ${tok}`;
+  if (c.kind === 'folder') return `folder · ${c.name} · ${c.files} file${c.files === 1 ? '' : 's'} · ${tok}`;
   return `${c.type} · ${c.name} · ${fmtSize(c.size ?? 0)}`;
 }
 
@@ -130,7 +133,9 @@ export function pastedPaths(text: string, cwd = process.cwd()): string[] | null 
     }
     return p.replace(/^~(?=[/\\]|$)/, os.homedir());
   });
-  const ok = paths.length > 0 && paths.every((p) => (path.isAbsolute(p) || /^\.{1,2}[/\\]/.test(p)) && fs.existsSync(path.resolve(cwd, p)));
+  // Relative paths count when they have a folder in them (`Downloads/my\ file.png`),
+  // so a pasted word that happens to name a file stays text.
+  const ok = paths.length > 0 && paths.every((p) => (path.isAbsolute(p) || /[/\\]/.test(p)) && fs.existsSync(path.resolve(cwd, p)));
   return ok ? paths.map((p) => path.resolve(cwd, p)) : null;
 }
 
@@ -370,7 +375,7 @@ export function parts(buf: string, chips: Map<string, Chip>) {
     const what =
       c.kind === 'image' ? `image ${c.n} · ${c.name} → ${fitTo(c.w!, c.h!, 1568).join('×')} ${c.mime === 'image/jpeg' ? 'JPEG' : 'PNG'}`
       : c.kind === 'video' ? (c.error ? `video ${c.n} · nothing (${c.error})` : `video ${c.n} · ${c.frames?.length ?? 0} frames at ${c.fw}×${c.fh} JPEG, no sound`)
-      : c.kind === 'folder' ? `folder ${c.path} · tree of ${c.files} files (the AI can read inside it)`
+      : c.kind === 'folder' ? `folder ${c.path} · tree of ${c.files} file${c.files === 1 ? '' : 's'} (the AI can read inside it)`
       : c.kind === 'file' ? `file ${c.path} · first ${Math.min(c.lines!, FILE_LINES)} lines with line numbers`
       : c.kind === 'text' ? `text ${c.n} · ${c.lines} lines, in full`
       : `path ${c.path} · type and size only`;
@@ -403,7 +408,7 @@ export async function blocksFor(buf: string, chips: Map<string, Chip>, cwd: stri
       }
     } else if (c.kind === 'text') head(`\n${c.text}`);
     else if (c.kind === 'file') head(`${c.path} (${c.lines} lines)\n${c.text}`);
-    else if (c.kind === 'folder') head(`${c.path} (${c.files} files; read files inside it if you need them)\n${c.tree!.join('\n')}`);
+    else if (c.kind === 'folder') head(`${c.path} (${c.files} file${c.files === 1 ? '' : 's'}; read files inside it if you need them)\n${c.tree!.join('\n')}`);
     else head(`${c.path} · ${c.type} · ${fmtSize(c.size ?? 0)}`);
   }
   return out;

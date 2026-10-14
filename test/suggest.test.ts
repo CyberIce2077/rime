@@ -87,3 +87,10 @@ test("the ask tool's options are read however the model wrote them", () => {
   assert.deepEqual(optionsOf('- A\n- B'), [{ label: 'A' }, { label: 'B' }]);
   assert.deepEqual(optionsOf([{ title: 'A', description: 'd' }]), [{ label: 'A', detail: 'd' }]);
 });
+
+test('S-1: a failing test names its file', () => {
+  const ran = (out: string[]) => ({ wrote: [], ran: [{ cmd: 'npm test', ok: false, out }] });
+  assert.equal(nextStep('Done.', ran(['> node --test', '✖ test/signup.test.ts (12ms)', "  TypeError: Cannot read properties of undefined"]), '/nowhere'), 'fix the failing test in signup.test.ts');
+  assert.equal(nextStep('Done.', ran([' FAIL  src/auth.spec.ts', '  ● login › rejects']), '/nowhere'), 'fix the failing test in auth.spec.ts');
+  assert.equal(nextStep('Done.', ran(['1 failed']), '/nowhere'), 'fix the failing tests');
+});

@@ -20,7 +20,8 @@ export type Conn = {
   local?: boolean;
   cache?: CacheMode;
   llamacpp?: boolean;
-  effortField?: string; // where effort goes on OpenAI-style hosts, e.g. "reasoning.effort"
+  effortField?: 'reasoning_effort' | 'reasoning.effort' | 'think' | 'chat_template_kwargs'; // where effort goes on OpenAI-style hosts
+  tools?: 'native' | 'text' | 'none'; // how the server's template handles tool calls (probed)
 };
 
 export type Model = {
@@ -48,6 +49,7 @@ export type Event =
   | { type: 'model'; id: string }
   | { type: 'usage'; usage: Usage }
   | { type: 'stop'; reason: string }
+  | { type: 'tool'; name: string; args: string } // a tool call being written: its arguments so far
   | { type: 'blocks'; blocks: Block[] }; // the finished assistant turn, to store as-is
 
 export type Request = {

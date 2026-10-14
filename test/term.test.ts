@@ -43,3 +43,10 @@ test('sliceCols cuts plain text by screen column', () => {
   assert.equal(sliceCols('日本語', 3, 4), '本');
   assert.equal(sliceCols('abc', 2, 99), 'bc');
 });
+
+test('wrap with a hanging indent: later lines get their own width', async () => {
+  const { wrap } = await import('../src/core/term.ts');
+  const lines = wrap([{ t: '/setup  connect your server, this computer, or a provider', s: '' }], 30, 20).map((l) => l.map((r) => r.t).join(''));
+  assert.equal(lines[0], '/setup  connect your server,');
+  assert.ok(lines.slice(1).every((l) => l.length <= 20), JSON.stringify(lines));
+});

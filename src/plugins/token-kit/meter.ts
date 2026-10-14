@@ -15,6 +15,14 @@ export type Turn = {
   savedMs?: number; // local: time the cache saved
 };
 
+// Two requests of one turn as one ↳ line.
+const opt = (a?: number, b?: number) => (a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0));
+export const addTurns = (a: Turn, b: Turn): Turn => ({
+  in: a.in + b.in, cached: a.cached + b.cached, out: a.out + b.out, saved: a.saved + b.saved, local: b.local,
+  spent: a.spent === undefined || b.spent === undefined ? undefined : a.spent + b.spent,
+  promptMs: opt(a.promptMs, b.promptMs), savedMs: opt(a.savedMs, b.savedMs),
+});
+
 const usd = (tokens: number, perM: number) => (tokens * perM) / 1e6;
 
 export const fmtT = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
@@ -27,7 +35,7 @@ export const fmtS = (ms: number) => (ms < 10000 ? `${(ms / 1000).toFixed(1)}s` :
 export function createMeter() {
   const t = { uncached: 0, read: 0, write: 0, out: 0 };
   const cost = { uncached: 0, read: 0, write: 0, out: 0 };
-  const saved = { cache: 0, ms: 0 };
+  const saved = { cache: 0, ms: 0, handled: 0 }; // handled: turns Rime answered itself
   let unpriced = false;
 
   return {
@@ -58,7 +66,11 @@ export function createMeter() {
     },
     totalTokens: () => t.uncached + t.read + t.write + t.out,
     spent: () => cost.uncached + cost.read + cost.write + cost.out,
-    savedTotal: () => saved.cache,
+    // A request Rime handled with no API call (SPEC §15): what that turn would have cost.
+    credit(d: number) {
+      saved.handled += d;
+    },
+    savedTotal: () => saved.cache + saved.handled,
     pct() {
       const sp = this.spent(), sv = this.savedTotal();
       return Math.round((sv / (sp + sv)) * 100) || 0;

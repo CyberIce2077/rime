@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import pkg from '../package.json' with { type: 'json' };
 import { runApp } from './core/app.ts';
 import { loadConfig, saveConfig } from './core/config.ts';
@@ -19,17 +20,22 @@ function load() {
   }
 }
 
-// `rime connect <url> [--key KEY] [--name NAME]`: /connect for scripts.
+// `rime connect <url> [--key-env VAR | --key -] [--name NAME]`: /connect for
+// scripts. The key comes from an environment variable (saved as its name, never
+// its value) or from stdin, so it stays out of shell history.
 async function connect(url: string) {
-  const key = opt('--key');
+  const keyEnv = opt('--key-env');
+  const raw = opt('--key');
+  const key = keyEnv ? process.env[keyEnv] : raw === '-' ? fs.readFileSync(0, 'utf8').trim() : raw;
+  if (keyEnv && !key) return console.error(`rime: ${keyEnv} is not set`), process.exit(1);
   const p = await probe(url, key);
   if (!p) return console.error(`rime: nothing answered at ${url}`), process.exit(1);
-  if (p.needKey) return console.error(`rime: ${url} needs an API key (--key)`), process.exit(1);
+  if (p.needKey) return console.error(`rime: ${url} needs an API key (--key-env VAR, or --key - to read it from stdin)`), process.exit(1);
   const cfg = load();
   const host = new URL(p.base).hostname;
   const name = opt('--name') ?? (host === 'localhost' || host === '127.0.0.1' ? 'local' : /^[\d.]+$/.test(host) ? 'server' : host.split('.')[0]);
   const preset = p.kind === 'openai' ? 'generic' : p.kind;
-  cfg.providers[name] = { preset, url: p.base, ...(key ? { key } : {}) };
+  cfg.providers[name] = { preset, url: p.base, ...(keyEnv ? { keyEnv } : key ? { key } : {}) };
   const models = (p.server ?? p.models).map((m) => m.id);
   if (!cfg.model && models[0]) cfg.model = `${name}/${models[0]}`;
   saveConfig(cfg);
@@ -45,12 +51,13 @@ if (args.includes('-v') || args.includes('--version')) {
 
 usage: rime                    start a session in this directory
        rime connect <url>      add an OpenAI-compatible or llama.cpp server
-            [--key KEY] [--name NAME]
+            [--key-env VAR | --key -] [--name NAME]
+                               (--key - reads the key from stdin)
        rime -v                 print the version
 
 Inside Rime, /setup connects your own server, this computer, or a provider.`);
 } else if (args[0] === 'connect') {
-  if (!args[1]) console.error('usage: rime connect <url> [--key KEY] [--name NAME]'), process.exit(1);
+  if (!args[1]) console.error('usage: rime connect <url> [--key-env VAR | --key -] [--name NAME]'), process.exit(1);
   await connect(args[1]);
 } else {
   const cfg = load();

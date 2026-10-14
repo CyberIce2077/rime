@@ -55,11 +55,14 @@ export function fit(l: Line, width: number, ellipsis = true): Line {
 }
 
 // Greedy word wrap of one styled paragraph (no newlines inside). Words longer
-// than the width are broken by character.
-export function wrap(runs: Line, width: number): Line[] {
+// than the width are broken by character. `next`: the width of the lines after
+// the first (a hanging indent).
+export function wrap(runs: Line, width: number, next = width): Line[] {
   width = Math.max(1, width);
+  next = Math.max(1, next);
   const lines: Line[] = [[]];
   let w = 0;
+  const lim = () => (lines.length === 1 ? width : next);
   const push = (t: string, s: string) => {
     const cur = lines.at(-1)!;
     const last = cur.at(-1);
@@ -71,20 +74,20 @@ export function wrap(runs: Line, width: number): Line[] {
       if (!tok) continue;
       const tw = strWidth(tok);
       if (/^\s+$/.test(tok)) {
-        if (w + tw <= width) { push(tok, r.s); w += tw; }
+        if (w + tw <= lim()) { push(tok, r.s); w += tw; }
         else { lines.push([]); w = 0; } // a break swallows the spaces
         continue;
       }
-      if (w + tw > width && w > 0 && tw <= width) {
+      if (w + tw > lim() && w > 0 && tw <= next) {
         const last = lines.at(-1)!.at(-1);
         if (last) last.t = last.t.replace(/\s+$/, ''); // no trailing spaces on the line we leave
         lines.push([]);
         w = 0;
       }
-      if (tw <= width - w) { push(tok, r.s); w += tw; continue; }
+      if (tw <= lim() - w) { push(tok, r.s); w += tw; continue; }
       for (const ch of tok) {
         const cw = cpWidth(ch.codePointAt(0)!);
-        if (w + cw > width) { lines.push([]); w = 0; }
+        if (w + cw > lim()) { lines.push([]); w = 0; }
         push(ch, r.s);
         w += cw;
       }

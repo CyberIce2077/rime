@@ -44,7 +44,10 @@ test('another Rime window writing the config is picked up', { timeout: 5000 }, a
   const other = loadConfig(file);
   other.effort = 'max';
   saveConfig(other, file);
-  await got;
+  // The watcher is unref'd (it never keeps Rime open), so on Linux nothing else
+  // would hold the event loop while this waits.
+  const keep = setInterval(() => {}, 1000);
+  await got.finally(() => clearInterval(keep));
   stop();
   assert.equal(cfg.effort, 'max');
   assert.equal(cfg.reasoning, false);
@@ -57,4 +60,11 @@ test('short, exact requests run with no API call', () => {
   assert.deepEqual(phrase('turn on reasoning'), { key: 'reasoning', value: 'on' });
   assert.equal(phrase('what effort should I use for this?'), null);
   assert.equal(phrase('effort high and fix the bug'), null);
+});
+
+test('S-2: "use <model>" and "load <model>" are handled in Rime', () => {
+  assert.deepEqual(phrase('use gpubox'), { key: 'use', value: 'gpubox' });
+  assert.deepEqual(phrase('load qwen3.8-27b'), { key: 'use', value: 'qwen3.8-27b' });
+  assert.deepEqual(phrase('switch to anthropic/claude-opus-5-5'), { key: 'use', value: 'anthropic/claude-opus-5-5' });
+  assert.equal(phrase('use tabs instead of spaces'), null);
 });

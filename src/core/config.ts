@@ -19,11 +19,12 @@ export type ProviderConfig = {
   tunnel?: { remote: string };
   wake?: { mac: string; broadcast?: string };
   model?: string; // the model to load on it
+  router?: boolean; // llama-server in router mode (several models, POST /models/load)
   steps?: Partial<Record<Step, string>>; // only steps the user edited
   skip?: Step[];
   onQuit?: 'keep' | 'stop' | 'poweroff';
   saveCache?: boolean;
-  probe?: { build?: string; slots?: number; ctx?: number; effortSafe?: boolean; reasoningSafe?: boolean };
+  probe?: { build?: string; slots?: number; ctx?: number; effortSafe?: boolean; reasoningSafe?: boolean; tools?: 'native' | 'text' | 'none' };
 };
 
 export type ModelConfig = {
@@ -53,9 +54,12 @@ export function loadConfig(file = CONFIG_PATH): Config {
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`Could not read ${file}: ${(e as Error).message}`);
   }
-  const cfg: Config = { providers: raw.providers ?? {}, models: raw.models ?? {}, model: raw.model, effort: raw.effort, reasoning: raw.reasoning, ...(raw.permissions ? { permissions: raw.permissions } : {}) };
+  // Keys Rime doesn't know yet (a hand-written block, a newer Rime's) are kept
+  // and written back unchanged.
+  const cfg: Config = { ...raw, providers: raw.providers ?? {}, models: raw.models ?? {}, model: raw.model, effort: raw.effort, reasoning: raw.reasoning, ...(raw.permissions ? { permissions: raw.permissions } : {}) };
   // Old files: a top-level apiKey was Anthropic's.
   if (raw.apiKey && !cfg.providers.anthropic) cfg.providers.anthropic = { preset: 'anthropic', key: raw.apiKey };
+  delete (cfg as { apiKey?: string }).apiKey;
   return cfg;
 }
 
