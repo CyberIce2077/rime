@@ -45,6 +45,7 @@ export type Config = {
   permissions?: { allow?: string[]; ask?: string[]; deny?: string[] }; // your rules (SPEC §17)
   trustedRules?: Record<string, string>; // project folder -> hash of the .rime/permissions.json you accepted
   passEnv?: string[]; // secret-looking variables you let commands see
+  updates?: 'on' | 'off'; // check npm for a new version at startup
 };
 
 export const CONFIG_PATH = path.join(os.homedir(), '.rime', 'config');

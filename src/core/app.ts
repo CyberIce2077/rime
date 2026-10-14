@@ -32,6 +32,7 @@ import { PRESETS } from '../providers/presets.ts';
 import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
+import { compare as compareVersions, install as installVersion, latest as latestVersion, newest as newestVersion } from '../plugins/updater/update.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
 import { recheck } from '../providers/probe.ts';
 import { ApiError, type Block, type Conn, type Controls, type Effort, type Message, type Model, type Usage } from '../providers/types.ts';
@@ -54,6 +55,7 @@ const CMDS: [string, string][] = [
   ['/diff', 'what the last change did, file by file'],
   ['/undo', 'put the files back as they were before the last change'],
   ['/usage', 'token, cost and savings breakdown'],
+  ['/update', 'install the newest Rime and restart into it'],
   ['/exit', 'quit Rime'],
 ];
 
@@ -122,7 +124,7 @@ const MODES_OFF = '\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b]112\x0
 // What the compact loader says in header line 2 while a server comes up.
 const PHASE: Record<string, string> = { wake: 'waking', connect: 'connecting', tunnel: 'opening the tunnel', start: 'starting', load: 'loading', warm: 'warming the cache', test: 'testing' };
 
-export async function runApp(cfg: Config, version: string) {
+export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli', updates = false) {
   const out = process.stdout, inp = process.stdin;
   const st = styles(colorMode(out));
   const write = (s: string) => out.write(s);
@@ -724,6 +726,8 @@ export async function runApp(cfg: Config, version: string) {
       const parts: { line: Line; id?: string }[] = [];
       if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
       if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
+      if (upd.state === 'installing') parts.push({ line: [dim(`⟳ installing ${upd.version}…`)] });
+      else if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
       if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
       const asking = sessions.filter((x) => x !== S && needsYou(x)).length;
       const working = sessions.filter((x) => x !== S && (x.busy || x.waiting) && !needsYou(x)).length;
@@ -1216,6 +1220,7 @@ export async function runApp(cfg: Config, version: string) {
       C.nextStep = nextFor(said, did, project);
       offerChoices(said, C);
       if (C === S) askTrust(); // the rules file changed during the reply
+      if (upd.state === 'ready' && upd.folded && C === S) offerRestart();
       example = exampleFor(project);
       // What you sent meanwhile: stopped, it goes back to the prompt; else it's next.
       if (C.queued.length && ac.signal.aborted) unqueue(C);
@@ -1342,6 +1347,99 @@ export async function runApp(cfg: Config, version: string) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(hit, content);
     return { content, summary: `summary · ${lines} lines` };
+  }
+
+  // ---- updater (Phase 9, SPEC §4.3, §10) ----
+  // checking → offline / current (a line that goes after a few seconds), or
+  // available (offered above the prompt; "not now" folds it into the status line)
+  // → installing (in the background, while you work) → ready (offered at a quiet
+  // moment: restart now, or the next start picks it up through the launcher).
+  const upd: { state: 'off' | 'checking' | 'offline' | 'current' | 'available' | 'installing' | 'ready' | 'failed'; version?: string; changes?: string[]; folded?: boolean } = { state: 'off' };
+  const launchVersion = (v: string) => {
+    const n = newestVersion(pkgName, version);
+    return n && n.version === v ? launchEntry(n.entry) : 0;
+  };
+  const launchEntry = (entry: string) => spawnSync(process.execPath, [entry, ...process.argv.slice(2)], { stdio: 'inherit', env: { ...process.env, RIME_LAUNCHED: '1', RIME_RESTARTED: '1' } }).status ?? 0;
+  function checkUpdates() {
+    if (!updates || process.env.RIME_NO_UPDATE_CHECK || cfg.updates === 'off') return;
+    upd.state = 'checking';
+    const row: Extract<Item, { kind: 'lines' }> = { kind: 'lines', lines: [[{ t: '  ● ', s: st.dim }, { t: 'checking npm…', s: st.dim }]] };
+    const shown = S;
+    shown.items.push(row);
+    const gone = (ms: number) => setTimeout(() => (bound(shown).drop(row), schedule()), ms);
+    void latestVersion(pkgName).then((l) => {
+      if (!l) {
+        upd.state = 'offline';
+        row.lines = [[{ t: '  ○ ', s: st.dim }, { t: "offline · couldn't check npm for a new version", s: st.dim }]];
+        gone(4000);
+      } else if (compareVersions(l.version, version) <= 0) {
+        upd.state = 'current';
+        row.lines = [[{ t: '  ✓ ', s: st.ok }, { t: `Rime ${version} is up to date`, s: st.dim }]];
+        gone(3000);
+      } else {
+        Object.assign(upd, { state: 'available', version: l.version, changes: l.changes });
+        bound(shown).drop(row);
+        offerUpdate();
+      }
+      cache.delete(row);
+      schedule();
+    });
+  }
+  function offerUpdate() {
+    if (S.question || S.approval) return void (upd.folded = true);
+    S.question = {
+      q: `Rime ${upd.version} is out (you have ${version}).`,
+      options: [{ label: `Update to ${upd.version}`, detail: upd.changes?.length ? upd.changes.join(' · ') : 'installs in the background while you work' }, { label: 'Not now', detail: '/update any time' }],
+      sel: 0, tool: false,
+      done: (a) => {
+        S.question = null;
+        if (a?.startsWith('Update')) void updateNow();
+        else upd.folded = true;
+        schedule();
+      },
+    };
+    schedule();
+  }
+  async function updateNow() {
+    if (upd.state === 'ready') return offerRestart(true);
+    if (upd.state === 'installing') return say(`installing ${upd.version}…`);
+    if (!updates) return note(`Rime ${version} isn't published to npm yet, so there's nothing to update from.`, 'dim');
+    if (upd.state !== 'available') {
+      say('checking npm…');
+      const l = await latestVersion(pkgName);
+      if (!l) return note("Couldn't reach npm to check for a new version.", 'dim');
+      if (compareVersions(l.version, version) <= 0) return note(`Rime ${version} is up to date.`, 'dim');
+      Object.assign(upd, { version: l.version, changes: l.changes });
+    }
+    upd.state = 'installing';
+    upd.folded = false;
+    schedule();
+    const r = await installVersion(pkgName, upd.version!);
+    if (!r.ok) {
+      upd.state = 'failed';
+      note(`Couldn't install Rime ${upd.version}: ${r.error}`);
+    } else {
+      upd.state = 'ready';
+      offerRestart();
+    }
+    schedule();
+  }
+  // At a quiet moment (no reply or tool running anywhere), or when asked.
+  function offerRestart(asked = false) {
+    if (upd.state !== 'ready') return;
+    if (!asked && (sessions.some((x) => x.busy) || S.question || S.approval)) return void (upd.folded = true);
+    S.question = {
+      q: `Rime ${upd.version} is installed.`,
+      options: [{ label: 'Restart now', detail: 'this conversation reopens in the new version' }, { label: 'At the next start', detail: 'the launcher picks it up' }],
+      sel: 0, tool: false,
+      done: (a) => {
+        S.question = null;
+        if (a === 'Restart now') return quit(upd.version);
+        upd.folded = true;
+        schedule();
+      },
+    };
+    schedule();
   }
 
   // ---- code-index (Phase 5) ----
@@ -2703,6 +2801,7 @@ export async function runApp(cfg: Config, version: string) {
       if (later) host.choose(later);
     } else if (c === '/usage') boxKind = 'usage';
     else if (c === '/exit') quit();
+    else if (c === '/update') void updateNow();
     else if (c === '/compact') void compactNow();
     else if (c === '/diff') showDiff();
     else if (c === '/undo') undo();
@@ -2844,6 +2943,7 @@ export async function runApp(cfg: Config, version: string) {
     }
     if (id === 'stop') return stopBg();
     if (id === 'mode') return cycleMode();
+    if (id === 'update') return void updateNow();
     if (id === 'conversations') return openList();
     if (id.startsWith('conv:') && list) return openRow(listRows()[+id.slice(5)]);
     if (id.startsWith('sugg:') && list) return takeSuggestion(listSuggestions()[+id.slice(5)] ?? '');
@@ -3247,7 +3347,7 @@ export async function runApp(cfg: Config, version: string) {
   // a reply being streamed is kept as interrupted, and each own server's onQuit
   // (stop the service or power the machine off, docs/providers.md §4.3) runs in a
   // detached child that finishes on its own and logs to ~/.rime/logs/.
-  function quit() {
+  function quit(into?: string) {
     if (quitting) return;
     quitting = 'bye';
     finishDelete(); // a delete waiting for undo is done now
@@ -3257,6 +3357,12 @@ export async function runApp(cfg: Config, version: string) {
       if (x.convId) save((d) => d.unlock(x.convId!));
     }
     header?.close();
+    // Restarting into an update: the conversations are free again, servers stay up,
+    // and the new version takes this terminal and reopens the conversation.
+    if (into) {
+      restore();
+      process.exit(launchVersion(into));
+    }
     for (const [name, p] of Object.entries(cfg.providers)) {
       if (!p.ssh || !p.onQuit || p.onQuit === 'keep' || !tunnels[name]?.port) continue;
       const logs = path.join(os.homedir(), '.rime', 'logs');
@@ -3365,6 +3471,8 @@ export async function runApp(cfg: Config, version: string) {
   }
   askTrust();
   example = exampleFor(project);
+  checkUpdates();
+  if (process.env.RIME_RESTARTED) setTimeout(() => header?.blink(), 400); // back in the new version
   // The code index opens in the background (a first build yields often, so the
   // screen stays live); then new conversations get the repo map in their frozen
   // prompt, including this one if nothing was sent yet.

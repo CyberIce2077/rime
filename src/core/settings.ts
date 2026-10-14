@@ -15,7 +15,7 @@ export const WHEN: Record<Applies, string> = { now: 'now', 'next-message': 'from
 
 export type Setting = {
   key: string; // "effort", "server.gpubox.onQuit"
-  group: 'Model' | 'Server' | 'Commands';
+  group: 'Model' | 'Server' | 'Commands' | 'Updates';
   label: string;
   help: string;
   applies: Applies;
@@ -46,6 +46,12 @@ export function definitions(cfg: Config): Setting[] {
       set: (c, v) => void (c.reasoning = v === 'on'),
     },
   ];
+  out.push({
+    key: 'updates', group: 'Updates', label: 'Check for updates', help: 'look at npm for a new Rime when it starts', applies: 'next-conversation',
+    values: ['on', 'off'],
+    get: (c) => c.updates ?? 'on',
+    set: (c, v) => void (c.updates = v === 'off' ? 'off' : undefined),
+  });
   // Secret-looking variables in your shell: hidden from the commands the model
   // runs unless you pass one through here (the rime tool can't change these).
   for (const name of Object.keys(process.env).filter((k) => SECRET.test(k)).sort())

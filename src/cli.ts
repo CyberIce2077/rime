@@ -4,8 +4,34 @@ import { runApp } from './core/app.ts';
 import { loadConfig, saveConfig } from './core/config.ts';
 import { renderHeader } from './core/header.ts';
 import { probe } from './providers/probe.ts';
+import { compare, install, latest, launch, newest } from './plugins/updater/update.ts';
 
 const args = process.argv.slice(2);
+
+// npm checks stay off while the package name is a placeholder (another package
+// could own it); publishing sets "rime": {"updates": true} in package.json.
+const UPDATES = (pkg as { rime?: { updates?: boolean } }).rime?.updates === true || process.env.RIME_UPDATE_CHECK === '1';
+
+// The launcher (SPEC §10): a newer version installed by an update runs instead.
+if (!process.env.RIME_LAUNCHED && !args.includes('--here')) {
+  const n = newest(pkg.name, pkg.version);
+  if (n) process.exit(launch(n.entry, args));
+}
+
+// `rime update`: the same as /update, in the shell.
+async function update() {
+  if (!UPDATES) return console.log(`Rime ${pkg.version} isn't published to npm yet, so there's nothing to update from.`);
+  process.stdout.write('checking npm… ');
+  const l = await latest(pkg.name);
+  if (!l) return console.log("offline: couldn't reach the npm registry"), process.exit(1);
+  if (compare(l.version, pkg.version) <= 0) return console.log(`Rime ${pkg.version} is up to date`);
+  console.log(`Rime ${l.version} is out (you have ${pkg.version})`);
+  for (const c of l.changes) console.log(`  · ${c}`);
+  process.stdout.write(`installing into ~/.rime/versions/${l.version}… `);
+  const r = await install(pkg.name, l.version);
+  if (!r.ok) return console.log(`failed: ${r.error}`), process.exit(1);
+  console.log('done. The next `rime` starts it.');
+}
 const opt = (name: string) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
@@ -53,9 +79,12 @@ usage: rime                    start a session in this directory
        rime connect <url>      add an OpenAI-compatible or llama.cpp server
             [--key-env VAR | --key -] [--name NAME]
                                (--key - reads the key from stdin)
+       rime update             install the newest version (the next start runs it)
        rime -v                 print the version
 
 Inside Rime, /setup connects your own server, this computer, or a provider.`);
+} else if (args[0] === 'update') {
+  await update();
 } else if (args[0] === 'connect') {
   if (!args[1]) console.error('usage: rime connect <url> [--key-env VAR | --key -] [--name NAME]'), process.exit(1);
   await connect(args[1]);
@@ -66,5 +95,5 @@ Inside Rime, /setup connects your own server, this computer, or a provider.`);
     console.error('rime: needs an interactive terminal');
     process.exit(1);
   }
-  await runApp(cfg, pkg.version);
+  await runApp(cfg, pkg.version, pkg.name, UPDATES);
 }
