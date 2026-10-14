@@ -33,7 +33,7 @@ import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor }
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
 import { createSide } from '../plugins/shell-panel/panel.ts';
-import { BROWSER_TOOL, type BrowserSession, chrome as hasChrome, closeChrome, install as installBrowser, installed as browserInstalled, openBrowser } from '../plugins/browser/browser.ts';
+import { BROWSER_TOOL, type BrowserSession, type Progress, chrome as hasChrome, closeChrome, install as installBrowser, installed as browserInstalled, openBrowser } from '../plugins/browser/browser.ts';
 import { DESIGN_TOOL, type DesignSession, type Pick, designFile, openDesign, overflow, slug as designSlug, starter } from '../plugins/design/design.ts';
 import { compare as compareVersions, install as installVersion, latest as latestVersion, newest as newestVersion } from '../plugins/updater/update.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
@@ -769,8 +769,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
       if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl-w z')], id: 'panel' });
       else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl-w l'), dim(' panel')], id: 'panel' });
-      if (upd.state === 'installing') parts.push({ line: [dim(`⟳ installing ${upd.version}…`)] });
-      else if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
+      if (running) parts.push({ line: [{ t: '⟳ ', s: st.accent }, dim(`${running.label} · `), key('ctrl+c'), dim(' stop')], id: 'key:ctrl+c' });
+      if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
       if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
       const asking = sessions.filter((x) => x !== S && needsYou(x)).length;
       const working = sessions.filter((x) => x !== S && (x.busy || x.waiting) && !needsYou(x)).length;
@@ -1489,12 +1489,19 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     upd.state = 'installing';
     upd.folded = false;
-    schedule();
-    const r = await installVersion(pkgName, upd.version!);
-    if (!r.ok) {
+    const ac = new AbortController();
+    const pr = progressRow(() => ac.abort());
+    pr.update({ step: `Installing Rime ${upd.version} (npm)` });
+    const r = await installVersion(pkgName, upd.version!, undefined, undefined, ac.signal);
+    if (r.stopped) {
+      upd.state = 'available';
+      upd.folded = true;
+      pr.finish(`stopped · Rime ${upd.version} wasn't installed; /update starts again`, 'stopped');
+    } else if (!r.ok) {
       upd.state = 'failed';
-      note(`Couldn't install Rime ${upd.version}: ${r.error}`);
+      pr.finish(`couldn't install Rime ${upd.version}: ${r.error}`, false);
     } else {
+      pr.finish(`Rime ${upd.version} installed`, true);
       upd.state = 'ready';
       offerRestart();
     }
@@ -1516,6 +1523,55 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       },
     };
     schedule();
+  }
+
+  // ---- downloads and installs, live ----
+  // One row in the transcript, updated in place: a ▰▱ bar with the size, speed
+  // and time left once the size is known, else a spinner and the seconds so far.
+  // ctrl+c stops it (the status line says so too, in case the row scrolled away).
+  let running: { stop(): void; label: string } | null = null;
+  const fmtB = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(1)} MB`);
+  function progressRow(stop: () => void) {
+    const row: Extract<Item, { kind: 'lines' }> = { kind: 'lines', lines: [] };
+    S.items.push(row);
+    const t0 = Date.now();
+    let step = '', done: number | undefined, total: number | undefined, samples: [number, number][] = [];
+    const me = { stop, label: '' };
+    running = me;
+    const elapsed = () => fmtS(Date.now() - t0);
+    const draw = () => {
+      const spin = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[Math.floor(Date.now() / 100) % 10];
+      const stops: Line = [{ t: 'ctrl+c', s: st.accentB }, { t: ' stops', s: st.dim }];
+      if (total && done !== undefined) {
+        const b = bar(done / total, 24);
+        const w = samples.filter(([t]) => Date.now() - t < 4000);
+        const speed = w.length > 1 && w.at(-1)![0] > w[0][0] ? (w.at(-1)![1] - w[0][1]) / ((w.at(-1)![0] - w[0][0]) / 1000) : 0;
+        const left = speed > 0 ? Math.ceil((total - done) / speed) : 0;
+        me.label = `${step.replace(/^Downloading /, '')} ${b.pct.trim()}`;
+        row.lines = [[{ t: `  ${spin} `, s: st.accent }, { t: `${step}  `, s: st.fg }, { t: b.fill, s: st.accent }, { t: b.empty, s: st.line }, { t: ` ${b.pct.trim()}`, s: st.titleB }, { t: ` · ${fmtB(done)} of ${fmtB(total)}${speed ? ` · ${fmtB(speed)}/s` : ''}${left ? ` · ${left < 60 ? `${left} s` : `${Math.ceil(left / 60)} min`} left` : ''} · `, s: st.dim }, ...stops]];
+      } else {
+        me.label = `${step} · ${elapsed()}`;
+        row.lines = [[{ t: `  ${spin} `, s: st.accent }, { t: step, s: st.fg }, { t: ` · ${elapsed()} · `, s: st.dim }, ...stops]];
+      }
+      cache.delete(row);
+      schedule();
+    };
+    const tick = setInterval(draw, 120);
+    return {
+      update(p: Progress) {
+        if (p.step !== step) (step = p.step), (samples = []);
+        (done = p.done), (total = p.total);
+        if (p.done !== undefined) samples.push([Date.now(), p.done]);
+        draw();
+      },
+      finish(text: string, ok: boolean | 'stopped') {
+        clearInterval(tick);
+        if (running === me) running = null;
+        row.lines = [[{ t: ok === true ? '  ✓ ' : ok === 'stopped' ? '  ■ ' : '  ✗ ', s: ok === true ? st.ok : ok === 'stopped' ? st.dim : st.warn }, { t: `${text} · ${elapsed()}`, s: st.dim }]];
+        cache.delete(row);
+        schedule();
+      },
+    };
   }
 
   // ---- browser plug-in (Phase 11) ----
@@ -1558,12 +1614,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       done: (a) => {
         S.question = null;
         if (!a || a === 'Not now') return schedule();
-        const row: Extract<Item, { kind: 'lines' }> = { kind: 'lines', lines: [[{ t: '  ⟳ ', s: st.accent }, { t: 'setting up Playwright…', s: st.dim }]] };
-        S.items.push(row);
-        const show = (t: string) => ((row.lines = [[{ t: '  ⟳ ', s: st.accent }, { t, s: st.dim }]]), cache.delete(row), schedule());
-        void installBrowser(a === 'Use my Chrome', (step) => show(`${step}…`)).then((r) => {
-          if (!r.ok) return show(`couldn't set up Playwright: ${r.error}`);
-          show('Playwright is ready');
+        const useChrome = a === 'Use my Chrome';
+        const ac = new AbortController();
+        const pr = progressRow(() => ac.abort());
+        void installBrowser(useChrome, (p) => pr.update(p), ac.signal).then((r) => {
+          if (r.stopped) return pr.finish(`stopped · nothing was turned on; /${plugin} starts again`, 'stopped');
+          if (!r.ok) return pr.finish(`couldn't set up Playwright: ${r.error}`, false);
+          pr.finish(useChrome ? 'Playwright installed · it uses your Chrome' : 'Playwright and Chromium installed', true);
           on();
         });
         schedule();
@@ -3346,6 +3403,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (boxKind) return void (boxKind = null);
       if (big || listPinned) return void ((big = null), (listPinned = listOpen = false));
       if (S.busy) return S.busy.abort();
+      if (running) return running.stop(); // a download or install
       if (buf) {
         buf = '';
         cur = 0;

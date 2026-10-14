@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { blocks, gfxMode } from '../src/plugins/browser/browser.ts';
+import { blocks, gfxMode, parseBar } from '../src/plugins/browser/browser.ts';
 import { decide } from '../src/core/permissions.ts';
 
 const ctx = (mode: any, rules: any[] = []) => ({ mode, project: '/p', rules });
@@ -30,4 +30,9 @@ test('pictures: Kitty and iTerm2 where the terminal says so, half-blocks elsewhe
   assert.equal(gfxMode({ TERM_PROGRAM: 'iTerm.app', TMUX: '1' }), 'blocks');
   assert.equal(gfxMode({ TERM_PROGRAM: 'Apple_Terminal' }), 'blocks');
   assert.equal(gfxMode({ RIME_GFX: 'kitty' }), 'kitty');
+});
+
+test("a download's size and progress are read from Playwright's bar (the newest one in the text)", () => {
+  assert.deepEqual(parseBar('Downloading Chromium 140.0 from https://x\n150.5 MiB [====      ] 20% 3.1s150.5 MiB [=====     ] 25% 2.9s'), { total: 157810688, pct: 25 });
+  assert.equal(parseBar('Downloading FFmpeg from https://x'), null);
 });

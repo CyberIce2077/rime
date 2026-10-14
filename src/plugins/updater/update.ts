@@ -60,15 +60,19 @@ export function launch(entry: string, args: string[], env: Record<string, string
 
 // npm install into ~/.rime/versions/<v>/ (a half-done folder never counts: the
 // entry file is the last thing there), then only the newest few are kept.
-export function install(name: string, version: string, dir = VERSIONS, npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'): Promise<{ ok: boolean; error?: string }> {
+export function install(name: string, version: string, dir = VERSIONS, npm = process.platform === 'win32' ? 'npm.cmd' : 'npm', signal?: AbortSignal): Promise<{ ok: boolean; error?: string; stopped?: boolean }> {
   const to = path.join(dir, version);
   fs.mkdirSync(to, { recursive: true });
   return new Promise((resolve) => {
     let err = '';
     const p = spawn(npm, ['install', '--prefix', to, '--no-audit', '--no-fund', '--loglevel=error', `${name}@${version}`], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const stop = () => p.kill('SIGTERM');
+    signal?.addEventListener('abort', stop, { once: true });
     p.stderr.on('data', (d) => (err += d));
     p.on('error', (e) => resolve({ ok: false, error: e.message }));
     p.on('close', (code) => {
+      signal?.removeEventListener('abort', stop);
+      if (signal?.aborted) return fs.rmSync(to, { recursive: true, force: true }), resolve({ ok: false, stopped: true });
       if (code !== 0) return resolve({ ok: false, error: err.trim().split('\n').at(-1) || `npm exited ${code}` });
       for (const old of installed(name, dir).slice(KEEP)) fs.rmSync(path.dirname(path.dirname(path.dirname(path.dirname(old.entry)))), { recursive: true, force: true });
       resolve({ ok: true });

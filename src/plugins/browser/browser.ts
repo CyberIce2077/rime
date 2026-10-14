@@ -42,24 +42,56 @@ export function chrome(): boolean {
   return places.some((p) => fs.existsSync(p));
 }
 
+// How an install is going: the step, and for a download its size and how much
+// has arrived (bytes); `done`/`total` are missing while npm works.
+export type Progress = { step: string; done?: number; total?: number };
+
+// Playwright's installer only draws its live progress bar on a terminal (it asks
+// stdout, then draws on stderr); this preload makes both pipes look like one, with
+// cursor moves as no-ops, so the bar arrives as text: "150.5 MiB [=====   ] 31% 13.0s".
+const PRELOAD = 'for (const o of [process.stdout, process.stderr]) Object.assign(o, { isTTY: true, columns: 120, clearLine: () => true, cursorTo: () => true, moveCursor: () => true });\n';
+export const parseBar = (text: string): { total: number; pct: number } | null => {
+  const m = [...text.matchAll(/([\d.]+) MiB \[[= ]*\] +(\d+)%/g)].at(-1);
+  return m ? { total: parseFloat(m[1]) * 1024 * 1024, pct: +m[2] } : null;
+};
+
 // npm install into the plug-in's folder, then Chromium unless Chrome is used.
-export function install(useChrome: boolean, onStep: (s: string) => void, npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'): Promise<{ ok: boolean; error?: string }> {
+// `signal` stops it (the child is killed; a half-downloaded Chromium is retried
+// from scratch next time).
+export function install(useChrome: boolean, onProgress: (p: Progress) => void, signal?: AbortSignal, npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'): Promise<{ ok: boolean; error?: string; stopped?: boolean }> {
   fs.mkdirSync(DIR, { recursive: true });
-  const run = (cmd: string, args: string[]) =>
-    new Promise<{ ok: boolean; error?: string }>((resolve) => {
+  const run = (cmd: string, args: string[], onOut?: (s: string) => void) =>
+    new Promise<{ ok: boolean; error?: string; stopped?: boolean }>((resolve) => {
+      if (signal?.aborted) return resolve({ ok: false, stopped: true });
       let err = '';
-      const p = spawn(cmd, args, { cwd: DIR, stdio: ['ignore', 'ignore', 'pipe'] });
-      p.stderr.on('data', (d) => (err += d));
+      const p = spawn(cmd, args, { cwd: DIR, stdio: ['ignore', 'pipe', 'pipe'] });
+      const stop = () => p.kill('SIGTERM');
+      signal?.addEventListener('abort', stop, { once: true });
+      p.stdout.on('data', (d) => onOut?.(d.toString('utf8')));
+      p.stderr.on('data', (d) => ((err = (err + d).slice(-4000)), onOut?.(d.toString('utf8'))));
       p.on('error', (e) => resolve({ ok: false, error: e.message }));
-      p.on('close', (code) => resolve(code === 0 ? { ok: true } : { ok: false, error: err.trim().split('\n').at(-1) || `exit ${code}` }));
+      p.on('close', (code) => {
+        signal?.removeEventListener('abort', stop);
+        resolve(signal?.aborted ? { ok: false, stopped: true } : code === 0 ? { ok: true } : { ok: false, error: err.split(/[\r\n]+/).filter((l) => l.trim() && !/MiB \[/.test(l)).at(-1)?.trim() || `exit ${code}` });
+      });
     });
   return (async () => {
-    onStep('installing Playwright');
+    onProgress({ step: 'Installing Playwright (npm)' });
     const a = await run(npm, ['install', '--prefix', DIR, '--no-audit', '--no-fund', '--loglevel=error', ...PACKAGES]);
     if (!a.ok) return a;
     if (!useChrome) {
-      onStep('downloading Chromium (~150 MB)');
-      const b = await run(process.execPath, [path.join(DIR, 'node_modules', 'playwright-core', 'cli.js'), 'install', 'chromium']);
+      const preload = path.join(DIR, 'tty-preload.cjs');
+      fs.writeFileSync(preload, PRELOAD);
+      let step = 'Downloading Chromium', buf = '';
+      onProgress({ step });
+      const b = await run(process.execPath, ['--require', preload, path.join(DIR, 'node_modules', 'playwright-core', 'cli.js'), 'install', 'chromium'], (s) => {
+        buf = (buf + s).slice(-4000);
+        // "Downloading Chromium 140.0.7339.16 (playwright build v1187) from …", then FFmpeg and the headless shell.
+        const name = [...buf.matchAll(/Downloading ([^\n(]+?)(?: \(playwright[^)]*\))? from/g)].at(-1)?.[1];
+        if (name) step = `Downloading ${name.replace(/ [\d.]+$/, '')}`;
+        const bar = parseBar(buf);
+        onProgress(bar ? { step, total: bar.total, done: (bar.total * bar.pct) / 100 } : { step });
+      });
       if (!b.ok) return b;
     }
     fs.writeFileSync(path.join(DIR, 'choice.json'), JSON.stringify(useChrome ? { channel: 'chrome' } : {}));
