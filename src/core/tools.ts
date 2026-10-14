@@ -4,6 +4,7 @@
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { stripAnsi } from './term.ts';
 
@@ -142,11 +143,55 @@ export function cap(text: string) {
 // What a command printed, kept to a few MB while it runs (the start and the end).
 const keep = (s: string) => (s.length > 4e6 ? `${s.slice(0, 1e6)}\n… output cut …\n${s.slice(-2e6)}` : s);
 
-export function bash(cwd: string, input: { command: string; timeout?: number }, signal?: AbortSignal): Promise<ToolResult> {
+// Variables that look like secrets (API keys, tokens, passwords) don't reach the
+// commands the model runs, unless you let one through (/settings → Commands).
+export const SECRET = /KEY|SECRET|TOKEN|PASSW|CREDENTIAL/i; // not SSH_AUTH_SOCK: git over ssh needs it
+export function commandEnv(env: NodeJS.ProcessEnv, pass: string[] = [], readOnly = false): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) if (!SECRET.test(k) || pass.includes(k)) out[k] = v;
+  Object.assign(out, { CI: '1', NO_COLOR: '1', FORCE_COLOR: '0', TERM: 'dumb' });
+  // A read-only git command that runs without asking can't start a command from
+  // the repo's config (core.fsmonitor runs on every `git status`) or a hook.
+  if (readOnly) Object.assign(out, { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.fsmonitor', GIT_CONFIG_VALUE_0: 'false', GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
+  return out;
+}
+
+// The OS sandbox for what auto mode runs without asking (SPEC §17): writes only
+// inside the project, the temp folders and package caches; the project's
+// .git/config, git hooks and .rime stay read-only. macOS sandbox-exec, Linux
+// bwrap when it's installed; null when neither exists.
+export function sandboxed(cmd: string, project: string): [string, string[]] | null {
+  const home = os.homedir();
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return null;
+    }
+  };
+  const root = real(project) ?? project;
+  // ponytail: a short list of caches; add ~/.cargo, ~/.gradle and the like as they come up.
+  const write = [root, os.tmpdir(), '/tmp', '/var/tmp', path.join(home, '.npm'), path.join(home, '.cache'), path.join(home, 'Library', 'Caches')].map(real).filter((p): p is string => !!p);
+  const locked = [path.join(root, '.git', 'config'), path.join(root, '.git', 'hooks'), path.join(root, '.rime')].filter((p) => fs.existsSync(p));
+  const q = (p: string) => JSON.stringify(p);
+  if (process.platform === 'darwin' && fs.existsSync('/usr/bin/sandbox-exec')) {
+    const profile = `(version 1)(allow default)(deny file-write*)(allow file-write* ${[...new Set(write)].map((p) => `(subpath ${q(p)})`).join(' ')} (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/tty") (regex #"^/dev/fd/"))${locked.length ? `(deny file-write* ${locked.map((p) => `(subpath ${q(p)})`).join(' ')})` : ''}`;
+    return ['/usr/bin/sandbox-exec', ['-p', profile, 'sh', '-c', cmd]];
+  }
+  const bwrap = process.platform === 'linux' && (process.env.PATH ?? '').split(':').map((d) => path.join(d, 'bwrap')).find((p) => fs.existsSync(p));
+  if (bwrap) return [bwrap, ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', ...[...new Set(write)].flatMap((p) => ['--bind', p, p]), ...locked.flatMap((p) => ['--ro-bind', p, p]), '--', 'sh', '-c', cmd]];
+  return null;
+}
+
+export type RunAs = { project?: string; sandbox?: boolean; readOnly?: boolean; passEnv?: string[] };
+
+export function bash(cwd: string, input: { command: string; timeout?: number }, signal?: AbortSignal, as: RunAs = {}): Promise<ToolResult> {
   return new Promise((resolve) => {
     const limit = Math.min(600, Math.max(1, input.timeout ?? 120)) * 1000;
+    const box = as.sandbox ? sandboxed(input.command ?? '', as.project ?? cwd) : null;
+    const [bin, args] = box ?? ['sh', ['-c', input.command ?? '']];
     // Its own process group, so a stop or timeout ends everything it started.
-    const p = spawn('sh', ['-c', input.command ?? ''], { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0', TERM: 'dumb' } });
+    const p = spawn(bin, args, { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: commandEnv(process.env, as.passEnv, as.readOnly) });
     let out = '', why = '';
     const kill = (w: string) => {
       why = w;
@@ -165,6 +210,8 @@ export function bash(cwd: string, input: { command: string; timeout?: number }, 
       signal?.removeEventListener('abort', stop);
       const lines = cap(clean(out));
       const status = why || (code === 0 ? 'exit 0' : `exit ${code}`);
+      // Say when it was the sandbox, so the model asks instead of trying around it.
+      if (box && code !== 0 && /Operation not permitted|Read-only file system|Permission denied/.test(out)) lines.push("(Rime's auto-mode sandbox allows writes only inside the project (not .git/config, git hooks or .rime), temp folders and package caches; to write elsewhere, ask the user.)");
       const body = lines.join('\n').trim();
       resolve({ content: `${status}${body ? '\n' + body : ''}`, error: code !== 0 || !!why, summary: status, output: body ? lines : [] });
     });

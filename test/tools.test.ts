@@ -129,3 +129,29 @@ test('A-5: bash output is capped per line and in total', async () => {
   assert.match(many.content, /^exit 0\n0y/);
   assert.match(many.content, /399y+$/);
 });
+
+test('review 3: secrets stay out of commands unless passed; read-only git is hardened', async () => {
+  const { commandEnv } = await import('../src/core/tools.ts');
+  const env = commandEnv({ PATH: '/bin', ANTHROPIC_API_KEY: 'k', GITHUB_TOKEN: 't', DB_PASSWORD: 'p', SSH_AUTH_SOCK: '/s', OPENAI_API_KEY: 'o' }, ['OPENAI_API_KEY']);
+  assert.deepEqual(Object.keys(env).filter((k) => !['CI', 'NO_COLOR', 'FORCE_COLOR', 'TERM'].includes(k)).sort(), ['OPENAI_API_KEY', 'PATH', 'SSH_AUTH_SOCK']);
+  assert.equal(commandEnv({}, [], true).GIT_CONFIG_VALUE_0, 'false');
+  assert.equal(commandEnv({}).GIT_CONFIG_COUNT, undefined);
+});
+
+test('review 2: the auto-mode sandbox keeps writes in the project (macOS and Linux with bwrap)', async (t) => {
+  const { bash, sandboxed } = await import('../src/core/tools.ts');
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'rime-sb-'));
+  if (!sandboxed('true', project)) return t.skip('no sandbox on this computer');
+  fs.mkdirSync(path.join(project, '.git'));
+  fs.writeFileSync(path.join(project, '.git', 'config'), '');
+  const run = (command: string) => bash(project, { command }, undefined, { project, sandbox: true });
+  assert.equal((await run('echo ok > a.txt')).error, false);
+  const outsideDir = fs.mkdtempSync(path.join(os.homedir(), '.rime-sb-test-'));
+  try {
+    assert.equal((await run(`echo x > ${outsideDir}/b.txt`)).error, true);
+    assert.equal(fs.existsSync(path.join(outsideDir, 'b.txt')), false);
+  } finally {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+  assert.equal((await run('echo x >> .git/config')).error, true);
+});

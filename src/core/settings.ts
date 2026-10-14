@@ -8,13 +8,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { type Config, CONFIG_PATH, loadConfig, saveConfig } from './config.ts';
 import { EFFORTS } from '../providers/types.ts';
+import { SECRET } from './tools.ts';
 
 export type Applies = 'now' | 'next-message' | 'next-task' | 'next-conversation';
 export const WHEN: Record<Applies, string> = { now: 'now', 'next-message': 'from the next message', 'next-task': 'from the next task', 'next-conversation': 'from the next conversation' };
 
 export type Setting = {
   key: string; // "effort", "server.gpubox.onQuit"
-  group: 'Model' | 'Server';
+  group: 'Model' | 'Server' | 'Commands';
   label: string;
   help: string;
   applies: Applies;
@@ -45,6 +46,19 @@ export function definitions(cfg: Config): Setting[] {
       set: (c, v) => void (c.reasoning = v === 'on'),
     },
   ];
+  // Secret-looking variables in your shell: hidden from the commands the model
+  // runs unless you pass one through here (the rime tool can't change these).
+  for (const name of Object.keys(process.env).filter((k) => SECRET.test(k)).sort())
+    out.push({
+      key: `commands.env.${name}`, group: 'Commands', label: name, help: 'let commands Rime runs see this variable', applies: 'now',
+      values: ['hidden', 'passed'],
+      get: (c) => (c.passEnv?.includes(name) ? 'passed' : 'hidden'),
+      set: (c, v) => {
+        const s = new Set(c.passEnv ?? []);
+        v === 'passed' ? s.add(name) : s.delete(name);
+        c.passEnv = s.size ? [...s] : undefined;
+      },
+    });
   for (const [name, p] of Object.entries(cfg.providers)) {
     if (!p.ssh) continue;
     out.push(

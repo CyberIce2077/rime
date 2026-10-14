@@ -434,6 +434,7 @@ export function createSettingsPanel(h: SettingsHost): Panel {
       { group: 'Providers', label: 'Add a provider or URL', help: '/connect', kind: 'action', go: h.openConnect },
       ...defs.filter((d) => d.group === 'Server').map((d): Row => ({ group: 'Server', label: d.label, help: d.help, kind: 'value', key: d.key })),
       ...Object.entries(cfg.providers).filter(([, p]) => p.ssh).map(([name]): Row => ({ group: 'Server', label: `${name}: steps`, help: 'the commands that bring it up', kind: 'action', go: () => h.openSteps(name) })),
+      ...defs.filter((d) => d.group === 'Commands').map((d): Row => ({ group: 'Commands', label: d.label, help: d.help, kind: 'value', key: d.key })),
       ...settings.recent().slice(0, 5).map((c): Row => ({ group: 'Recent changes', label: `${c.label} ${c.to}`, help: c.undone ? 'undone' : `was ${c.from} · ${ago(c.at)} · enter undoes`, kind: 'undo', change: c })),
     ];
     const f = filter.toLowerCase();

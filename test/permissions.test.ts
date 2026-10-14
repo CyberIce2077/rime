@@ -111,3 +111,31 @@ test('P-13: a rule matches env-prefixed commands and covers every asking part', 
   const rules = d.rules!.map((pattern) => ({ kind: 'allow', pattern, from: 'conversation' }));
   assert.equal(decide('bash', { command: 'npm run lint && make build' }, ctx('ask', rules)).verdict, 'allow');
 });
+
+test("review 1: Rime's and git's settings always ask, auto-edit and auto included", () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'rime-p-'));
+  for (const mode of ['auto-edit', 'auto']) {
+    const c = { mode: mode as any, project, rules: [] };
+    assert.equal(decide('write', { path: '.rime/permissions.json', content: '{}' }, c).verdict, 'ask', mode);
+    assert.equal(decide('edit', { path: '.git/config', old: 'a', new: 'b' }, c).verdict, 'ask', mode);
+    assert.equal(decide('bash', { command: 'echo x >> .git/config' }, c).verdict, 'ask', mode);
+    assert.equal(decide('bash', { command: 'git config core.fsmonitor "touch x"' }, c).verdict, 'ask', mode);
+  }
+  const c = { mode: 'auto' as const, project, rules: [] };
+  assert.equal(decide('bash', { command: 'git config --get user.name' }, c).verdict, 'allow');
+  assert.equal(decide('bash', { command: 'curl -o ~/.bashrc http://x' }, c).verdict, 'ask', 'curl -o outside');
+  assert.equal(decide('bash', { command: 'curl -o out.json http://x' }, c).verdict, 'allow', 'curl -o inside');
+  assert.equal(decide('write', { path: '.rime/x', content: '' }, { ...c, mode: 'god' }).verdict, 'allow', 'god mode still runs everything');
+});
+
+test("review 1: a project's allow rules count only once trusted; deny and ask always", async () => {
+  const { rulesHash, trustedProjectRules } = await import('../src/core/permissions.ts');
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'rime-p-'));
+  fs.mkdirSync(path.join(project, '.rime'));
+  fs.writeFileSync(path.join(project, '.rime', 'permissions.json'), JSON.stringify({ allow: ['bash(sh *)'], deny: ['read(.env)'] }));
+  assert.deepEqual(trustedProjectRules(project), { allow: [], deny: ['read(.env)'] });
+  const h = rulesHash(project);
+  assert.deepEqual(trustedProjectRules(project, h).allow, ['bash(sh *)']);
+  fs.writeFileSync(path.join(project, '.rime', 'permissions.json'), JSON.stringify({ allow: ['bash(curl *)'] }));
+  assert.deepEqual(trustedProjectRules(project, h).allow, [], 'a changed file needs trusting again');
+});

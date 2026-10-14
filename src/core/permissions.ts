@@ -4,6 +4,7 @@
 // guard's always-ask list that holds even in auto. Chained commands are checked
 // part by part, so an allow rule never covers `npm test && rm -rf ~`.
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,7 +16,7 @@ export const MODE_HELP: Record<Mode, string> = {
   ask: 'ask before commands and edits',
   'auto-edit': 'edits without asking · commands still ask',
   plan: 'plan · read-only',
-  auto: 'auto · only risky commands ask',
+  auto: 'auto · only risky commands ask; the rest run in a sandbox',
   god: 'god mode · runs everything without asking',
 };
 
@@ -76,7 +77,21 @@ export function guarded(part: string, project: string): string | null {
   if (forcePush(words)) return 'force push';
   if (/^(scp|rsync|sftp|ftp|nc|ncat|netcat)$/.test(words[0]) || (/^(curl|wget)$/.test(words[0]) && /\s(-T|--upload-file|-F|--form|--data-binary|-d|--data)\b/.test(p))) return 'sends files off this machine';
   if (targets(p).some((t) => outside(t, project))) return 'writes outside the project';
+  if (targets(p).some((t) => settingsPath(t, project))) return "changes Rime's or git's settings";
+  if (words[0] === 'git' && words.includes('config') && !words.some((w) => /^(--get\S*|--list|-l)$/.test(w))) return "changes git's settings";
+  // curl -o / wget -O name where the download lands.
+  const out = /^(curl|wget)$/.test(words[0]) ? /\s(?:-o|--output|-O|--output-document)[\s=]+(\S+)/.exec(p)?.[1] : undefined;
+  if (out && out !== '-' && outside(unquote(out), project)) return 'writes outside the project';
   return null;
+}
+
+// Rime's and git's own settings inside the project (.rime/, .git/) and
+// ~/.rime: writing there changes what Rime allows or what git runs (a
+// core.fsmonitor command runs on every `git status`), so it always asks.
+export function settingsPath(target: string, project: string) {
+  if (target.startsWith('&') || target === '/dev/null') return false;
+  const abs = real(path.resolve(project, expand(target))), root = real(project);
+  return [path.join(root, '.rime'), path.join(root, '.git'), real(path.join(os.homedir(), '.rime'))].some((d) => abs === d || abs.startsWith(d + path.sep));
 }
 
 // A path outside the project. One that starts with a variable ($HOME/x) can't be
@@ -276,6 +291,7 @@ export function decide(tool: string, input: Record<string, any>, c: Ctx): Decisi
     const r = ruleFor(c.rules, 'edit', relp, abs);
     if (r?.kind === 'deny') return { verdict: 'deny', why: `denied by ${r.pattern}` };
     if (outside(abs, c.project)) return { verdict: 'ask', why: 'writes outside the project (always asks)' };
+    if (settingsPath(abs, c.project)) return { verdict: 'ask', why: "changes Rime's or git's settings (always asks)" };
     if (r?.kind === 'ask') return { verdict: 'ask', why: `asks by ${r.pattern}` };
     if (c.mode === 'auto-edit' || c.mode === 'auto') return { verdict: 'allow', why: c.mode };
     if (r?.kind === 'allow') return { verdict: 'allow', why: `allowed by ${r.pattern}` };
@@ -315,6 +331,20 @@ export function projectRules(project: string): Rules {
   } catch {
     return {};
   }
+}
+// A project's rules can come with a cloned repo, so its allow rules count only
+// once you trusted this exact file (`trusted` is the hash you accepted). Its deny
+// and ask rules only make Rime more careful, so they always count.
+export function rulesHash(project: string) {
+  try {
+    return createHash('sha256').update(fs.readFileSync(path.join(project, '.rime', 'permissions.json'))).digest('hex').slice(0, 16);
+  } catch {
+    return '';
+  }
+}
+export function trustedProjectRules(project: string, trusted?: string): Rules {
+  const r = projectRules(project);
+  return !r.allow?.length || trusted === rulesHash(project) ? r : { ...r, allow: [] };
 }
 export function addProjectRule(project: string, kind: Kind, pattern: string) {
   const r = projectRules(project);

@@ -13,8 +13,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { type Conversation, type Db, type Stored, openDb, projectOf } from './db.ts';
-import { type Decision, MODE_HELP, MODES, type Mode, addProjectRule, decide, projectRules, removeProjectRule, ruleList } from './permissions.ts';
-import { type ToolResult, TOOLS, bash as bashTool, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
+import { type Decision, MODE_HELP, MODES, type Mode, addProjectRule, decide, projectRules, removeProjectRule, ruleList, rulesHash, trustedProjectRules } from './permissions.ts';
+import { type RunAs, type ToolResult, TOOLS, bash as bashTool, sandboxed, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
 import { WHEN, createSettings, phrase } from './settings.ts';
 import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
 import { toolEvents } from './timeline.ts';
@@ -90,7 +90,7 @@ const system = (cwd: string, agents = '') =>
   `You are Rime, a coding assistant running in the user's terminal.\n` +
   `Working directory: ${cwd}\n` +
   `Do the work with your tools: read files before you change them, create files with write, change them with edit, run commands with bash. Don't paste whole files into the chat; say in a line or two what you did.\n` +
-  `When you need the user to choose before you go on, use the ask tool instead of ending your reply with a question.\n` +
+  `When you need the user to choose before you go on, use the ask tool and stop there; never ask in text and then carry on in the same reply.\n` +
   `You run inside Rime. Use the rime tool to change Rime itself (tabs, panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
   `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.` +
   (agents ? `\n\nAGENTS.md:\n${agents}` : '');
@@ -1180,6 +1180,16 @@ export async function runApp(cfg: Config, version: string) {
         said = r.blocks.filter((b) => b.type === 'text').map((b) => String(b.text)).join('');
         const uses = r.blocks.filter((b) => b.type === 'tool_use');
         if (!uses.length) break;
+        // A reply that asks you something in text and then goes ahead anyway: the
+        // calls wait for your answer (they get "not run" results, so the history
+        // stays valid, and your next message goes with them).
+        const asked = splitToolCalls(said).text.trim();
+        if (asked.endsWith('?') && !uses.some((u) => u.name === 'ask')) {
+          C.messages.push({ role: 'user', content: uses.map((u) => result(u.id, 'Not run: you asked the user a question. Wait for their answer, and use the ask tool when they need to choose.', true)) });
+          C.lastUserSeq = store(C.messages.at(-1)!);
+          note('Rime asked you something, so it waits for your answer before running that.', 'dim');
+          break;
+        }
         esc = () => ac.abort();
         const results = await runTools(uses, ac.signal, did, C);
         C.messages.push({ role: 'user', content: [...results, ...(ac.signal.aborted ? [] : await takeQueued(C))] });
@@ -1201,6 +1211,7 @@ export async function runApp(cfg: Config, version: string) {
       if (C.busy === me) C.busy = null;
       C.nextStep = nextFor(said, did, project);
       offerChoices(said, C);
+      if (C === S) askTrust(); // the rules file changed during the reply
       example = exampleFor(project);
       // What you sent meanwhile: stopped, it goes back to the prompt; else it's next.
       if (C.queued.length && ac.signal.aborted) unqueue(C);
@@ -1439,10 +1450,34 @@ export async function runApp(cfg: Config, version: string) {
   // ---- tools (Phase 4) and permissions (SPEC §17) ----
 
   const result = (id: unknown, content: string, error = false): Block => ({ type: 'tool_result', tool_use_id: id, content, ...(error ? { is_error: true } : {}) });
+  // The project's .rime/permissions.json: its allow rules count once you trusted
+  // this exact file (a cloned repo can't grant itself commands). Asked when Rime
+  // opens the project and again before a message if the file changed.
+  const projRules = () => trustedProjectRules(project, cfg.trustedRules?.[project]);
+  function trustRules() {
+    cfg.trustedRules = { ...cfg.trustedRules, [project]: rulesHash(project) };
+    settings.save();
+  }
+  function askTrust() {
+    const allow = projectRules(project).allow ?? [];
+    if (!allow.length || cfg.trustedRules?.[project] === rulesHash(project) || S.question) return;
+    S.question = {
+      q: `This project's .rime/permissions.json lets these run without asking: ${allow.join(', ')}. Trust them?`,
+      options: [{ label: 'Trust them', detail: 'until the file changes' }, { label: 'Not now', detail: 'they stay off; its deny and ask rules still count' }],
+      sel: 1, tool: false,
+      done: (a) => {
+        S.question = null;
+        if (a === 'Trust them') trustRules(), note('trusted this project\'s permission rules · /permissions lists them', 'dim');
+        schedule();
+      },
+    };
+    schedule();
+  }
+
   // The rules of the conversation the tools run for, and the paths dropped into it.
   const permCtx = (C: Session) => {
     const dropped = C.items.flatMap((it) => (it.kind === 'user' ? [...it.text].filter(isChip).map((ch) => chips.get(ch)?.path ?? '') : [])).filter(Boolean);
-    return { mode, project, rules: ruleList(cfg.permissions, projectRules(project), C.convRules), granted: (p: string) => dropped.some((d) => p === d || p.startsWith(d + path.sep)) };
+    return { mode, project, rules: ruleList(cfg.permissions, projRules(), C.convRules), granted: (p: string) => dropped.some((d) => p === d || p.startsWith(d + path.sep)) };
   };
   const describe = (u: Block) => {
     const i = (u.input ?? {}) as Record<string, any>;
@@ -1545,7 +1580,9 @@ export async function runApp(cfg: Config, version: string) {
       schedule();
       let r: ToolResult;
       try {
-        r = await runTool(String(u.name), input, signal, C);
+        // Auto mode's unasked commands run in the sandbox; read-only ones get git
+        // hardened. Asked-and-approved commands run as you approved them.
+        r = await runTool(String(u.name), input, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv });
       } catch (e) {
         r = { content: (e as Error).message, error: true, summary: (e as Error).message };
       }
@@ -1565,22 +1602,21 @@ export async function runApp(cfg: Config, version: string) {
     return out;
   }
 
-  function runTool(name: string, input: Record<string, any>, signal: AbortSignal, C: Session): ToolResult | Promise<ToolResult> {
+  function runTool(name: string, input: Record<string, any>, signal: AbortSignal, C: Session, as: RunAs = {}): ToolResult | Promise<ToolResult> {
     const { conversation, store, note, drop, addConvRule, detail } = bound(C);
     if (name === 'read') return readTool(cwd, input as { path: string });
     if (name === 'write') return writeTool(cwd, input as { path: string; content: string });
     if (name === 'edit') return editTool(cwd, input as { path: string; old: string; new: string });
-    if (name === 'bash') return bashTool(cwd, input as { command: string }, signal);
+    if (name === 'bash') return bashTool(cwd, input as { command: string }, signal, as);
     if (name === 'rime') {
-      const text = rimeTool(String(input.action ?? ''), (input.args ?? {}) as Record<string, any>, C);
-      return { content: text, summary: text.split('\n')[0] };
+      return Promise.resolve(rimeTool(String(input.action ?? ''), (input.args ?? {}) as Record<string, any>, C, signal)).then((text) => ({ content: text, summary: text.split('\n')[0] }));
     }
     return { content: `Unknown tool ${name}.`, error: true, summary: 'unknown tool' };
   }
 
   // The rime tool (SPEC §15): Rime acting on itself. It never reads or writes API
   // keys, and it can't change permission modes or rules (it opens /permissions).
-  function rimeTool(action: string, args: Record<string, any>, C: Session = S): string {
+  function rimeTool(action: string, args: Record<string, any>, C: Session = S, signal?: AbortSignal): string | Promise<string> {
     const { conversation, store, note, drop, addConvRule, detail } = bound(C);
     const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open · tab.close · tab.focus · panel.show · panel.hide · panel.split';
     if (action === 'help') return `Actions: ${ACTIONS}\nSettings: ${settings.list().map((d) => `${d.key} (${d.values.join(' | ')}; applies ${WHEN[d.applies]})`).join(', ')}`;
@@ -1590,9 +1626,26 @@ export async function runApp(cfg: Config, version: string) {
       const d = settings.list().find((x) => x.key === args.key);
       if (!d) return `No setting ${args.key}. settings.list shows them.`;
       if (!d.values.includes(String(args.value))) return `${args.key} takes ${d.values.join(' | ')}.`;
-      const ch = settings.set(d.key, String(args.value));
-      if (ch) C.items.push({ kind: 'gear', change: ch });
-      return ch ? `Done: ${d.label.toLowerCase()} ${ch.to} (was ${ch.from}), ${WHEN[d.applies]}.` : `${d.label.toLowerCase()} was already ${args.value}.`;
+      // Letting a secret reach commands is the user's call alone.
+      if (d.key.startsWith('commands.env.')) return 'Only the user can let a secret variable through to commands, in /settings → Commands. Tell them if a command needs it.';
+      const apply = () => {
+        const ch = settings.set(d.key, String(args.value));
+        if (ch) C.items.push({ kind: 'gear', change: ch });
+        return ch ? `Done: ${d.label.toLowerCase()} ${ch.to} (was ${ch.from}), ${WHEN[d.applies]}.` : `${d.label.toLowerCase()} was already ${args.value}.`;
+      };
+      // Stopping or powering off a server asks first (SPEC §15), even as a setting.
+      if (/^server\..+\.onQuit$/.test(d.key) && args.value !== 'keep running' && d.get(cfg) !== args.value)
+        return new Promise<string>((res) => {
+          const done = (v: string | null) => {
+            C.question = null;
+            schedule();
+            res(v === 'Yes' ? apply() : 'The user said no; nothing changed.');
+          };
+          signal?.addEventListener('abort', () => done(null), { once: true });
+          C.question = { q: `Rime wants to set ${d.label.toLowerCase()} to "${args.value}". OK?`, options: [{ label: 'Yes' }, { label: 'No' }], sel: 1, tool: true, done };
+          schedule();
+        });
+      return apply();
     }
     if (action === 'command') {
       const name = String(args.name ?? '').replace(/^\/?/, '/');
@@ -1675,14 +1728,14 @@ export async function runApp(cfg: Config, version: string) {
     type Row = { kind: 'mode' | 'rule' | 'add'; m?: Mode; rule?: ReturnType<typeof ruleList>[number] };
     const rowsOf = (): Row[] => [
       ...PRESETS.map(([m]): Row => ({ kind: 'mode', m })),
-      ...ruleList(cfg.permissions, projectRules(project), S.convRules).map((rule): Row => ({ kind: 'rule', rule })),
+      ...ruleList(cfg.permissions, projRules(), S.convRules).map((rule): Row => ({ kind: 'rule', rule })),
       { kind: 'add' },
     ];
     const remove = (r: ReturnType<typeof ruleList>[number]) => {
       if (r.from === 'conversation') {
         S.convRules = { ...S.convRules, [r.kind]: (S.convRules[r.kind] ?? []).filter((x) => x !== r.pattern) };
         save((d) => d.setRules(conversation()!, S.convRules));
-      } else if (r.from === 'project') removeProjectRule(project, r.kind, r.pattern);
+      } else if (r.from === 'project') removeProjectRule(project, r.kind, r.pattern), trustRules();
       else {
         cfg.permissions = { ...cfg.permissions, [r.kind]: (cfg.permissions?.[r.kind] ?? []).filter((x) => x !== r.pattern) };
         settings.save();
@@ -1749,7 +1802,7 @@ export async function runApp(cfg: Config, version: string) {
         // committed); otherwise the rule is this conversation's.
         const m = /^(allow|ask|deny)\s+((?:bash|edit|read|fetch)\(.+\))(\s+for the team)?$/.exec(v.trim());
         if (!m) return void (error = 'A rule looks like: allow bash(npm test *), ask edit(src/**), deny read(.env), optionally ending "for the team"');
-        if (m[3]) addProjectRule(project, m[1] as 'allow', m[2]);
+        if (m[3]) addProjectRule(project, m[1] as 'allow', m[2]), trustRules();
         else addConvRule(m[1] as 'allow', m[2]);
         adding = false;
         error = '';
@@ -1764,7 +1817,7 @@ export async function runApp(cfg: Config, version: string) {
   // Which of the three answers this question offers (0 yes, 1 don't ask again, 2 no).
   function approvalOptions() {
     const a = S.approval!;
-    const again = a.use.name === 'bash' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/outside/.test(a.decision.why);
+    const again = a.use.name === 'bash' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/always asks/.test(a.decision.why);
     return again ? [0, 1, 2] : [0, 2];
   }
   // `o`: the option (0 yes, 1 don't ask again, 2 no). On screen they're numbered
@@ -2248,6 +2301,8 @@ export async function runApp(cfg: Config, version: string) {
   function setMode(m: Mode) {
     mode = m;
     say(`permission mode: ${MODE_HELP[m]}`);
+    // Without a sandbox, auto's guard list is a speed bump, not a boundary: say so.
+    if (m === 'auto' && !sandboxed('true', project)) note("This computer has no sandbox for auto mode (on Linux, install bubblewrap), so commands that run without asking aren't contained. The always-ask list catches common mistakes, not a determined model.");
     schedule();
   }
 
@@ -2395,7 +2450,8 @@ export async function runApp(cfg: Config, version: string) {
   }
 
   function submit() {
-    const v = buf.trim();
+    // A prompt that is just `exit` or `quit` means /exit; nobody sends that word to a model.
+    const v = /^(exit|quit)$/i.test(buf.trim()) && !S.declining && !S.question?.tool ? '/exit' : buf.trim();
     browsing = null;
     // "No, and tell Rime what to do instead": these words go back as the reason.
     if (S.declining && !v.startsWith('/')) {
@@ -3122,6 +3178,7 @@ export async function runApp(cfg: Config, version: string) {
     else if (conv) reopen(conv);
     past = save((d) => d.prompts(project)) ?? [];
   }
+  askTrust();
   example = exampleFor(project);
   if (!connected()) panel = createSetup(host);
   else if (cfg.model) useRef(cfg.model, true);
