@@ -57,3 +57,19 @@ test('a "~~~" inside a ``` block (a cat\'s tail) does not end it', () => {
   assert.ok(at('_,,,').includes(st2.accent), 'the second block is code');
   assert.ok(!at('Want me').includes(st2.accent));
 });
+
+test('status parts pack into rows whole, and nothing is ever cut', async () => {
+  const { packParts } = await import('../src/core/view.ts');
+  const p = (t: string, id?: string) => ({ line: [{ t, s: '' }], ...(id ? { id } : {}) });
+  const sep = { t: ' · ', s: '' };
+  const text = (rows: { line: { t: string }[] }[]) => rows.map((r) => r.line.map((x) => x.t).join(''));
+  // The first row is narrow (beside the meter); whole parts move down.
+  assert.deepEqual(text(packParts([p('ctrl-w …'), p('v split'), p('h l focus'), p('q close')], 20, 40, sep)), ['ctrl-w … · v split', 'h l focus · q close']);
+  // A part wider than any row wraps by words, nothing dropped.
+  const long = text(packParts([p('one two three four five six seven eight')], 12, 16, sep));
+  assert.equal(long.join(' ').replace(/\s+/g, ' '), 'one two three four five six seven eight');
+  assert.ok(long.every((l, i) => l.length <= (i ? 16 : 12)));
+  // Hits follow their part onto the row it landed on.
+  const rows = packParts([p('aaaa', 'a'), p('bbbb', 'b')], 6, 20, sep);
+  assert.deepEqual(rows.map((r) => r.hits.map((h) => `${h.id}:${h.x0}-${h.x1}`)), [['a:1-4'], ['b:1-4']]);
+});

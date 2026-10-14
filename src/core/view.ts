@@ -261,6 +261,34 @@ export function hang(l: Line, width: number, n: number): Line[] {
   return wrap(l, width, Math.max(1, width - n)).map((x, i) => (i ? [run(' '.repeat(n)), ...x] : x));
 }
 
+// The status line's parts packed into rows, never cut: whole parts, in order; the
+// first row is `first` cells (beside the meter), the rest `width`. A part wider
+// than a row on its own wraps word by word. Each part with an id is a hit.
+export function packParts(parts: { line: Line; id?: string }[], first: number, width: number, sep: Run): { line: Line; hits: Hit[] }[] {
+  const rows: { line: Line; hits: Hit[] }[] = [{ line: [], hits: [] }];
+  const room = () => Math.max(1, rows.length === 1 ? first : width);
+  for (const p of parts) {
+    let r = rows.at(-1)!;
+    const need = lineWidth(p.line) + (r.line.length ? lineWidth([sep]) : 0);
+    if (r.line.length && lineWidth(r.line) + need > room()) rows.push((r = { line: [], hits: [] }));
+    if (r.line.length) r.line.push(sep);
+    const free = room() - lineWidth(r.line);
+    if (lineWidth(p.line) <= free) {
+      r.line.push(...p.line);
+      if (p.id) r.hits.push({ x0: lineWidth(r.line) - lineWidth(p.line) + 1, x1: lineWidth(r.line), id: p.id });
+      continue;
+    }
+    // Too wide even on a row of its own: wrapped, its pieces on rows of their own.
+    const pieces = wrap(p.line, free, width);
+    pieces.forEach((piece, i) => {
+      if (i) rows.push((r = { line: [], hits: [] }));
+      r.line.push(...piece);
+      if (p.id) r.hits.push({ x0: lineWidth(r.line) - lineWidth(piece) + 1, x1: lineWidth(r.line), id: p.id });
+    });
+  }
+  return rows;
+}
+
 // Key hints that wrap instead of being cut off: [key, label, label style] pairs.
 // ' · ' in a label ends a group (`ctrl+r rename`); a label without it joins the
 // next pair to its group (`→ or enter open`). Groups never split: one that doesn't
@@ -288,6 +316,14 @@ export function hintLines(hints: Hint[], width: number, st: Styles): { lines: Li
   for (const gr of groups) {
     let l = lines.at(-1)!;
     if (l.length && lineWidth(l) + 3 + lineWidth(gr.line) > width) lines.push((l = [])), segs.push([]);
+    // A group wider than the whole line wraps word by word (its keys stay
+    // clickable on the first piece); nothing is cut.
+    if (!l.length && lineWidth(gr.line) > width) {
+      const pieces = wrap(gr.line, width);
+      for (const { x: kx, k } of gr.keys) if (kx + strWidth(k) <= lineWidth(pieces[0])) segs.at(-1)!.push({ x0: kx + 1, x1: kx + strWidth(k), id: `key:${k.split(' ')[0]}` });
+      pieces.forEach((piece, i) => (i ? (lines.push([...piece]), segs.push([])) : l.push(...piece)));
+      continue;
+    }
     if (l.length) l.push(run(' · ', st.dim));
     const x = lineWidth(l);
     for (const { x: kx, k } of gr.keys) {

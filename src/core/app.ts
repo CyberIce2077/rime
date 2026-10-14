@@ -26,7 +26,7 @@ import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } f
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
 import { colorMode, sgr } from './theme.ts';
 import { previewBox, sendLine, sendList } from './preview.ts';
-import { type BoxRow, type Hint, type Hit, type Item, box, caretOf, footRows, hintLines, layoutInput, listRow, offsetAt, prompt, renderItem, spaced, splitToolCalls, status, str, styles } from './view.ts';
+import { type BoxRow, type Hint, type Hit, type Item, box, caretOf, footRows, hintLines, packParts, layoutInput, listRow, offsetAt, prompt, renderItem, spaced, splitToolCalls, status, str, styles } from './view.ts';
 import { type Turn, addTurns, createMeter, fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
 import * as llama from '../providers/llamacpp.ts';
 import { PRESETS } from '../providers/presets.ts';
@@ -773,7 +773,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const key = (t: string) => ({ t, s: st.accentB });
       const parts: { line: Line; id?: string }[] = [];
       if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
-      if (prefix) parts.push({ line: [key('ctrl-w'), dim(' … v split · h l focus · q close · 1-9 tab · n p · z hide')] });
+      // After ctrl-w: its keys, each a group of its own so they wrap whole.
+      if (prefix) for (const [k, l] of [['ctrl-w', ' …'], ['v', ' split'], ['h l', ' focus'], ['q', ' close'], ['1-9', ' tab'], ['n p', ' next / previous'], ['z', ' hide']]) parts.push({ line: [key(k), dim(l)] });
       if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
       if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl-w z')], id: 'panel' });
       else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl-w l'), dim(' panel')], id: 'panel' });
@@ -798,18 +799,18 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       // Parts are never cut: what doesn't fit beside the meter moves to a line
       // below, whole, in the same order.
       const room = width - lineWidth(rightLine()) - 2;
-      const rowsOut: { line: Line; hits: Hit[] }[] = [{ line: [], hits: [] }];
-      for (const p of parts) {
-        let r = rowsOut.at(-1)!;
-        const fits = (rowsOut.length === 1 ? room : width - 1) - lineWidth(r.line) - (r.line.length ? 3 : 0) >= lineWidth(p.line);
-        if (r.line.length && !fits) rowsOut.push((r = { line: [], hits: [] }));
-        if (r.line.length) r.line.push(dim(' · '));
-        r.line.push(...p.line);
-        if (p.id) r.hits.push({ x0: lineWidth(r.line) - lineWidth(p.line) + 1, x1: lineWidth(r.line), id: p.id });
-      }
+      const rowsOut = packParts(parts, room, width - 1, dim(' · '));
       left = rowsOut[0].line;
       leftHits = rowsOut[0].hits;
       more.push(...rowsOut.slice(1));
+    }
+    // A one-off message that doesn't fit beside the meter wraps below it too.
+    const room0 = width - lineWidth(rightLine()) - 2;
+    if (!more.length && lineWidth(left) > room0) {
+      const [head, ...rest] = packParts([{ line: left }], room0, width - 1, { t: ' · ', s: st.dim });
+      left = head.line;
+      leftHits = leftHits.filter((h) => h.x1 <= lineWidth(left));
+      more.push(...rest);
     }
     const s = status(left, rightLine(), width, st, leftHits, stoppable() ? [{ x0: 1, x1: lineWidth(meterLine()), id: 'meter' }, { x0: lineWidth(meterLine()) + 4, x1: lineWidth(rightLine()), id: 'key:esc' }] : undefined);
     lines.push(s.line);
