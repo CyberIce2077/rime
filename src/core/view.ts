@@ -354,7 +354,8 @@ export function box(legend: string | Line, rows: BoxRow[], width: number, st: St
   const hits: Hit[][] = [closeId ? [{ x0: width - 4, x1: width - 2, id: closeId }] : []];
   // Hint rows become as many lines as the keys need.
   rows = rows.flatMap((r) => {
-    if (r.hang !== undefined && lineWidth(r.line) > inner - 2) return hang(r.line, inner - 2, r.hang).map((line, i) => ({ ...r, line, hang: undefined, segs: i ? undefined : r.segs }));
+    // Nothing in a box is cut: a row too wide wraps, under its text (`hang`).
+    if (!r.rule && !r.hints && lineWidth(r.line) > inner - 2) return hang(r.line, inner - 2, r.hang ?? 0).map((line, i) => ({ ...r, line, hang: undefined, segs: i ? undefined : r.segs }));
     if (!r.hints) return [r];
     const h = hintLines(r.hints, inner - 2, st);
     return h.lines.map((line, i) => ({ line, segs: h.segs[i] }));
@@ -473,12 +474,20 @@ export function prompt(buf: string, cursor: number, width: number, maxRows: numb
   const first = Math.max(0, Math.min(caret.row - maxRows + 1, rows.length - maxRows));
   const shown = rows.slice(first, first + maxRows);
   const lines = [str([run('╭' + '─'.repeat(width - 2) + '╮', border)], st)];
+  // The placeholder and a suggestion are hints: they wrap onto more rows of the
+  // box instead of ending in "…". Your own text keeps its layout (the caret's too).
+  const row = (l: Line) => lines.push(str([run('│ ', border), ...fit(l, inner), run(' │', border)], st));
+  const after = (typed: Line, extra: Line) => {
+    const free = inner - lineWidth(typed);
+    if (lineWidth(extra) <= free) return row([...typed, ...extra]);
+    const pieces = free >= 8 ? wrap(extra, free, inner - 2) : [[], ...wrap(extra, inner - 2)];
+    pieces.forEach((p, k) => row(k ? [run('  '), ...p] : [...typed, ...p]));
+  };
   shown.forEach((r, i) => {
     const lead = first + i === 0 ? run('› ', st.accentB) : run('  ');
     const text: Line = [];
-    if (!buf) text.push(run(placeholder, st.placeholder));
     const hint = o.tabHint && first + i === rows.length - 1 ? [run('  '), run('tab', st.accentB), run(' to accept', st.dim)] : [];
-    if (!buf) text.push(...hint);
+    if (!buf) return after([lead], [run(placeholder, st.placeholder), ...hint]);
     let at = r.start;
     for (const ch of r.text) {
       const selected = !!o.sel && at >= o.sel[0] && at < o.sel[1];
@@ -487,8 +496,8 @@ export function prompt(buf: string, cursor: number, width: number, maxRows: numb
       else text.push(run(ch, selected ? st.selection : st.title));
       at += ch.length;
     }
-    if (o.ghost && buf && first + i === rows.length - 1) text.push(run(o.ghost, st.placeholder), ...hint);
-    lines.push(str([run('│ ', border), ...fit([lead, ...text], inner, !buf || !!o.ghost), run(' │', border)], st));
+    if (o.ghost && first + i === rows.length - 1) return after([lead, ...text], [run(o.ghost, st.placeholder), ...hint]);
+    row([lead, ...text]);
   });
   // With more than one line the frame shows the count and the keys (clickable).
   const hits: Hit[] = [];

@@ -14,10 +14,13 @@ test('input layout wraps rows and places the caret', () => {
 
 test('prompt box is full width with the caret after "› "', () => {
   const p = prompt('', 0, 40, 5, st);
-  assert.equal(p.lines.length, 3);
   assert.ok(p.lines.every((l) => strWidth(l) === 40));
   assert.match(stripAnsi(p.lines[1]), /^│ › ask Rime/);
   assert.deepEqual(p.cursor, { row: 1, col: 4 });
+  // The placeholder is a hint: too long for the box, it wraps instead of ending in "…".
+  const all = p.lines.slice(1, -1).map((l) => stripAnsi(l).slice(2, -2).trim()).join(' ').replace(/^› /, '');
+  assert.equal(all, 'ask Rime to change some code, @ a file, paste a screenshot, or / for commands');
+  assert.equal(prompt('', 0, 120, 5, st).lines.length, 3, 'one row when it fits');
 });
 
 test('a reply is indented two cells and uses the whole width', () => {
