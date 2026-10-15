@@ -425,7 +425,7 @@ export function createModelPicker(
 
 // ---- /settings ----
 
-type SettingsHost = Host & { settings: Settings; current(): Model | undefined; openModel(): void; openSteps(name: string): void; openConnect(): void; rename(from: string, to: string): string | null };
+type SettingsHost = Host & { published?: boolean; settings: Settings; current(): Model | undefined; openModel(): void; openSteps(name: string): void; openConnect(): void; rename(from: string, to: string): string | null };
 type Row = { group: string; label: string; help: string; kind: 'value' | 'action' | 'undo'; key?: string; go?: () => void; change?: Change; provider?: string };
 
 // Every setting in one box, grouped, changed in place and applied live (SPEC §15).
@@ -437,6 +437,7 @@ export function createSettingsPanel(h: SettingsHost): Panel {
   let filter = '';
   let renaming: string | null = null; // the provider being renamed (its new name is typed in the prompt)
   let error = '';
+  let envOpen = false; // Commands: the hidden variables, one row until enter opens them
   const ago = (t: number) => {
     const s = Math.round((Date.now() - t) / 1000);
     return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : `${Math.floor(s / 3600)} h ago`;
@@ -444,6 +445,8 @@ export function createSettingsPanel(h: SettingsHost): Panel {
 
   function rows(): Row[] {
     const defs = settings.list();
+    const env = defs.filter((d) => d.group === 'Commands');
+    const passed = env.filter((d) => settings.get(d.key) === 'passed').length;
     const out: Row[] = [
       { group: 'Model', label: 'Model', help: `${h.current()?.label ?? 'none'} · enter picks one`, kind: 'action', go: h.openModel },
       ...defs.filter((d) => d.group === 'Model').map((d): Row => ({ group: 'Model', label: d.label, help: d.help, kind: 'value', key: d.key })),
@@ -451,8 +454,9 @@ export function createSettingsPanel(h: SettingsHost): Panel {
       { group: 'Providers', label: 'Add a provider or URL', help: '/connect', kind: 'action', go: h.openConnect },
       ...defs.filter((d) => d.group === 'Server').map((d): Row => ({ group: 'Server', label: d.label, help: d.help, kind: 'value', key: d.key })),
       ...Object.entries(cfg.providers).filter(([, p]) => p.ssh).map(([name]): Row => ({ group: 'Server', label: `${name}: steps`, help: 'the commands that bring it up', kind: 'action', go: () => h.openSteps(name) })),
-      ...defs.filter((d) => d.group === 'Commands').map((d): Row => ({ group: 'Commands', label: d.label, help: d.help, kind: 'value', key: d.key })),
-      ...defs.filter((d) => d.group === 'Updates').map((d): Row => ({ group: 'Updates', label: d.label, help: d.help, kind: 'value', key: d.key })),
+      ...(envOpen || filter ? env.map((d): Row => ({ group: 'Commands', label: d.label, help: d.help, kind: 'value', key: d.key })) : env.length ? [{ group: 'Commands', label: 'Hidden from commands', help: `${env.length} variable${env.length === 1 ? '' : 's'}${passed ? `, ${passed} passed` : ''} · enter to choose`, kind: 'action', go: () => void (envOpen = true) } as Row] : []),
+      // Unpublished, Rime has nowhere to look, so the setting doesn't promise it.
+      ...defs.filter((d) => d.group === 'Updates').map((d): Row => (h.published === false ? { group: 'Updates', label: d.label, help: 'off until Rime is published', kind: 'action', go: () => {} } : { group: 'Updates', label: d.label, help: d.help, kind: 'value', key: d.key })),
       ...settings.recent().slice(0, 5).map((c): Row => ({ group: 'Recent changes', label: `${c.label} ${c.to}`, help: c.undone ? 'undone' : `was ${c.from} · ${ago(c.at)} · enter undoes`, kind: 'undo', change: c })),
     ];
     const f = filter.toLowerCase();
@@ -465,6 +469,8 @@ export function createSettingsPanel(h: SettingsHost): Panel {
       pick = Math.min(pick, Math.max(0, list.length - 1));
       const out: BoxRow[] = [];
       let group = '';
+      // Long variable names keep their full width (the values move right).
+      const labelW = Math.max(26, ...list.filter((r) => r.kind === 'value').map((r) => r.label.length));
       list.forEach((r, i) => {
         if (r.group !== group) {
           if (group) out.push({ line: [] });
@@ -473,8 +479,8 @@ export function createSettingsPanel(h: SettingsHost): Panel {
         }
         if (r.kind === 'value') {
           const v = settings.get(r.key!) ?? '';
-          const row = settingRow(r.label, v, i === pick, st, `pick:${i}`);
-          out.push({ ...row, line: [{ t: i === pick ? '› ' : '  ', s: st.accent }, ...row.line.slice(0, 1).map((x) => ({ ...x, t: x.t.slice(0, 26) })), ...row.line.slice(1), dim(`  ${r.help}`)] });
+          const row = settingRow(r.label, v, i === pick, st, `pick:${i}`, labelW);
+          out.push({ ...row, line: [{ t: i === pick ? '› ' : '  ', s: st.accent }, ...row.line, dim(`  ${r.help}`)], hang: labelW + 25 });
         } else out.push(listRow(r.label, r.kind === 'undo' && r.change?.undone ? [dim(r.help)] : r.help, i === pick, st, `pick:${i}`, 28));
       });
       if (!list.length) out.push({ line: [dim(`no setting matches ${filter}`)] });
@@ -502,6 +508,7 @@ export function createSettingsPanel(h: SettingsHost): Panel {
       }
       if (k.name === 'escape') {
         if (filter) return h.setBuffer(''), (filter = ''), true;
+        if (envOpen) return (envOpen = false), (pick = 0), true;
         return h.close(), true;
       }
       if (k.name === 'up') return (pick = (pick + list.length - 1) % Math.max(1, list.length), true);

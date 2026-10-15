@@ -488,9 +488,13 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
 
   const START: [string, string][] = [
     ['My own server', 'llama.cpp on another computer, over ssh'],
-    ['This computer', 'llama.cpp on this machine'],
+    ['This computer', 'llama.cpp, Ollama, LM Studio or vLLM on this machine'],
     ['A provider', 'OpenRouter, OpenAI, Anthropic, DeepSeek, Groq, …'],
   ];
+  // A provider whose key is already in the environment is the likely choice: first,
+  // preselected, one enter away.
+  const found = HOSTED.find((p) => PRESETS[p].keyEnv && process.env[PRESETS[p].keyEnv!]);
+  const starts = (): [string, string][] => (found ? [[`Use ${PRESETS[found].label}`, `${PRESETS[found].keyEnv} found`], ...START] : START);
   const RESUME: [string, string][] = [
     ['Continue', 'pick up where you stopped, with your answers'],
     ['Start over', 'forget the answers and begin at screen 1'],
@@ -603,7 +607,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
             { line: [plain(any ? 'How do you want to run Rime?' : 'No model is connected yet. How do you want to run Rime?')] },
             ...why('Nothing is installed, changed or saved until you confirm at the end.'),
             blank,
-            ...START.map(([n, d], i) => listRow(n, d, i === pick, st, `pick:${i}`, 22)),
+            ...starts().map(([n, d], i) => listRow(n, d, i === pick, st, `pick:${i}`, 22)),
           ],
           foot: ['↑ ↓', ' choose · ', 'enter', ' next · ', 'esc', ' later · ', ...CANCEL],
         };
@@ -768,14 +772,22 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
       }
       if (screen === 'start') {
         if (k.name === 'escape') return say('Setup closed. Run /setup when you\'re ready.'), h.close(), true;
-        if (nav(START.length)) return true;
+        if (nav(starts().length)) return true;
         if (k.name === 'enter') {
           filter = '';
-          if (pick === 0) {
+          if (found && pick === 0) {
+            preset = found;
+            fromLocal = false;
+            key = '';
+            void testKey();
+            return true;
+          }
+          const at = pick - (found ? 1 : 0);
+          if (at === 0) {
             screen = 'where';
             typed = host;
             h.setBuffer(host);
-          } else if (pick === 1) {
+          } else if (at === 1) {
             screen = 'local';
             lookLocal();
           } else screen = 'providers';
@@ -879,7 +891,7 @@ export function createSetup(h: Host, start: 'start' | 'steps' | 'connect' = 'sta
       }
       if (screen === 'providers') {
         const list = filtered(HOSTED, (p) => PRESETS[p].label);
-        if (k.name === 'escape') return (screen = 'start', pick = 2, filter = '', h.setBuffer(''), true);
+        if (k.name === 'escape') return (screen = 'start', pick = found ? 3 : 2, filter = '', h.setBuffer(''), true);
         if (nav(list.length)) return true;
         if (k.name === 'enter' && list[pick]) {
           preset = list[pick];

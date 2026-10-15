@@ -22,7 +22,7 @@ import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from 
 import { toolEvents } from './timeline.ts';
 import { parse as parseQuery, rank, suggestions } from './rank.ts';
 import { type Config, rimeDir, saveConfig } from './config.ts';
-import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } from './header.ts';
+import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, shortPath, tildify } from './header.ts';
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
 import { colorMode, sgr } from './theme.ts';
 import { previewBox, sendLine, sendList } from './preview.ts';
@@ -195,7 +195,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // Permissions (SPEC §17): the mode for this session, the open question, and
   // the last decisions for /permissions.
   let mode: Mode = 'ask';
-  const decisions: { at: number; tool: string; what: string; verdict: string; why: string }[] = [];
+  const decisions: { at: number; tool: string; what: string; verdict: string; why: string; src?: object; answered?: string }[] = [];
   let example = ''; // `Try "…"` on an empty prompt, from this project
   // "Don't ask again" rules belong to this conversation and are saved with it.
   const addConvRule = (kind: 'allow' | 'ask' | 'deny', pattern: string) => bound(S).addConvRule(kind, pattern);
@@ -205,6 +205,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let browsing: { list: string[]; i: number; draft: string; edited?: boolean } | null = null;
   let navigated = false;
   let cleared = ''; // the prompt ctrl+c cleared, first on ↑
+  let heldPrompt: string | null = null; // sent with no model: waits for /setup
   const cwd = process.cwd();
   // The tools a new conversation freezes: the core ones, plus enabled plug-ins'.
   const toolsNow = (): ToolDef[] => [...TOOLS, ...(cfg.plugins?.browser ? [BROWSER_TOOL] : []), ...(cfg.plugins?.design ? [DESIGN_TOOL] : [])];
@@ -323,6 +324,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // stays on its text while you scroll; elsewhere it is in screen cells.
   let selection: { a: { x: number; y: number }; b: { x: number; y: number }; log: boolean } | null = null;
   let pointer = { x: 0, y: 0 }; // where the mouse is during a drag
+  let hoverRow = 0; // the screen row under the mouse: a message's ◆ shows only there (or once pinned)
   let edgeScroll: NodeJS.Timeout | null = null; // dragging past the top or bottom scrolls
   let top = 0; // transcript line shown on the first row
   let logLines: string[] = [];
@@ -330,7 +332,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
 
   let header!: Header;
   const headerOpts: HeaderOpts & { ready: (h: Header) => void } = {
-    version, cwd, mode: st.mode, interactive: false,
+    version, cwd, mode: st.mode, interactive: false, cols: () => CW(),
     onFrame: () => schedule(),
     ready: (h) => (header = h),
   };
@@ -758,9 +760,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     // The prompt grows to 10 rows (at most a third of the screen), then scrolls.
     const maxRows = Math.max(1, Math.min(10, Math.floor(height / 3), height - lines.length - 3 - (sent.length ? 1 : 0)));
     const p = prompt(buf, cur, width, maxRows, st, {
-      placeholder: panel?.placeholder?.() ?? (S.declining ? 'tell Rime what to do instead' : S.question ? 'pick one above, or type your own answer' : S.resumeOk ? (pendingUses(S).length ? 'enter asks the open question again, or ask something new' : 'enter continues the interrupted reply, or ask something new') : S.nextStep ? S.nextStep : unloaded() ? `load ${unloaded()}` : example && !S.messages.length ? `Try "${example}"` : undefined),
+      placeholder: panel?.placeholder?.() ?? (S.approval ? 'answer above' : S.declining ? 'tell Rime what to do instead' : S.question ? 'pick one above, or type your own answer' : S.resumeOk ? (pendingUses(S).length ? 'enter asks the open question again, or ask something new' : 'enter continues the interrupted reply, or ask something new') : S.nextStep ? S.nextStep : unloaded() ? `load ${unloaded()}` : example && !S.messages.length && connected() ? `Try "${example}"` : undefined),
       // A suggestion shows the key that takes it.
-      tabHint: !panel && !S.declining && !S.resumeOk && (buf ? !!ghost() : !!(S.nextStep || unloaded() || (example && !S.messages.length))),
+      tabHint: !panel && !S.approval && !S.declining && !S.resumeOk && (buf ? !!ghost() : !!(S.nextStep || unloaded() || (example && !S.messages.length && connected()))),
       masked: panel?.masked?.() ?? false,
       sel: range() ?? undefined,
       chip: chipView,
@@ -828,10 +830,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         : mode === 'plan' ? ['⏸', 'plan', st.accentB]
         : mode === 'god' ? ['⏵⏵⏵⏵', 'god mode', st.del]
         : ['⏵⏵⏵', 'auto', st.warn];
-      parts.push({ line: [{ t: `${icon} ${name}`, s: ms }, dim(' shift+tab')], id: 'mode' });
-      parts.push({ line: [key('←'), dim(' conversations')], id: 'conversations' });
-      parts.push({ line: [key('/'), dim(' for commands')], id: '/' });
-      parts.push({ line: [key('?'), dim(' for shortcuts')], id: '?' });
+      // Short labels keep it to one row down to about 85 columns; each part is clickable.
+      parts.push({ line: [{ t: `${icon} ${name}`, s: ms }], id: 'mode' });
+      parts.push({ line: [key('←'), dim(' chats')], id: 'conversations' });
+      parts.push({ line: [key('/'), dim(' commands')], id: '/' });
+      parts.push({ line: [key('?'), dim(' keys')], id: '?' });
       // Parts are never cut: what doesn't fit beside the meter moves to a line
       // below, whole, in the same order.
       const room = width - lineWidth(rightLine()) - 2;
@@ -928,6 +931,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (back >= 0) hits.push({ row: r2, x0: strWidth(l2.slice(0, back)) + 1, x1: strWidth(l2.slice(0, back)) + 15, id: 'conversations' });
     const marks = rows.map(() => '');
     for (const { y, x0, x1 } of selectionSpans(width)) marks[y - 1] += `\x1b[${y};${x0}H${st.selection}${sliceCols(rows[y - 1], x0, x1).padEnd(x1 - x0 + 1)}${st.reset}`;
+    for (const h of hits) if (h.id.startsWith('pin:') && h.row !== hoverRow && !(S.items[+h.id.slice(4)] as { pinned?: boolean })?.pinned) marks[h.row - 1] += `\x1b[${h.row};${h.x0}H${st.reset} `;
     // Split: the panel takes the columns right of the chat, top to bottom.
     if (L.px) {
       const v = side.render(full - width, height, sideFocus);
@@ -2106,12 +2110,14 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         const inp = (u.input ?? {}) as Record<string, any>;
         // The design tool writes design/<name>.html: the same check as a write.
         const d = u.name === 'design' ? decide('write', { path: designFile(designSlug(String(inp.name ?? 'page'))), content: inp.html }, permCtx(C)) : decide(String(u.name), inp, permCtx(C));
-        decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why });
+        decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why, src: d });
         decisions.length = Math.min(decisions.length, 50);
         return d;
       },
       approve: async (u, d, signal) => {
         const answer = await ask(u, d, signal, C);
+        const e = decisions.find((x) => x.src === d);
+        if (e) e.answered = answer === 'no' ? 'no' : answer === 'stop' ? 'stopped' : 'yes';
         if (answer === 'stop') return 'stop';
         if (answer === 'no') {
           C.items.push({ kind: 'lines', lines: [[{ t: '✗ ', s: st.del }, { t: 'declined ', s: st.dim }, { t: `${describe(u).verb} ${describe(u).rest}`, s: st.title }, { t: ' · tell Rime what to do instead', s: st.dim }]] });
@@ -2480,7 +2486,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         if (error) out.push({ line: [{ t: error, s: st.warn }] });
         out.push({ line: [] }, { line: [dim('Recent decisions')] });
         if (!decisions.length) out.push({ line: [dim('  none yet')] });
-        for (const d of decisions.slice(0, 6)) out.push({ line: [{ t: d.verdict === 'allow' ? '  ✓ ' : d.verdict === 'deny' ? '  ✗ ' : '  ? ', s: d.verdict === 'deny' ? st.del : d.verdict === 'allow' ? st.ok : st.warn }, { t: d.what, s: st.fg }, dim(` · ${d.why}`)] });
+        for (const d of decisions.slice(0, 6)) out.push({ line: [{ t: d.verdict === 'allow' ? '  ✓ ' : d.verdict === 'deny' ? '  ✗ ' : '  ? ', s: d.verdict === 'deny' ? st.del : d.verdict === 'allow' ? st.ok : st.warn }, { t: d.what, s: st.fg }, dim(` · ${d.why}`), ...(d.answered ? [{ t: ` → ${d.answered}`, s: d.answered === 'yes' ? st.ok : st.del }] : [])] });
         return { legend: [{ t: 'permissions', s: st.accent }, dim(` · ${MODE_HELP[mode]}`)], rows: out, foot: adding ? ['enter', ' add · ', 'esc', ' back'] : ['↑ ↓', ' choose · ', 'enter', ' pick · ', 'd', ' remove a rule · ', 'esc', ' close'] };
       },
       placeholder: () => (adding ? 'allow bash(npm test *)' : 'Pick a mode or a rule'),
@@ -2594,7 +2600,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const title = u.name === 'browser' ? 'open a web page?' : u.name === 'bash' ? 'run a command?' : u.name === 'write' ? (fs.existsSync(path.resolve(cwd, String(i.path))) ? 'replace a file?' : 'create a file?') : u.name === 'edit' ? 'edit a file?' : 'read a file?';
     if (u.name === 'bash') {
       for (const l of String(i.command ?? '').split('\n').slice(0, 6)) rows.push({ line: [{ t: '$ ', s: st.dim }, { t: l, s: st.titleB }], bg: st.panelBg });
-      rows.push({ line: [dim(`in ${tildify(cwd)}`), ...(i.reason ? [dim(' · '), { t: 'Rime: ', s: st.fg }, dim(String(i.reason))] : [])] });
+      // The folder only when it isn't the project's own.
+      const where = path.resolve(cwd) === path.resolve(project) ? [] : [dim(`in ${tildify(rel(project, cwd))}`)];
+      const why = i.reason ? [{ t: 'Rime: ', s: st.fg }, dim(String(i.reason))] : [];
+      if (where.length || why.length) rows.push({ line: [...where, ...(where.length && why.length ? [dim(' · ')] : []), ...why] });
       if (d.parts && d.parts.length > 1)
         rows.push({ line: d.parts.flatMap((p, j) => [...(j ? [dim(' · ')] : []), { t: `${p.state === 'ok' ? '✓' : p.state === 'guard' ? '✗' : '?'} ${p.text}`, s: p.state === 'ok' ? st.ok : p.state === 'guard' ? st.del : st.warn }, ...(p.why ? [dim(` ${p.why}`)] : [])]) });
     } else if (u.name === 'browser') rows.push({ line: [{ t: String(i.url ?? ''), s: st.titleB }], bg: st.panelBg });
@@ -2796,7 +2805,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         { t: ' conversations', s: st.titleB },
         // What just happened (renamed, deleted, why not), in place of the project
         // for a moment, since the status line is hidden here.
-        ...(flash ? (flash.text.startsWith('✓') ? [{ t: ' · ✓', s: st.ok }, dim(flash.text.slice(1))] : [{ t: ` · ${flash.text}`, s: st.warn }]) : [dim(`${L.all ? ' · all projects' : ` · ${tildify(project)}`} · ${searching ? 'searching' : SORTS[L.sort]}`)]),
+        ...(flash ? (flash.text.startsWith('✓') ? [{ t: ' · ✓', s: st.ok }, dim(flash.text.slice(1))] : [{ t: ` · ${flash.text}`, s: st.warn }]) : [dim(`${L.all ? ' · all projects' : ` · ${shortPath(tildify(project), width - 34)}`} · ${searching ? 'searching' : SORTS[L.sort]}`)]),
       ],
       [{ t: ' › ', s: st.accentB }, L.filter ? { t: L.filter, s: st.title } : { t: 'search, or describe the conversation', s: st.placeholder }],
       ...(sugg.length ? [suggLine] : []),
@@ -2830,16 +2839,19 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const on = i === L.pick;
       const why = r.id !== null ? L.found?.why.get(r.id) : undefined;
       const when = ago(r.updated);
-      const meta: Line = searching && why
-        ? [{ t: why.reason, s: st.accent }]
-        : [dim([L.all && r.project !== project ? tildify(r.project) : '', r.model?.split('/').pop(), r.tokens ? `${fmtK(r.tokens)} tokens` : '', r.last ? `${markOf(timelineOf(r.id!, r.updated).at(-1)?.kind ?? '')} ${r.last}` : ''].filter(Boolean).join(' · '))];
+      const parts = [L.all && r.project !== project ? tildify(r.project) : '', r.model?.split('/').pop(), r.tokens ? `${fmtK(r.tokens)} tokens` : '', r.last ? `${markOf(timelineOf(r.id!, r.updated).at(-1)?.kind ?? '')} ${r.last}` : ''].filter((x): x is string => !!x);
       const tw = Math.max(8, Math.min(strWidth(r.title) + 1, lw - 4 - when.length - 2 - 12));
       const title =
         on && L.edit !== undefined ? [{ t: L.edit.slice(-(tw - 1)), s: L.fresh ? st.selection : st.title }, { t: '▏', s: st.accent }]
         : fit([{ t: r.title, s: on && confirm.includes(r) ? st.del : on ? st.accentB : r.session === S ? st.titleB : st.title }], tw);
       const mark = r.id !== null && L.picked.has(r.id) ? { t: '✓', s: st.ok } : { t: on ? '›' : ' ', s: st.accent };
       const head: Line = [mark, dotOf(r), ...title, { t: ' ', s: '' }, dim(when), { t: '  ', s: '' }];
-      left.push({ line: [...head, ...fit(meta, Math.max(0, lw - lineWidth(head)))], i });
+      // Whole parts only, never "±…": what doesn't fit is in the preview.
+      const room = Math.max(0, lw - lineWidth(head));
+      let m = '';
+      for (const x of parts) if (strWidth(m ? `${m} · ${x}` : x) <= room) m = m ? `${m} · ${x}` : x;
+      const meta: Line = searching && why ? fit([{ t: why.reason, s: st.accent }], room) : [dim(m)];
+      left.push({ line: [...head, ...meta], i });
     });
     if (!rows.length) left.push({ line: [dim(L.filter ? ' No conversation matches. Try fewer words, or a file name.' : ' No conversations yet. n starts one.')] });
     const selAt = left.findIndex((l) => l.i === L.pick);
@@ -3067,14 +3079,17 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   const host: Host & Parameters<typeof createServer>[0] & Parameters<typeof createModelPicker>[0] & Parameters<typeof createSettingsPanel>[0] = {
     st,
     cfg,
+    published: updates,
     get system() {
       return S.system;
     },
     redraw: () => schedule(),
     close: () => {
       panel = null;
-      buf = '';
-      cur = 0;
+      buf = heldPrompt ?? '';
+      cur = buf.length;
+      heldPrompt = null;
+      if (buf && connected() && model) submit();
       schedule();
     },
     setBuffer: (s) => {
@@ -3267,6 +3282,15 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     // A model that can't see: ask before sending the text without the images.
     // ponytail: the router (Phase 7) will move the task to a connected model that can see.
     if (!v.startsWith('/') && blind() && hasMedia(v) && !blindAsk) return void (blindAsk = true);
+    // No model yet: the message waits while /setup connects one, then goes; a
+    // setup closed early puts it back in the prompt.
+    if (!v.startsWith('/') && !connected()) {
+      heldPrompt = buf;
+      buf = '';
+      cur = 0;
+      anchor = null;
+      return void (panel = createSetup(host));
+    }
     const see = !blindAsk;
     blindAsk = false;
     buf = '';
@@ -3621,7 +3645,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       return void (sel = (sel + (k.name === 'down' ? 1 : n - 1)) % n);
     }
     // On an empty prompt, tab or → takes the suggestion (the next step, or the example).
-    if (!buf && !panel && !S.declining && (k.name === 'tab' || (k.name === 'right' && !k.shift)) && (S.nextStep || unloaded() || (example && !S.messages.length))) return insert(S.nextStep || (unloaded() ? `load ${unloaded()}` : example));
+    if (!buf && !panel && !S.declining && (k.name === 'tab' || (k.name === 'right' && !k.shift)) && (S.nextStep || unloaded() || (example && !S.messages.length && connected()))) return insert(S.nextStep || (unloaded() ? `load ${unloaded()}` : example));
     // tab, or → at the end, takes the ghost text.
     const g = ghost();
     if (g && (k.name === 'tab' || (k.name === 'right' && !k.shift && !k.ctrl))) return insert(g);
@@ -3801,7 +3825,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         const h = chipAt(ev.x, ev.y);
         const overList = hits.some((x) => x.id === 'sendlist' && x.row === ev.y && ev.x >= x.x0 && ev.x <= x.x1);
         const open = listPinned || overList;
-        if (h === hover && open === listOpen) return;
+        const pinRow = (y: number) => hits.some((x) => x.row === y && x.id.startsWith('pin:'));
+        const moved = ev.y !== hoverRow && (pinRow(ev.y) || pinRow(hoverRow));
+        hoverRow = ev.y;
+        if (h === hover && open === listOpen && !moved) return;
         hover = h;
         listOpen = open;
       } else if (ev.button === 0 && !ev.release) {

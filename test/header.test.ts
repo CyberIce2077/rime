@@ -109,3 +109,10 @@ test('every snowfall lasts 3 to 10 s at 120 ms a frame (SPEC §4.1)', () => {
     assert.ok(ticks * 120 >= 3000 && ticks * 120 <= 10000, `seed ${seed}: ${ticks * 120} ms`);
   }
 });
+
+test('a long folder is shortened in the middle, never cut at the edge', async () => {
+  const { shortPath } = await import('../src/core/header.ts');
+  assert.equal(shortPath('~/a/b', 20), '~/a/b');
+  assert.equal(shortPath('~/projects/x/scratchpad/proj', 20), '~/…/scratchpad/proj');
+  assert.equal(shortPath('/private/tmp/abcdefghijklmnop', 12), '…/abcdefghijklmnop');
+});

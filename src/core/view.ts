@@ -270,7 +270,9 @@ export function packParts(parts: { line: Line; id?: string }[], first: number, w
   for (const p of parts) {
     let r = rows.at(-1)!;
     const need = lineWidth(p.line) + (r.line.length ? lineWidth([sep]) : 0);
-    if (r.line.length && lineWidth(r.line) + need > room()) rows.push((r = { line: [], hits: [] }));
+    // A part that doesn't fit moves down whole; it wraps only when no row could hold it
+    // (the first row beside the meter is shorter than the rest).
+    if (lineWidth(r.line) + need > room() && (r.line.length || lineWidth(p.line) <= width)) rows.push((r = { line: [], hits: [] }));
     if (r.line.length) r.line.push(sep);
     const free = room() - lineWidth(r.line);
     if (lineWidth(p.line) <= free) {
@@ -382,12 +384,12 @@ export function listRow(name: string, help: string | Line, selected: boolean, st
   return { line: [...n, run('  '), ...(typeof help === 'string' ? [run(help, st.dim)] : help)], bg: selected ? st.panelBg : undefined, hit, hang: nameWidth + 2 };
 }
 
-// A setting: dim label (26ch), then ‹ value › with the value centred in 17ch.
-export function settingRow(label: string, value: string, selected: boolean, st: Styles, hit?: string): BoxRow {
+// A setting: dim label (26ch, or `labelW`), then ‹ value › with the value centred in 17ch.
+export function settingRow(label: string, value: string, selected: boolean, st: Styles, hit?: string, labelW = 26): BoxRow {
   const pad = Math.max(0, 17 - strWidth(value));
   const v = ' '.repeat(Math.floor(pad / 2)) + value + ' '.repeat(Math.ceil(pad / 2));
   return {
-    line: [...fit([run(label, st.dim)], 26, false), run('  '), run('‹', st.accent), run(v, st.title), run('›', st.accent)],
+    line: [...fit([run(label, st.dim)], labelW, false), run('  '), run('‹', st.accent), run(v, st.title), run('›', st.accent)],
     bg: selected ? st.panelBg : undefined,
     hit,
   };

@@ -97,7 +97,7 @@ export function sendLine(buf: string, chips: Map<string, Chip>, open: boolean, s
   const att = new Set([...buf].filter(isChip)).size;
   const tot = ps.reduce((a, p) => a + p.tok, 0);
   return [
-    { t: ` ${att ? `+ ${att} attachment${att > 1 ? 's' : ''} · ` : ''}~${fmtK(tot)} tokens to send ${open ? '▾' : '▸'}`, s: st.dim },
+    { t: ` ${att ? `+ ${att} attachment${att > 1 ? 's' : ''} · ` : ''}~${fmtK(tot)} token${tot === 1 ? '' : 's'} to send ${open ? '▾' : '▸'}`, s: st.dim },
     ...(warn ? [{ t: ` · ${warn}`, s: st.warn }] : []),
   ];
 }

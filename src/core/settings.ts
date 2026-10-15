@@ -56,7 +56,7 @@ export function definitions(cfg: Config): Setting[] {
   // runs unless you pass one through here (the rime tool can't change these).
   for (const name of Object.keys(process.env).filter((k) => SECRET.test(k)).sort())
     out.push({
-      key: `commands.env.${name}`, group: 'Commands', label: name, help: 'let commands Rime runs see this variable', applies: 'now',
+      key: `commands.env.${name}`, group: 'Commands', label: name, help: 'passed: commands Rime runs see it', applies: 'now',
       values: ['hidden', 'passed'],
       get: (c) => (c.passEnv?.includes(name) ? 'passed' : 'hidden'),
       set: (c, v) => {

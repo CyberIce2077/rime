@@ -194,11 +194,26 @@ export function tildify(dir: string) {
   return home && (dir === home || dir.startsWith(home + '/')) ? '~' + dir.slice(home.length) : dir;
 }
 
+// A folder too long for `room` columns keeps its start and as many of its last
+// folders as fit: ~/…/scratchpad/proj.
+export function shortPath(p: string, room: number) {
+  if (p.length <= room) return p;
+  const parts = p.split('/');
+  let best = `…/${parts.at(-1)}`;
+  for (let k = parts.length - 1; k > 1; k--) {
+    const c = `${parts[0]}/…/${parts.slice(k).join('/')}`;
+    if (c.length > room) break;
+    best = c;
+  }
+  return best;
+}
+
 export type HeaderOpts = {
   version?: string;
   model?: string;
   details?: string;
   cwd?: string;
+  cols?: () => number; // the width the header has, for the folder line
   seed?: number;
   mode?: ColorMode;
   stream?: NodeJS.WriteStream;
@@ -219,7 +234,7 @@ function infoLines(opts: HeaderOpts, mode: ColorMode) {
     `${BOLD(mode)}${c(TEXT.title)}Rime${R} ${c(TEXT.dim)}v${version}${R}`,
     // Without a model, `details` says why ("no model connected").
     model ? `${c(TEXT.accent)}${model}${R}${details ? ` ${c(TEXT.dim)}· ${details}${R}` : ''}` : `${c(TEXT.dim)}${details || 'no model selected'}${R}`,
-    `${c(TEXT.dim)}${tildify(cwd)}${R}`,
+    `${c(TEXT.dim)}${shortPath(tildify(cwd), (opts.cols?.() ?? Infinity) - SCENE.COLS - 2)}${R}`,
   ];
 }
 
