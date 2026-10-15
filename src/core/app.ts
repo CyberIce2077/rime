@@ -871,7 +871,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const v = frameList(full, height);
       hits = v.rowHits;
       rows = v.lines.map((l) => truncAnsi(l, full));
-      return paint(rows.map((l) => [l, '']), full, '');
+      return paint(rows.map((l) => [l, '']), full, v.cursor);
     }
     const L = layout();
     // Narrow, with the panel focused: the panel is the screen.
@@ -2891,7 +2891,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     for (const l of foot) lines.push(str(fit(l, width), st));
     fh.segs.forEach((segs, i) => rowHits.push(...segs.map((h) => ({ x0: h.x0 + 1, x1: h.x1 + 1, id: h.id, row: lines.length - fh.lines.length + i + 1 }))));
-    return { lines, rowHits };
+    // The search line has the same blinking caret as the prompt (not while a title is typed).
+    const cursor = L.edit === undefined ? `\x1b[2;${Math.min(width, 4 + strWidth(L.filter))}H\x1b[?25h` : '';
+    return { lines, rowHits, cursor };
   }
 
   function listKey(k: Key) {
