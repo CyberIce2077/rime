@@ -824,33 +824,40 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const dim = (t: string) => ({ t, s: st.dim });
       const key = (t: string) => ({ t, s: st.accentB });
       const parts: { line: Line; id?: string }[] = [];
-      if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
+      // The panel has the keys: the chat's own keys would do nothing, so only the way back.
+      const away = sideFocus && side.visible && !prefix;
+      if (away) parts.push(needsYou(S) ? { line: [{ t: '● Rime is asking · ', s: st.warn }, key('esc'), dim(' answer')], id: 'chat' } : { line: [key('esc'), dim(' back to the chat')], id: 'chat' });
+      if (S.declining && !away) parts.push({ line: [dim('type what Rime should do instead')] });
       // After ctrl+w: its keys, each a group of its own so they wrap whole.
       // Not split: only the keys that do something then.
       const pk = side.visible ? [['v', ' split'], ['n', ' new tab'], ['q', ' close'], ['1-9', ' tab'], ['z', ' hide']] : [['v', ' split'], ['n', ' new tab'], ...(side.tabs.length ? [['z', ' show']] : [])];
       if (prefix) for (const [k, l] of [['ctrl+w', ' …'], ...pk]) parts.push({ line: [key(k), dim(l)] });
-      if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
-      if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+w z')], id: 'panel' });
-      else if (side.visible && !sideFocus) parts.push({ line: [key(`ctrl+w ${side.active + 1}`), dim(' panel')], id: 'panel' });
-      if (running) parts.push({ line: [{ t: '⟳ ', s: st.accent }, dim(`${running.label} · `), key('ctrl+c'), dim(' stop')], id: 'key:ctrl+c' });
-      if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
-      if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
+      if (!away) {
+        if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
+        if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+w z')], id: 'panel' });
+        else if (side.visible && !sideFocus) parts.push({ line: [key(`ctrl+w ${side.active + 1}`), dim(' panel')], id: 'panel' });
+        if (running) parts.push({ line: [{ t: '⟳ ', s: st.accent }, dim(`${running.label} · `), key('ctrl+c'), dim(' stop')], id: 'key:ctrl+c' });
+        if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
+        if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
+      }
       const asking = sessions.filter((x) => x !== S && needsYou(x)).length;
       const working = sessions.filter((x) => x !== S && (x.busy || x.waiting) && !needsYou(x)).length;
       if (asking) parts.push({ line: [{ t: '● ', s: st.warn }, { t: `${asking} needs you`, s: st.fg }], id: 'conversations' });
       if (working) parts.push({ line: [{ t: '● ', s: st.accent }, { t: `${working} working`, s: st.fg }], id: 'conversations' });
-      // The permission mode always shows, like Claude Code's; a click cycles it.
-      const [icon, name, ms] =
-        mode === 'ask' ? ['⏵', 'ask', st.accent]
-        : mode === 'auto-edit' ? ['⏵⏵', 'auto-edit', st.accentB]
-        : mode === 'plan' ? ['⏸', 'plan', st.accentB]
-        : mode === 'god' ? ['⏵⏵⏵⏵', 'god mode', st.del]
-        : ['⏵⏵⏵', 'auto', st.warn];
-      // Short labels keep it to one row down to about 85 columns; each part is clickable.
-      parts.push({ line: [{ t: `${icon} ${name}`, s: ms }], id: 'mode' });
-      parts.push({ line: [key('←'), dim(' chats')], id: 'conversations' });
-      parts.push({ line: [key('/'), dim(' commands')], id: '/' });
-      parts.push({ line: [key('?'), dim(' keys')], id: '?' });
+      // The permission mode shows whenever the chat has the keys; a click cycles it.
+      if (!away) {
+        const [icon, name, ms] =
+          mode === 'ask' ? ['⏵', 'ask', st.accent]
+          : mode === 'auto-edit' ? ['⏵⏵', 'auto-edit', st.accentB]
+          : mode === 'plan' ? ['⏸', 'plan', st.accentB]
+          : mode === 'god' ? ['⏵⏵⏵⏵', 'god mode', st.del]
+          : ['⏵⏵⏵', 'auto', st.warn];
+        // Short labels keep it to one row down to about 85 columns; each part is clickable.
+        parts.push({ line: [{ t: `${icon} ${name}`, s: ms }], id: 'mode' });
+        parts.push({ line: [key('←'), dim(' chats')], id: 'conversations' });
+        parts.push({ line: [key('/'), dim(' commands')], id: '/' });
+        parts.push({ line: [key('?'), dim(' keys')], id: '?' });
+      }
       // Parts are never cut: what doesn't fit beside the meter moves to a line
       // below, whole, in the same order.
       const room = width - lineWidth(rightLine()) - 2;
@@ -895,6 +902,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const v = side.render(full, height, true, false);
       hits = v.hits;
       rows = v.lines;
+      // The chat is out of sight: Rime waiting on an answer shows on the last line.
+      if (needsYou(S)) {
+        rows[rows.length - 1] = str([{ t: '● Rime is asking · ', s: st.warn }, { t: 'esc', s: st.accentB }, { t: ' answer', s: st.dim }], st);
+        hits = hits.filter((h) => h.row !== rows.length).concat({ row: rows.length, x0: 1, x1: 25, id: 'chat' });
+      }
       paint(rows.map((l) => [l, '']), full, '\x1b[?25l');
       return images(side.overlay(1));
     }
@@ -3515,11 +3527,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const k = CLICK_KEYS[label] ?? (/^[a-z0-9]$/.test(label) ? { name: 'char', ch: label } : null);
       if (k) onKey({ type: 'key', ...k });
       // A panel key ("ctrl+w q"): the prefix, then the letter.
-      else if (/^ctrl\+w [a-z]$/.test(label)) (prefix = true), onKey({ type: 'key', name: 'char', ch: label.at(-1) });
+      else if (/^ctrl\+w [a-z1-9]$/.test(label)) (prefix = true), onKey({ type: 'key', name: 'char', ch: label.at(-1) });
       return;
     }
     if (id === 'stop') return stopBg();
     if (id === 'mode') return cycleMode();
+    if (id === 'chat') return void (sideFocus = false);
     if (id.startsWith('side:')) return (sideFocus = true), side.click(id);
     if (id === 'panel') return void (side.show(true), (sideFocus = side.visible));
     if (id === 'update') return void updateNow();
@@ -3581,6 +3594,19 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       else if (k.name === 'escape' || (k.ctrl && k.name === 'c')) boxKind = null;
       return;
     }
+    // Split view (SPEC §8): only the focused side takes keys, Rime's questions too.
+    // Split view: ctrl+w is the panel prefix once there are tabs (or on an
+    // empty prompt, so ctrl+w v opens the first); ctrl+w ctrl+w is ctrl+w itself.
+    if (prefix) return void ((prefix = false), panelKey(k));
+    if (k.ctrl && k.name === 'w' && !panel && (side.tabs.length > 0 || (!buf && !sideFocus))) return void (prefix = true);
+    if (k.ctrl && k.name === 't' && !panel) return void (side.shell(), (sideFocus = true));
+    if (sideFocus && side.visible && !panel) {
+      const t = side.tabs[side.active];
+      if (k.name === 'char' && k.ch === '?' && !(t?.kind === 'shell' && t.state !== 'running')) return void (boxKind = 'keys');
+      const r = side.key(k);
+      if (r === 'blur') sideFocus = false;
+      return; // one side has the keys: what the panel doesn't use goes nowhere
+    }
     // The permission question takes the keys while it's open.
     if (S.approval) {
       const opts = approvalOptions();
@@ -3603,18 +3629,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (k.name === 'char' && /^[1-9]$/.test(k.ch ?? '') && +k.ch! <= n) return Q.done(Q.options[+k.ch! - 1].label);
       if (k.name === 'enter' && !k.shift) return Q.done(Q.options[Q.sel].label);
       if (k.name === 'escape') return void (Q.tool ? S.busy?.abort() : (S.question = null));
-    }
-    // Split view (SPEC §8): ctrl+w is the panel prefix once there are tabs (or on an
-    // empty prompt, so ctrl+w v opens the first); ctrl+w ctrl+w is ctrl+w itself.
-    if (prefix) return void ((prefix = false), panelKey(k));
-    if (k.ctrl && k.name === 'w' && !panel && (side.tabs.length > 0 || (!buf && !sideFocus))) return void (prefix = true);
-    if (k.ctrl && k.name === 't' && !panel) return void (side.shell(), (sideFocus = true));
-    if (sideFocus && side.visible && !panel) {
-      const t = side.tabs[side.active];
-      if (k.name === 'char' && k.ch === '?' && !(t?.kind === 'shell' && t.state !== 'running')) return void (boxKind = 'keys');
-      const r = side.key(k);
-      if (r === 'blur') sideFocus = false;
-      if (r) return;
     }
     if (k.name === 'tab' && k.shift && !panel) return cycleMode();
     // ← on an empty prompt opens your conversations.
@@ -3934,7 +3948,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       }
     } else if (ev.type === 'paste') {
       if (boxKind === 'keys') boxKind = null;
-      if (!panel) pasteText(ev.text);
+      // A paste goes where the keys go: with the panel focused, typed into its tab.
+      if (sideFocus && side.visible && !panel) for (const ch of ev.text.replace(/\s+/g, ' ')) side.key(ch === ' ' ? { name: 'space' } : { name: 'char', ch });
+      else if (!panel) pasteText(ev.text);
       else if (panel.typing?.()) insert(ev.text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, ''));
     } else if (ev.type === 'key') {
       selection = null;

@@ -217,7 +217,8 @@ export function createSide(h: SideHost) {
       bar.push(...p.line, { t: ' ', s: '' });
     }
     const t = cur();
-    const fh = hintLines(foot(t), w, st);
+    // Only the focused side shows its keys; this one says how to get here.
+    const fh = hintLines(focused ? foot(t) : [[`ctrl+w ${active + 1}`, ' or a click to use the panel']], w, st);
     const rows = Math.max(1, height - 2 - (fh.lines.length + 1));
     shown = { w, rows };
     const content = t ? body(t, w, rows) : [[{ t: 'No tabs. ctrl+t opens a shell; ask Rime to open the files or the diff.', s: st.dim }] as Line];
