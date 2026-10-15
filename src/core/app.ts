@@ -69,6 +69,14 @@ const CMDS: [string, string][] = [
 // SPEC §5: only keys every keyboard has and every terminal passes on (§5.1).
 // The ? sheet, in four groups; split view's keys are always listed, so people
 // find ctrl+w v (or /panel where the terminal takes ctrl+w).
+// ctrl+w n offers these (SPEC §8).
+const NEW_TABS = [
+  ['file', 'find one by name and read it'],
+  ['folder', "the project's folders and files"],
+  ['browser', 'a web address or a local HTML file'],
+  ['design studio', 'build a page by chatting'],
+];
+
 const KEY_GROUPS: [string, [string, string][]][] = [
   ['Send and edit', [
     ['enter', 'send'],
@@ -102,7 +110,8 @@ const KEY_GROUPS: [string, [string, string][]][] = [
     ['esc', 'from the panel, back to chat'],
     ['ctrl+w q', 'close the tab'],
     ['ctrl+w ← →', 'wider / narrower · e evenly'],
-    ['ctrl+w 1…9', 'a tab · n p next / previous'],
+    ['ctrl+w n', 'new tab: file, folder, web…'],
+    ['ctrl+w 1…9', 'go to a tab'],
     ['ctrl+w u', 'reopen the closed tab'],
     ['ctrl+w z', 'hide or show (commands run on)'],
     ['ctrl+w ctrl+w', 'delete a word in split view'],
@@ -237,7 +246,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let rsearch: { q: string; i: number } | null = null;
   let files: { list: string[]; recent: string[]; at: number } | null = null;
   const usedFiles: string[] = []; // attached with @ in this session, shown first
-  let boxKind: 'keys' | 'usage' | null = null;
+  let boxKind: 'keys' | 'usage' | 'newtab' | null = null;
+  let newTabSel = 0;
   let keysPage = 0; // the ? sheet's page, when it needs more than one
   let panel: Panel | null = null;
   let quitArmed: NodeJS.Timeout | null = null;
@@ -541,6 +551,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (boxKind === 'keys') {
       return keysSheet(width, H(), st, keysPage);
     }
+    if (boxKind === 'newtab') {
+      const rows = NEW_TABS.map(([n, h], i) => listRow(`${i + 1} ${n}`, h, i === newTabSel, st, `newtab:${i}`, 17));
+      return box('new tab', [...rows, ...footRows(['↑ ↓', ' choose · ', 'enter', ' open · ', 'esc', ' close'], st)], width, st, st.accent, 'key:esc');
+    }
     if (boxKind === 'usage') return box(`usage · this conversation${model ? ` · ${model.label}` : ''}`, usageRows(width), width, st, st.accent, 'key:esc');
     return null;
   }
@@ -813,7 +827,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
       // After ctrl+w: its keys, each a group of its own so they wrap whole.
       // Not split: only the keys that do something then.
-      const pk = side.visible ? [['v', ' split'], ['q', ' close'], ['1-9', ' tab'], ['n p', ' next / previous'], ['z', ' hide']] : [['v', ' split'], ...(side.tabs.length ? [['z', ' show']] : [])];
+      const pk = side.visible ? [['v', ' split'], ['n', ' new tab'], ['q', ' close'], ['1-9', ' tab'], ['z', ' hide']] : [['v', ' split'], ['n', ' new tab'], ...(side.tabs.length ? [['z', ' show']] : [])];
       if (prefix) for (const [k, l] of [['ctrl+w', ' …'], ...pk]) parts.push({ line: [key(k), dim(l)] });
       if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
       if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+w z')], id: 'panel' });
@@ -2552,6 +2566,17 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   }
 
   // The key after ctrl+w.
+  // ctrl+w n: the new tab's kind. A file or folder opens the files tab (finding
+  // by name, or the tree); the browser and design studio need an address or an
+  // idea, so their command waits in the prompt (what was there, ctrl+y brings back).
+  function newTab(i: number) {
+    boxKind = null;
+    if (i < 2) return void (side.files(true, i === 0), (sideFocus = true));
+    kill(0, buf.length);
+    buf = i === 2 ? '/browser ' : '/design new ';
+    cur = buf.length;
+  }
+
   function panelKey(k: Key) {
     const n = k.name === 'char' ? (k.ch ?? '') : '';
     if (n === 'v') {
@@ -2563,7 +2588,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     else if (k.name === 'right') side.resize(-0.05);
     else if (n === 'e') side.resize(0);
     else if (/^[1-9]$/.test(n)) side.go(+n - 1), (sideFocus = true);
-    else if (n === 'n' || n === 'p') side.next(n === 'n' ? 1 : -1);
+    else if (n === 'n') (boxKind = 'newtab'), (newTabSel = 0), (sideFocus = false);
     else if (n === 'u') side.reopen();
     else if (n === 'z') side.show(), (sideFocus = sideFocus && side.visible);
     else if (k.ctrl && k.name === 'w') {
@@ -3523,6 +3548,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (id.startsWith('arg:')) return void ((sel = +id.slice(4)), onKey({ type: 'key', name: 'enter' }));
     if (panel && (id.startsWith('pick:') || id.startsWith('step:'))) return panel.click?.(id);
+    if (id.startsWith('newtab:')) return newTab(+id.slice(7));
     if (id.startsWith('cmd:')) {
       buf = matches()[+id.slice(4)][0];
       submit();
@@ -3546,6 +3572,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if ((k.name === 'right' || k.name === 'tab') && keysPage + 1 < keysSheet(CW(), H(), st).pages) return void keysPage++;
       boxKind = null;
       keysPage = 0;
+      return;
+    }
+    if (boxKind === 'newtab') {
+      const d = k.name === 'char' && /^[1-4]$/.test(k.ch ?? '') ? +k.ch! - 1 : -1;
+      if (k.name === 'up' || k.name === 'down') newTabSel = (newTabSel + (k.name === 'up' ? NEW_TABS.length - 1 : 1)) % NEW_TABS.length;
+      else if (k.name === 'enter' || d >= 0) newTab(d >= 0 ? d : newTabSel);
+      else if (k.name === 'escape' || (k.ctrl && k.name === 'c')) boxKind = null;
       return;
     }
     // The permission question takes the keys while it's open.

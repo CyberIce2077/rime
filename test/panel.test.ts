@@ -81,5 +81,5 @@ test("a plug-in tab's keys and the panel's keys stay separate groups", () => {
   const { s, screen } = side();
   s.custom({ title: 'browser', render: () => [], foot: () => [['', 'keys go to the page · '], ['esc', ' stop typing']] });
   const foot = screen(100, 12).slice(-3).join(' ');
-  assert.match(foot, /esc stop typing · ctrl\+w n p tabs/);
+  assert.match(foot, /esc stop typing · ctrl\+w q close/);
 });

@@ -182,11 +182,11 @@ export function createSide(h: SideHost) {
   }
 
   // A tab's own keys before the panel's: its last group has to end, or the two
-  // would run together ("esc stop typingctrl+w n p tabs").
+  // would run together ("esc stop typingctrl+w q close").
   const ended = (h: Hint[]): Hint[] => h.map(([k, l, s], i) => [k, i === h.length - 1 && !l.endsWith(' · ') ? `${l} · ` : l, s]);
   function foot(t: Tab | undefined): Hint[] {
     if (!t) return [['ctrl+t', ' new shell · '], ['esc', ' chat']];
-    const tabs: Hint[] = [['ctrl+w n p', ' tabs · '], ['ctrl+w q', ' close · '], ['esc', ' chat · '], ['?', ' all keys']];
+    const tabs: Hint[] = [['ctrl+w q', ' close · '], ['esc', ' chat · '], ['?', ' all keys']];
     if (asking !== null) return [['', 'it is still running · ', st.warn], ['ctrl+w q', ' stop it and close · '], ['esc', ' keep it']];
     if (t.kind === 'custom') return [...ended(t.foot()), ...tabs];
     if (t.kind === 'shell')
@@ -388,10 +388,12 @@ export function createSide(h: SideHost) {
       }
       add({ id: ++seq, kind: 'diff', title: 'diff', lines: diffLines(text), scroll: 0, byRime: true }, focus);
     },
-    files(focus = true) {
+    // find: start typing a name to filter (ctrl+w n → file); false: the tree.
+    files(focus = true, find?: boolean) {
       const old = tabs.findIndex((t) => t.kind === 'files');
+      if (old >= 0 && find !== undefined) Object.assign(tabs[old], { filter: '', filtering: find, sel: 0 });
       if (old >= 0) return void (focus && ((active = old), (visible = true), h.redraw()));
-      add({ id: ++seq, kind: 'files', title: 'files', open: new Set(), sel: 0, filter: '', filtering: false, scroll: 0 }, focus);
+      add({ id: ++seq, kind: 'files', title: 'files', open: new Set(), sel: 0, filter: '', filtering: !!find, scroll: 0 }, focus);
     },
     // A read-only viewer at a line (reused when the file is already open).
     file(rel: string, line?: number, focus = true) {
