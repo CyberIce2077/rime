@@ -812,7 +812,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const parts: { line: Line; id?: string }[] = [];
       if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
       // After ctrl+w: its keys, each a group of its own so they wrap whole.
-      if (prefix) for (const [k, l] of [['ctrl+w', ' …'], ['v', ' split'], ['h l', ' focus'], ['q', ' close'], ['1-9', ' tab'], ['n p', ' next / previous'], ['z', ' hide']]) parts.push({ line: [key(k), dim(l)] });
+      // Not split: only the keys that do something then.
+      const pk = side.visible ? [['v', ' split'], ['h l', ' focus'], ['q', ' close'], ['1-9', ' tab'], ['n p', ' next / previous'], ['z', ' hide']] : [['v', ' split'], ...(side.tabs.length ? [['z', ' show']] : [])];
+      if (prefix) for (const [k, l] of [['ctrl+w', ' …'], ...pk]) parts.push({ line: [key(k), dim(l)] });
       if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
       if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+w z')], id: 'panel' });
       else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl+w l'), dim(' panel')], id: 'panel' });
