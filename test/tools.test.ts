@@ -136,6 +136,10 @@ test('review 3: secrets stay out of commands unless passed; read-only git is har
   assert.deepEqual(Object.keys(env).filter((k) => !['CI', 'NO_COLOR', 'FORCE_COLOR', 'TERM'].includes(k)).sort(), ['OPENAI_API_KEY', 'PATH', 'SSH_AUTH_SOCK']);
   assert.equal(commandEnv({}, [], true).GIT_CONFIG_VALUE_0, 'false');
   assert.equal(commandEnv({}).GIT_CONFIG_COUNT, undefined);
+  // The shell's own GIT_CONFIG_* and non-secret settings pass; Rime's entries go after the user's.
+  const git = commandEnv({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'safe.directory', GIT_CONFIG_VALUE_0: '*', MAX_THINKING_TOKENS: '9', AWS_SESSION_TOKEN: 's', CLIENT_SECRET_ID: 'c' }, [], true);
+  assert.deepEqual([git.GIT_CONFIG_COUNT, git.GIT_CONFIG_KEY_0, git.GIT_CONFIG_KEY_1, git.GIT_CONFIG_KEY_2, git.MAX_THINKING_TOKENS], ['3', 'safe.directory', 'core.fsmonitor', 'core.hooksPath', '9']);
+  assert.equal(git.AWS_SESSION_TOKEN ?? git.CLIENT_SECRET_ID, undefined);
 });
 
 test('review 2: the auto-mode sandbox keeps writes in the project (macOS and Linux with bwrap)', async (t) => {

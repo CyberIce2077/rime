@@ -26,7 +26,7 @@ while your server starts up.
 
 ## Install
 
-Rime needs Node 22.13 or newer (for its built-in SQLite).
+Rime needs Node 22.13 or newer (for its built-in SQLite), on macOS or Linux. On Windows, run it inside WSL.
 
 ```sh
 git clone https://github.com/CyberIce2077/rime.git
@@ -64,7 +64,8 @@ rime connect http://localhost:8080 --name local
 | `enter` | send |
 | `ctrl+j` | new line (`shift+enter` too, where the terminal reports it) |
 | `esc` | stop the reply, go back one screen, or close a box |
-| `ctrl+c` | cancel what is open or running |
+| `ctrl+c` | cancel what is open or running, or clear the prompt |
+| `ctrl+y` | bring back what `ctrl+c`, `ctrl+u`, `ctrl+k` or `ctrl+w` removed |
 | `↑ ↓` | your earlier prompts (`esc` goes back to what you were typing) |
 | `tab` | take the suggestion shown in dim text |
 | `@` | attach a file or folder from the project |
@@ -103,7 +104,8 @@ Drag a file, folder, screenshot or video onto the terminal, or paste a long log,
 becomes a chip in the prompt. Put the cursor on a chip or point at it to see exactly what
 the model will get; the line under the prompt sums up the whole message.
 
-To copy text, drag to select it; Rime copies the selection when you let go.
+To copy text, drag to select it; Rime copies the selection when you let go (on Linux
+with `wl-copy`, `xclip` or `xsel`; without them, shift+drag selects with your terminal).
 Set `NO_COLOR` to turn colour off, or `RIME_NO_ANIMATION=1` to skip the snowfall.
 
 ## Asking first

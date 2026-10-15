@@ -104,7 +104,7 @@ const CLICK_KEYS: Record<string, Key> = {
   'ctrl+c': { name: 'c', ctrl: true }, 'ctrl+j': { name: 'j', ctrl: true }, 'ctrl+v': { name: 'v', ctrl: true }, 'ctrl+o': { name: 'o', ctrl: true },
   'ctrl+r': { name: 'r', ctrl: true }, 'ctrl+d': { name: 'd', ctrl: true }, '→': { name: 'right' }, '←': { name: 'left' }, '↑': { name: 'up' }, '↓': { name: 'down' }, 'shift+tab': { name: 'tab', shift: true },
   'ctrl-w': { name: 'w', ctrl: true }, 'ctrl-t': { name: 't', ctrl: true },
-  'ctrl+p': { name: 'p', ctrl: true }, 'ctrl+f': { name: 'f', ctrl: true }, 'ctrl+e': { name: 'e', ctrl: true }, 'ctrl+s': { name: 's', ctrl: true }, 'ctrl+u': { name: 'u', ctrl: true },
+  'ctrl+p': { name: 'p', ctrl: true }, 'ctrl+f': { name: 'f', ctrl: true }, 'ctrl+e': { name: 'e', ctrl: true }, 'ctrl+x': { name: 'x', ctrl: true }, 'ctrl+u': { name: 'u', ctrl: true },
 };
 
 // Frozen for the whole session: any byte change here would break the prompt cache.
@@ -168,6 +168,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // recalled text (esc still brings the draft back, ↑ ↓ then move in the text).
   let browsing: { list: string[]; i: number; draft: string; edited?: boolean } | null = null;
   let navigated = false;
+  let cleared = ''; // the prompt ctrl+c cleared, first on ↑
   const cwd = process.cwd();
   // The tools a new conversation freezes: the core ones, plus enabled plug-ins'.
   const toolsNow = (): ToolDef[] => [...TOOLS, ...(cfg.plugins?.browser ? [BROWSER_TOOL] : []), ...(cfg.plugins?.design ? [DESIGN_TOOL] : [])];
@@ -288,7 +289,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let edgeScroll: NodeJS.Timeout | null = null; // dragging past the top or bottom scrolls
   let top = 0; // transcript line shown on the first row
   let logLines: string[] = [];
-  let copied: NodeJS.Timeout | null = null;
   let rows: string[] = [];
 
   let header!: Header;
@@ -743,7 +743,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const ps = panel?.status?.();
     if (quitting) left = [{ t: quitting, s: st.dim }];
     else if (quitArmed) left = [{ t: 'press ctrl+c again to quit', s: st.dim }];
-    else if (copied) left = [{ t: '✓', s: st.ok }, { t: ' copied to clipboard', s: st.dim }];
     else if (flash) left = flash.text.startsWith('✓') ? [{ t: '✓', s: st.ok }, { t: flash.text.slice(1), s: st.dim }] : [{ t: flash.text, s: st.dim }];
     else if (blindAsk) {
       const lead = `${blindNote()} · `;
@@ -955,14 +954,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   function copySelection() {
     const text = selected(CW()).map(({ text: t, x0, x1 }) => sliceCols(t, x0, x1).trimEnd()).join('\n')
       .replace(/^\n+|\n+$/g, '');
-    if (!text.trim()) return;
-    copy(text, write);
-    if (copied) clearTimeout(copied);
-    copied = setTimeout(() => {
-      copied = null;
-      schedule();
-    }, 1500);
+    if (text.trim()) copyOut(text);
   }
+  // Says whether it reached the clipboard; when only OSC 52 was left (GNOME
+  // Terminal ignores it), how to copy with the terminal instead.
+  const copyOut = (text: string) =>
+    void copy(text, write).then((ok) => (say(ok ? '✓ copied to clipboard' : "shift+drag to copy with your terminal (no wl-copy, xclip or xsel here)"), schedule()));
 
   // Dragging on the top row or below the transcript scrolls it, a line at a time.
   function edge() {
@@ -2598,9 +2595,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // fills the screen with your conversations: a dot on the ones working (blue,
   // pulsing), waiting for you (yellow) or open in another Rime window (dim), and
   // the highlighted one's timeline. Typing searches (describe it, src/core/rank.ts),
-  // so the actions are ctrl keys that work while you type: ctrl+r rename, ctrl+d
+  // so the actions are ctrl keys that work while you type: ctrl+r rename, ctrl+x
   // delete (asks; ctrl+u undoes it for 10 s), ctrl+p keep on top, ctrl+f fork,
-  // ctrl+e export, ctrl+s sort. With the search empty, space selects, n starts a
+  // ctrl+e export, ctrl+o sort (not ctrl+s: flow control; not ctrl+d: it scrolls in the chat). With the search empty, space selects, n starts a
   // new conversation and a shows all projects.
   type ListRow = { id: number | null; title: string; project: string; updated: number; created: number; model: string | null; n: number; tokens: number; pinned: boolean; last: string | null; other: boolean; session?: Session };
   // `on`: the highlighted conversation, so the highlight stays on it when the list reorders.
@@ -2759,8 +2756,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       L.edit !== undefined ? [['enter', ' save · '], ['esc', ' cancel'], ['', '   type the new title']]
       : confirm.length ? [['', `delete ${confirm.length > 1 ? `${confirm.length} conversations` : `"${confirm[0].title}"`}? Its messages and timeline go too. `, 'warn'], ['enter', ' delete · '], ['esc', ' keep it']]
       : undoDelete ? [['', `deleted ${undoDelete.rows.length > 1 ? `${undoDelete.rows.length} conversations` : `"${undoDelete.rows[0].title}"`} · `, 'warn'], ['ctrl+u', ` undo (${undoDelete.left} s) · `], ['↑ ↓', ' choose · '], ['enter', ' open · '], ['esc', ' back']]
-      : searching ? [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ...(sugg.length ? [['tab', ' suggestion · '] as [string, string]] : []), ['ctrl+r', ' rename · '], ['ctrl+d', ' delete · '], ['esc', ' clear']]
-      : [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ['ctrl+r', ' rename · '], ['ctrl+d', ' delete · '], ['ctrl+p', sel?.pinned ? ' unpin · ' : ' keep on top · '], ['ctrl+f', ' fork · '], ['ctrl+e', ' export · '], ['ctrl+s', ' sort · '], ['space', ' select · '], ['n', ' new · '], ['a', L.all ? ' this project · ' : ' all projects · '], ['esc', ' back']];
+      : searching ? [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ...(sugg.length ? [['tab', ' suggestion · '] as [string, string]] : []), ['ctrl+r', ' rename · '], ['ctrl+x', ' delete · '], ['esc', ' clear']]
+      : [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ['ctrl+r', ' rename · '], ['ctrl+x', ' delete · '], ['ctrl+p', sel?.pinned ? ' unpin · ' : ' keep on top · '], ['ctrl+f', ' fork · '], ['ctrl+e', ' export · '], ['ctrl+o', ' sort · '], ['space', ' select · '], ['n', ' new · '], ['a', L.all ? ' this project · ' : ' all projects · '], ['esc', ' back']];
     // Keys wrap onto more lines when narrow, never cut off; the dot legend comes
     // last and only when it fits on the last line.
     const fh = hintLines(parts.map(([k, label, tone]): Hint => [k, label, tone === 'warn' ? st.warn : undefined]), width - 2, st);
@@ -2866,7 +2863,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (r.id === null) return say('send a message first; then it can have a name');
       return void ((L.edit = r.title === 'untitled' ? '' : r.title), (L.fresh = true));
     }
-    if (k.ctrl && k.name === 'd' && r) {
+    if (k.ctrl && k.name === 'x' && r) {
       const many = L.picked.size ? rows.filter((x) => x.id !== null && L.picked.has(x.id)) : [r];
       if (many.some((x) => x.id === null)) return say("nothing to delete: it isn't saved until you send something");
       if (many.some((x) => x.other)) return say("it's open in another Rime window; close it there first");
@@ -2887,7 +2884,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (k.name === 'backspace') return void (L.filter = L.filter.slice(0, -1));
     if (k.ctrl && k.name === 'u') return void (undoDelete ? undoDeleteNow() : (L.filter = ''));
-    if (k.ctrl && k.name === 's') return void (L.sort = (L.sort + 1) % SORTS.length);
+    if (k.ctrl && k.name === 'o') return void (L.sort = (L.sort + 1) % SORTS.length);
     if (k.ctrl && k.name === 'p' && r?.id != null) {
       save((d) => d.pin(r.id!, !r.pinned));
       L.at = 0;
@@ -3285,6 +3282,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     cur = a;
     anchor = null;
   };
+  // ctrl+c, ctrl+u, ctrl+k and ctrl+w keep what they remove for ctrl+y (readline's yank).
+  let yank = '';
+  const kill = (a: number, b: number) => ((yank = buf.slice(a, b)), cut(a, b));
   const insert = (s: string) => {
     const r = range();
     if (r) cut(...r);
@@ -3361,9 +3361,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const a = r ? r[0] : cur, b = r ? r[1] : cur;
     insert(`${a && !/\s/.test(buf[a - 1]) ? ' ' : ''}${ch}${/\s/.test(buf[b] ?? '') ? '' : ' '}`);
   };
-  function say(text: string) {
+  function say(text: string, ms = 2000) {
     if (flash) clearTimeout(flash.t);
-    flash = { text, t: setTimeout(() => ((flash = null), schedule()), 2000) };
+    flash = { text, t: setTimeout(() => ((flash = null), schedule()), ms) };
   }
 
   // A paste: dropped paths become chips, an empty paste reads a screenshot from the
@@ -3500,11 +3500,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (big || listPinned) return void ((big = null), (listPinned = listOpen = false));
       if (S.busy) return S.busy.abort();
       if (running) return running.stop(); // a download or install
+      // A cleared prompt stays at the top of ↑ and comes back with ctrl+y.
       if (buf) {
-        buf = '';
-        cur = 0;
-        anchor = null;
-        return;
+        cleared = buf;
+        kill(0, buf.length);
+        browsing = null;
+        return say('cleared · ctrl+y brings it back', 4000);
       }
       if (bg && !bg.run.state.done && !bg.stopping) return stopBg();
       if (quitArmed) return quit();
@@ -3670,7 +3671,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         // On the first line ↑ goes to older prompts; on the last line ↓ comes back
         // to newer ones and finally to what you were typing.
         if (up) {
-          browsing ??= { list: [...history].reverse().concat(past).filter((p, i, a) => p.trim() && a.indexOf(p) === i), i: -1, draft: buf };
+          browsing ??= { list: [cleared, ...[...history].reverse(), ...past].filter((p, i, a) => p.trim() && a.indexOf(p) === i), i: -1, draft: buf };
           if (browsing.i + 1 >= browsing.list.length) break;
           buf = browsing.list[++browsing.i];
         } else if (browsing) {
@@ -3690,11 +3691,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         if (k.name === 'j') insert('\n');
         else if (k.name === 'a') (anchor = null), (cur = lineStart());
         else if (k.name === 'e') (anchor = null), (cur = lineEnd());
-        else if (k.name === 'k') r ? cut(...r) : cut(cur, lineEnd());
-        else if (k.name === 'w') r ? cut(...r) : cut(wordLeft(cur), cur);
+        else if (k.name === 'k') r ? kill(...r) : kill(cur, lineEnd());
+        else if (k.name === 'w') r ? kill(...r) : kill(wordLeft(cur), cur);
+        else if (k.name === 'y') yank && insert(yank);
         else if (k.name === 'v') void pasteImage();
         // With text, ctrl+u / ctrl+d edit as in a shell; on an empty prompt they scroll.
-        else if (k.name === 'u') buf ? (r ? cut(...r) : cut(lineStart(), cur)) : (scrollOff += Math.max(1, Math.floor(viewH / 2)));
+        else if (k.name === 'u') buf ? (r ? kill(...r) : kill(lineStart(), cur)) : (scrollOff += Math.max(1, Math.floor(viewH / 2)));
         else if (k.name === 'd') buf ? (r ? cut(...r) : cur < buf.length && cut(cur, nextCp(cur))) : (scrollOff -= Math.max(1, Math.floor(viewH / 2)));
     }
     if (buf !== was) blindAsk = false;
@@ -3782,8 +3784,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         if (press.prompt) {
           const r = range();
           if (r) {
-            copy(plainOf(buf.slice(...r)), write); // a drag still copies, as before
-            say('✓ copied to clipboard');
+            copyOut(plainOf(buf.slice(...r))); // a drag still copies, as before
           } else {
             anchor = null;
             if (press.hit?.startsWith('chip:')) big = big === press.hit.slice(5) ? null : press.hit.slice(5);

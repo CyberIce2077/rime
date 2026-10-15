@@ -150,14 +150,20 @@ const keep = (s: string) => (s.length > 4e6 ? `${s.slice(0, 1e6)}\n… output cu
 
 // Variables that look like secrets (API keys, tokens, passwords) don't reach the
 // commands the model runs, unless you let one through (/settings → Commands).
-export const SECRET = /KEY|SECRET|TOKEN|PASSW|CREDENTIAL/i; // not SSH_AUTH_SOCK: git over ssh needs it
+// Not SSH_AUTH_SOCK (git over ssh needs it), GIT_CONFIG_* (git fails on a count
+// without its keys) or settings like MAX_THINKING_TOKENS.
+export const SECRET = /^(?!GIT_CONFIG_)(?:.*(?:KEY|TOKEN)$|.*(?:SECRET|PASSW|CREDENTIAL))/i;
 export function commandEnv(env: NodeJS.ProcessEnv, pass: string[] = [], readOnly = false): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) if (!SECRET.test(k) || pass.includes(k)) out[k] = v;
   Object.assign(out, { CI: '1', NO_COLOR: '1', FORCE_COLOR: '0', TERM: 'dumb' });
   // A read-only git command that runs without asking can't start a command from
   // the repo's config (core.fsmonitor runs on every `git status`) or a hook.
-  if (readOnly) Object.assign(out, { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.fsmonitor', GIT_CONFIG_VALUE_0: 'false', GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
+  // Added after the user's own GIT_CONFIG_COUNT entries, never in their place.
+  if (readOnly) {
+    const n = Number(out.GIT_CONFIG_COUNT) || 0;
+    Object.assign(out, { GIT_CONFIG_COUNT: String(n + 2), [`GIT_CONFIG_KEY_${n}`]: 'core.fsmonitor', [`GIT_CONFIG_VALUE_${n}`]: 'false', [`GIT_CONFIG_KEY_${n + 1}`]: 'core.hooksPath', [`GIT_CONFIG_VALUE_${n + 1}`]: '/dev/null' });
+  }
   return out;
 }
 

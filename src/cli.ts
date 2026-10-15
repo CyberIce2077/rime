@@ -89,6 +89,8 @@ Inside Rime, /setup connects your own server, this computer, or a provider.`);
   if (!args[1]) console.error('usage: rime connect <url> [--key-env VAR | --key -] [--name NAME]'), process.exit(1);
   await connect(args[1]);
 } else {
+  // ponytail: commands spawn `sh -c`, which native Windows lacks; Git Bash / PowerShell support when someone needs it.
+  if (process.platform === 'win32') console.error('rime: on Windows, run Rime inside WSL (its commands need a POSIX shell)'), process.exit(1);
   const cfg = load();
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.log(['', ...renderHeader({ version: pkg.version, model: cfg.model?.split('/').slice(1).join('/'), details: cfg.model ? cfg.model.split('/')[0] : 'no model connected' }), ''].join('\n'));
