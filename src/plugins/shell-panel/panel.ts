@@ -1,5 +1,5 @@
 // shell-panel (SPEC §8, Phase 10): the tabbed right panel of split view. Tabs are
-// numbered: shells (each command Rime runs, and ones you open with ctrl+t), a
+// numbered: shells (each command Rime runs, and ones you open with ctrl+w n), a
 // diff, the files tree, read-only file viewers, and plug-in tabs (browser,
 // design). Shells are plain child processes with their output captured, no pty
 // (SPEC §8 allows starting there): commands that need a terminal of their own
@@ -31,7 +31,18 @@ export type CustomTab = Base & {
 };
 export type Tab = ShellTab | TextTab | FilesTab | CustomTab;
 
-export type SideHost = { root: string; st: Styles; redraw(): void; files(): string[]; env(): NodeJS.ProcessEnv; open(path: string, line?: number): void };
+export type SideHost = { root: string; st: Styles; redraw(): void; files(): string[]; env(): NodeJS.ProcessEnv; open(path: string, line?: number): void; newTab(i: number): void };
+
+// The new-tab chooser (ctrl+t on an empty panel, ctrl+w n): the host opens the pick.
+export const NEW_TABS = [
+  ['file', 'find one by name and read it'],
+  ['folder', "the project's folders and files"],
+  ['shell', 'run commands'],
+  ['browser', 'a web address or a local HTML file'],
+  ['design studio', 'build a page by chatting'],
+];
+// After ctrl+w: the panel's own keys.
+const PREFIX: Hint[] = [['ctrl+w', ' … · '], ['n', ' new tab · '], ['q', ' close · '], ['1-9', ' go to · '], ['← →', ' size · '], ['u', ' reopen · '], ['ctrl+w', ' to the tab']];
 
 const MAX_OUT = 5000; // lines kept per shell tab
 
@@ -45,6 +56,8 @@ export function createSide(h: SideHost) {
   let asking: number | null = null; // closing a running tab: "ctrl+w q again stops it"
   let lead = 2; // columns before the content: the border and a space (1 without the border)
   let shown = { w: 0, rows: 0 }; // the content area of the last frame
+  let choosing: number | null = null; // the new-tab chooser's highlighted row
+  let pre = false; // ctrl+w pressed: the next key is the panel's
 
   const add = <T extends Tab>(t: T, focus = true): T => {
     tabs.push(t);
@@ -182,11 +195,11 @@ export function createSide(h: SideHost) {
   }
 
   // A tab's own keys before the panel's: its last group has to end, or the two
-  // would run together ("esc stop typingctrl+w q close").
+  // would run together ("esc stop typingctrl+w tabs").
   const ended = (h: Hint[]): Hint[] => h.map(([k, l, s], i) => [k, i === h.length - 1 && !l.endsWith(' · ') ? `${l} · ` : l, s]);
   function foot(t: Tab | undefined): Hint[] {
     if (!t) return [['ctrl+t', ' new shell · '], ['esc', ' chat']];
-    const tabs: Hint[] = [['ctrl+w q', ' close · '], ['esc', ' chat · '], ['?', ' all keys']];
+    const tabs: Hint[] = [['ctrl+w', ' tabs · '], ['esc', ' chat · '], ['?', ' all keys']];
     if (asking !== null) return [['', 'it is still running · ', st.warn], ['ctrl+w q', ' stop it and close · '], ['esc', ' keep it']];
     if (t.kind === 'custom') return [...ended(t.foot()), ...tabs];
     if (t.kind === 'shell')
@@ -218,10 +231,21 @@ export function createSide(h: SideHost) {
     }
     const t = cur();
     // Only the focused side shows its keys; this one says how to get here.
-    const fh = hintLines(focused ? foot(t) : [[`ctrl+w ${active + 1}`, ' or a click to use the panel']], w, st);
+    const fh = hintLines(!focused ? [['', 'click, or ctrl+t, to use the panel']] : choosing !== null ? [['↑ ↓', ' choose · '], ['enter', ' open · '], ['esc', ' cancel']] : pre ? PREFIX : foot(t), w, st);
     const rows = Math.max(1, height - 2 - (fh.lines.length + 1));
     shown = { w, rows };
-    const content = t ? body(t, w, rows) : [[{ t: 'No tabs. ctrl+t opens a shell; ask Rime to open the files or the diff.', s: st.dim }] as Line];
+    // The chooser: name and what it opens on one line, or (narrow) the help under it.
+    const nameW = Math.max(...NEW_TABS.map(([n]) => n.length)) + 6;
+    const one = nameW + Math.max(...NEW_TABS.map(([, x]) => x.length)) <= w;
+    const choices = NEW_TABS.map(([n, help], i): Line[] => {
+      const name = { t: `${i === choosing ? '›' : ' '} ${i + 1} ${n}`.padEnd(one ? nameW : 0), s: i === choosing ? st.accentB : st.title };
+      return one ? [[name, { t: help, s: st.dim }]] : [[name], [{ t: `    ${help}`, s: st.dim }]];
+    });
+    const content: Line[] =
+      choosing !== null ? [[{ t: 'New tab', s: st.titleB }], [], ...choices.flat()]
+      : t ? body(t, w, rows)
+      : [[{ t: 'No tabs. ctrl+w n opens one.', s: st.dim }] as Line];
+    if (choosing !== null) choices.forEach((c, i) => c.forEach((_, j) => hits.push({ row: 5 + choices.slice(0, i).flat().length + j, x0: lead + 1, x1: width, id: `side:new:${i}` })));
     const lines: Line[] = [bar, [{ t: '─'.repeat(w), s: st.line }], ...content.slice(0, rows), ...new Array(Math.max(0, rows - content.length)).fill([]), [{ t: '─'.repeat(w), s: st.line }], ...fh.lines];
     fh.segs.forEach((segs, i) => hits.push(...segs.map((s) => ({ row: 2 + rows + 2 + i, x0: s.x0 + lead, x1: s.x1 + lead, id: s.id }))));
     if (t?.kind === 'files') for (let i = 0; i < Math.min(rows, content.length); i++) hits.push({ row: 3 + i, x0: lead + 1, x1: width, id: `side:row:${i}` });
@@ -231,6 +255,21 @@ export function createSide(h: SideHost) {
   // ---- keys (when the panel has focus) ----
   // 'blur' hands focus back to the chat; true when the key was used.
   function key(k: Key): boolean | 'blur' {
+    // ctrl+w, then a key: the panel's own (ctrl+w twice hands ctrl+w to the tab).
+    if (pre) {
+      pre = false;
+      if (!(k.ctrl && k.name === 'w')) return prefixKey(k), h.redraw(), true;
+    } else if (k.ctrl && k.name === 'w') return (pre = true), h.redraw(), true;
+    if (choosing !== null) {
+      const d = k.name === 'char' && /^[1-9]$/.test(k.ch ?? '') && +k.ch! <= NEW_TABS.length ? +k.ch! - 1 : -1;
+      if (k.name === 'up' || k.name === 'down') choosing = (choosing + (k.name === 'up' ? NEW_TABS.length - 1 : 1)) % NEW_TABS.length;
+      else if (k.name === 'enter' || d >= 0) pick(d >= 0 ? d : choosing);
+      else if (k.name === 'escape' || (k.ctrl && k.name === 'c')) {
+        choosing = null;
+        if (!tabs.length) return (visible = false), h.redraw(), 'blur';
+      }
+      return h.redraw(), true;
+    }
     const t = cur();
     if (asking !== null) {
       if (k.name === 'escape') return (asking = null), h.redraw(), true;
@@ -315,14 +354,35 @@ export function createSide(h: SideHost) {
     return true;
   }
 
+  function pick(i: number) {
+    choosing = null;
+    h.newTab(i);
+  }
+  function prefixKey(k: Key) {
+    const n = k.name === 'char' ? (k.ch ?? '') : '';
+    if (n === 'q') api.close(asking !== null);
+    else if (n === 'n') choosing = 0;
+    else if (k.name === 'left') api.resize(0.05);
+    else if (k.name === 'right') api.resize(-0.05);
+    else if (n === 'e') api.resize(0);
+    else if (/^[1-9]$/.test(n)) api.go(+n - 1);
+    else if (n === 'u') api.reopen();
+  }
+
   // ---- tabs, from the outside ----
-  return {
+  const api = {
     tabs,
     get active() {
       return active;
     },
     get visible() {
-      return visible && tabs.length > 0;
+      return visible && (tabs.length > 0 || choosing !== null);
+    },
+    // The new-tab chooser, in the panel.
+    choose() {
+      choosing = 0;
+      visible = true;
+      h.redraw();
     },
     get ratio() {
       return ratio;
@@ -409,8 +469,9 @@ export function createSide(h: SideHost) {
     custom: (t: Omit<CustomTab, 'id' | 'kind'>, focus = true) => add({ ...t, id: ++seq, kind: 'custom' } as CustomTab, focus),
     // Mouse: a tab in the bar, a row in the files tree; the wheel scrolls.
     click(id: string) {
-      const m = /^side:(tab|row):(\d+)$/.exec(id);
+      const m = /^side:(tab|row|new):(\d+)$/.exec(id);
       if (!m) return;
+      if (m[1] === 'new') return pick(+m[2]);
       if (m[1] === 'tab') return void ((active = +m[2]), h.redraw());
       const t = cur();
       if (t?.kind !== 'files') return;
@@ -451,5 +512,6 @@ export function createSide(h: SideHost) {
     key,
     render,
   };
+  return api;
 }
 export type Side = ReturnType<typeof createSide>;

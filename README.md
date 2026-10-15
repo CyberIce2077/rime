@@ -74,6 +74,7 @@ rime connect http://localhost:8080 --name local
 | `ctrl+u` `ctrl+d` | scroll the conversation (on an empty prompt); `esc` jumps to the end |
 | `ctrl+v` | paste an image from the clipboard |
 | `shift+tab` | permission mode: ask · auto-edit · plan |
+| `ctrl+t` | split view: files, a shell, the browser or design beside the chat; `ctrl+t` again closes it |
 | `←` | your conversations (on an empty prompt) |
 | `/` | commands |
 | `?` | shortcuts |
@@ -89,7 +90,7 @@ rime connect http://localhost:8080 --name local
 | `/permissions` | permission mode and allow / ask / deny rules |
 | `/conversations` | this project's conversations |
 | `/usage` | tokens, cost and cache savings |
-| `/panel` | split view: `/panel files`, `shell`, `diff` or `hide` (where a browser terminal takes `ctrl+w`) |
+| `/panel` | split view, like `ctrl+t`: `/panel files`, `shell`, `diff` or `hide` (where a browser terminal takes `ctrl+t`) |
 | `/clear` | start a new conversation |
 | `/exit` | quit |
 

@@ -69,14 +69,6 @@ const CMDS: [string, string][] = [
 // SPEC §5: only keys every keyboard has and every terminal passes on (§5.1).
 // The ? sheet, in four groups; split view's keys are always listed, so people
 // find ctrl+w v (or /panel where the terminal takes ctrl+w).
-// ctrl+w n offers these (SPEC §8).
-const NEW_TABS = [
-  ['file', 'find one by name and read it'],
-  ['folder', "the project's folders and files"],
-  ['browser', 'a web address or a local HTML file'],
-  ['design studio', 'build a page by chatting'],
-];
-
 const KEY_GROUPS: [string, [string, string][]][] = [
   ['Send and edit', [
     ['enter', 'send'],
@@ -105,16 +97,15 @@ const KEY_GROUPS: [string, [string, string][]][] = [
     ['esc', 'stop, go back, or close a box'],
   ]],
   ['Panel', [
-    ['ctrl+w v', 'split view (or /panel)'],
-    ['ctrl+t', 'new shell tab'],
+    ['ctrl+t', 'split view on / off · /panel'],
     ['esc', 'from the panel, back to chat'],
+    ['', 'in the panel:'],
+    ['ctrl+w n', 'new tab: file, folder, shell…'],
     ['ctrl+w q', 'close the tab'],
-    ['ctrl+w ← →', 'wider / narrower · e evenly'],
-    ['ctrl+w n', 'new tab: file, folder, web…'],
     ['ctrl+w 1…9', 'go to a tab'],
+    ['ctrl+w ← →', 'wider / narrower · e evenly'],
     ['ctrl+w u', 'reopen the closed tab'],
-    ['ctrl+w z', 'hide or show (commands run on)'],
-    ['ctrl+w ctrl+w', 'delete a word in split view'],
+    ['ctrl+w ctrl+w', 'ctrl+w for the tab itself'],
     ['j k  g G', 'scroll, top, end (in a tab)'],
   ]],
 ];
@@ -246,8 +237,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let rsearch: { q: string; i: number } | null = null;
   let files: { list: string[]; recent: string[]; at: number } | null = null;
   const usedFiles: string[] = []; // attached with @ in this session, shown first
-  let boxKind: 'keys' | 'usage' | 'newtab' | null = null;
-  let newTabSel = 0;
+  let boxKind: 'keys' | 'usage' | null = null;
   let keysPage = 0; // the ? sheet's page, when it needs more than one
   let panel: Panel | null = null;
   let quitArmed: NodeJS.Timeout | null = null;
@@ -265,8 +255,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     files: () => (index ? index.files().sort() : listFiles(project)),
     env: () => commandEnv(process.env, cfg.passEnv),
     open: (p, line) => void side.file(p, line),
+    newTab: (i) => newTab(i),
   });
-  let sideFocus = false, prefix = false, dragging = false; // dragging: the divider, with the mouse
+  let sideFocus = false, dragging = false; // dragging: the divider, with the mouse
   // The chat's width and where the panel starts (0: no panel). Under 72 columns
   // there's room for one pane, so the one with focus takes the screen.
   const layout = () => {
@@ -551,10 +542,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (boxKind === 'keys') {
       return keysSheet(width, H(), st, keysPage);
     }
-    if (boxKind === 'newtab') {
-      const rows = NEW_TABS.map(([n, h], i) => listRow(`${i + 1} ${n}`, h, i === newTabSel, st, `newtab:${i}`, 17));
-      return box('new tab', [...rows, ...footRows(['↑ ↓', ' choose · ', 'enter', ' open · ', 'esc', ' close'], st)], width, st, st.accent, 'key:esc');
-    }
     if (boxKind === 'usage') return box(`usage · this conversation${model ? ` · ${model.label}` : ''}`, usageRows(width), width, st, st.accent, 'key:esc');
     return null;
   }
@@ -825,17 +812,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const key = (t: string) => ({ t, s: st.accentB });
       const parts: { line: Line; id?: string }[] = [];
       // The panel has the keys: the chat's own keys would do nothing, so only the way back.
-      const away = sideFocus && side.visible && !prefix;
+      const away = sideFocus && side.visible;
       if (away) parts.push(needsYou(S) ? { line: [{ t: '● Rime is asking · ', s: st.warn }, key('esc'), dim(' answer')], id: 'chat' } : { line: [key('esc'), dim(' back to the chat')], id: 'chat' });
       if (S.declining && !away) parts.push({ line: [dim('type what Rime should do instead')] });
-      // After ctrl+w: its keys, each a group of its own so they wrap whole.
-      // Not split: only the keys that do something then.
-      const pk = side.visible ? [['v', ' split'], ['n', ' new tab'], ['q', ' close'], ['1-9', ' tab'], ['z', ' hide']] : [['v', ' split'], ['n', ' new tab'], ...(side.tabs.length ? [['z', ' show']] : [])];
-      if (prefix) for (const [k, l] of [['ctrl+w', ' …'], ...pk]) parts.push({ line: [key(k), dim(l)] });
       if (!away) {
         if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
-        if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+w z')], id: 'panel' });
-        else if (side.visible && !sideFocus) parts.push({ line: [key(`ctrl+w ${side.active + 1}`), dim(' panel')], id: 'panel' });
+        if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+t')], id: 'panel' });
+        else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl+t'), dim(' panel')], id: 'panel' });
         if (running) parts.push({ line: [{ t: '⟳ ', s: st.accent }, dim(`${running.label} · `), key('ctrl+c'), dim(' stop')], id: 'key:ctrl+c' });
         if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
         if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
@@ -2572,42 +2555,29 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (!cps || !cp) return note('No changes to show: Rime takes a checkpoint before it changes a file.', 'dim');
       side.diff(cps.diff(cp), true);
     } else if (a) return note(`/panel ${a}? Try /panel, /panel files, shell, diff or hide.`, 'dim');
-    else if (!side.tabs.length) side.files();
-    else side.show(true);
+    else return void (sideFocus || toggleSplit());
     sideFocus = side.visible;
   }
 
-  // The key after ctrl+w.
-  // ctrl+w n: the new tab's kind. A file or folder opens the files tab (finding
+  // The new tab chosen in the panel. A file or folder opens the files tab (finding
   // by name, or the tree); the browser and design studio need an address or an
   // idea, so their command waits in the prompt (what was there, ctrl+y brings back).
   function newTab(i: number) {
-    boxKind = null;
     if (i < 2) return void (side.files(true, i === 0), (sideFocus = true));
+    if (i === 2) return void (side.shell(), (sideFocus = true));
     kill(0, buf.length);
-    buf = i === 2 ? '/browser ' : '/design new ';
+    buf = i === 3 ? '/browser ' : '/design new ';
     cur = buf.length;
+    sideFocus = false;
   }
 
-  function panelKey(k: Key) {
-    const n = k.name === 'char' ? (k.ch ?? '') : '';
-    if (n === 'v') {
-      if (!side.tabs.length) side.files();
-      else side.show(true);
-      sideFocus = true;
-    } else if (n === 'q') side.close(side.asking());
-    else if (k.name === 'left') side.resize(0.05);
-    else if (k.name === 'right') side.resize(-0.05);
-    else if (n === 'e') side.resize(0);
-    else if (/^[1-9]$/.test(n)) side.go(+n - 1), (sideFocus = true);
-    else if (n === 'n') (boxKind = 'newtab'), (newTabSel = 0), (sideFocus = false);
-    else if (n === 'u') side.reopen();
-    else if (n === 'z') side.show(), (sideFocus = sideFocus && side.visible);
-    else if (k.ctrl && k.name === 'w') {
-      if (sideFocus) side.key({ name: 'w', ctrl: true });
-      else if (buf) cut(wordLeft(cur), cur);
-    }
-    if (!side.visible) sideFocus = false;
+  // ctrl+t (and /panel): from the chat, the split opens (the new-tab chooser when
+  // there are no tabs) and the panel gets the keys; from the panel, it closes.
+  function toggleSplit() {
+    if (sideFocus && side.visible) return void (side.show(false), (sideFocus = false));
+    if (!side.tabs.length) side.choose();
+    else side.show(true);
+    sideFocus = true;
   }
 
   // Which of the three answers this question offers (0 yes, 1 don't ask again, 2 no).
@@ -3526,8 +3496,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const label = id.slice(4);
       const k = CLICK_KEYS[label] ?? (/^[a-z0-9]$/.test(label) ? { name: 'char', ch: label } : null);
       if (k) onKey({ type: 'key', ...k });
-      // A panel key ("ctrl+w q"): the prefix, then the letter.
-      else if (/^ctrl\+w [a-z1-9]$/.test(label)) (prefix = true), onKey({ type: 'key', name: 'char', ch: label.at(-1) });
+      // A panel key ("ctrl+w q"): the panel's prefix, then the letter.
+      else if (/^ctrl\+w [a-z1-9]$/.test(label)) (sideFocus = true), side.key({ name: 'w', ctrl: true }), side.key({ name: 'char', ch: label.at(-1) });
       return;
     }
     if (id === 'stop') return stopBg();
@@ -3561,7 +3531,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (id.startsWith('arg:')) return void ((sel = +id.slice(4)), onKey({ type: 'key', name: 'enter' }));
     if (panel && (id.startsWith('pick:') || id.startsWith('step:'))) return panel.click?.(id);
-    if (id.startsWith('newtab:')) return newTab(+id.slice(7));
     if (id.startsWith('cmd:')) {
       buf = matches()[+id.slice(4)][0];
       submit();
@@ -3587,19 +3556,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       keysPage = 0;
       return;
     }
-    if (boxKind === 'newtab') {
-      const d = k.name === 'char' && /^[1-4]$/.test(k.ch ?? '') ? +k.ch! - 1 : -1;
-      if (k.name === 'up' || k.name === 'down') newTabSel = (newTabSel + (k.name === 'up' ? NEW_TABS.length - 1 : 1)) % NEW_TABS.length;
-      else if (k.name === 'enter' || d >= 0) newTab(d >= 0 ? d : newTabSel);
-      else if (k.name === 'escape' || (k.ctrl && k.name === 'c')) boxKind = null;
-      return;
-    }
-    // Split view (SPEC §8): only the focused side takes keys, Rime's questions too.
-    // Split view: ctrl+w is the panel prefix once there are tabs (or on an
-    // empty prompt, so ctrl+w v opens the first); ctrl+w ctrl+w is ctrl+w itself.
-    if (prefix) return void ((prefix = false), panelKey(k));
-    if (k.ctrl && k.name === 'w' && !panel && (side.tabs.length > 0 || (!buf && !sideFocus))) return void (prefix = true);
-    if (k.ctrl && k.name === 't' && !panel) return void (side.shell(), (sideFocus = true));
+    // Split view (SPEC §8): ctrl+t opens or closes it; only the focused side takes
+    // keys, Rime's questions too. The panel's own keys (ctrl+w …) live in the panel.
+    if (k.ctrl && k.name === 't' && !panel) return toggleSplit();
     if (sideFocus && side.visible && !panel) {
       const t = side.tabs[side.active];
       if (k.name === 'char' && k.ch === '?' && !(t?.kind === 'shell' && t.state !== 'running')) return void (boxKind = 'keys');

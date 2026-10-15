@@ -14,7 +14,7 @@ function side(files: string[] = []) {
   const root = tmp();
   for (const f of files) fs.mkdirSync(path.dirname(path.join(root, f)), { recursive: true }), fs.writeFileSync(path.join(root, f), `// ${f}\nline 2\n`);
   const opened: string[] = [];
-  const s = createSide({ root, st: styles('truecolor'), redraw: () => {}, files: () => files, env: () => process.env, open: (p) => void opened.push(p) });
+  const s = createSide({ root, st: styles('truecolor'), redraw: () => {}, files: () => files, env: () => process.env, open: (p) => void opened.push(p), newTab: () => {} });
   const screen = (w = 60, h = 16) => s.render(w, h, true).lines.map(stripAnsi);
   return { s, root, opened, screen };
 }
@@ -81,5 +81,5 @@ test("a plug-in tab's keys and the panel's keys stay separate groups", () => {
   const { s, screen } = side();
   s.custom({ title: 'browser', render: () => [], foot: () => [['', 'keys go to the page · '], ['esc', ' stop typing']] });
   const foot = screen(100, 12).slice(-3).join(' ');
-  assert.match(foot, /esc stop typing · ctrl\+w q close/);
+  assert.match(foot, /esc stop typing · ctrl\+w tabs/);
 });
