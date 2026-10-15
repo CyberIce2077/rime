@@ -67,7 +67,7 @@ test('status parts pack into rows whole, and nothing is ever cut', async () => {
   const sep = { t: ' · ', s: '' };
   const text = (rows: { line: { t: string }[] }[]) => rows.map((r) => r.line.map((x) => x.t).join(''));
   // The first row is narrow (beside the meter); whole parts move down.
-  assert.deepEqual(text(packParts([p('ctrl-w …'), p('v split'), p('h l focus'), p('q close')], 20, 40, sep)), ['ctrl-w … · v split', 'h l focus · q close']);
+  assert.deepEqual(text(packParts([p('ctrl+w …'), p('v split'), p('h l focus'), p('q close')], 20, 40, sep)), ['ctrl+w … · v split', 'h l focus · q close']);
   // A part wider than any row wraps by words, nothing dropped.
   const long = text(packParts([p('one two three four five six seven eight')], 12, 16, sep));
   assert.equal(long.join(' ').replace(/\s+/g, ' '), 'one two three four five six seven eight');
@@ -75,4 +75,16 @@ test('status parts pack into rows whole, and nothing is ever cut', async () => {
   // Hits follow their part onto the row it landed on.
   const rows = packParts([p('aaaa', 'a'), p('bbbb', 'b')], 6, 20, sep);
   assert.deepEqual(rows.map((r) => r.hits.map((h) => `${h.id}:${h.x0}-${h.x1}`)), [['a:1-4'], ['b:1-4']]);
+});
+
+test('the ? sheet: two columns at 100, pages of whole groups when the screen is short', async () => {
+  const { keysSheet } = await import('../src/core/app.ts');
+  const wide = keysSheet(100, 40, st);
+  assert.equal(wide.pages, 1);
+  assert.match(stripAnsi(wide.lines[1]), /Send and edit +Move around/);
+  assert.ok(wide.lines.length <= 40 - 5);
+  const narrow = keysSheet(60, 30, st);
+  assert.equal(narrow.pages, 2);
+  assert.ok(narrow.lines.length <= 30 - 5);
+  assert.match(stripAnsi(keysSheet(60, 30, st, 1).lines.join('\n')), /Panel[^]*ctrl\+w v +split view[^]*2\/2 · any key to close/);
 });

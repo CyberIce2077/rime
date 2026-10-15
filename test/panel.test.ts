@@ -37,12 +37,12 @@ test('a running tab asks before it closes; closing the last tab un-splits', asyn
   assert.equal(s.visible, true);
   s.close();
   assert.equal(s.tabs.length, 1, 'asked first');
-  assert.match(screen().join('\n'), /still running · ctrl-w q stop it and close/);
+  assert.match(screen().join('\n'), /still running · ctrl\+w q stop it and close/);
   s.close(true);
   assert.equal(s.tabs.length, 0);
   assert.equal(s.visible, false);
   s.reopen();
-  assert.equal(s.tabs.length, 1, 'ctrl-w u brings it back (stopped)');
+  assert.equal(s.tabs.length, 1, 'ctrl+w u brings it back (stopped)');
 });
 
 test("Rime's commands mirror into a tab that flashes in without taking the active tab", () => {
@@ -81,5 +81,5 @@ test("a plug-in tab's keys and the panel's keys stay separate groups", () => {
   const { s, screen } = side();
   s.custom({ title: 'browser', render: () => [], foot: () => [['', 'keys go to the page · '], ['esc', ' stop typing']] });
   const foot = screen(100, 12).slice(-3).join(' ');
-  assert.match(foot, /esc stop typing · ctrl-w n p tabs/);
+  assert.match(foot, /esc stop typing · ctrl\+w n p tabs/);
 });

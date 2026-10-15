@@ -42,7 +42,7 @@ export function createSide(h: SideHost) {
   let active = 0, seq = 0;
   let visible = false;
   let ratio = 0.45; // the panel's share of the width
-  let asking: number | null = null; // closing a running tab: "ctrl-w q again stops it"
+  let asking: number | null = null; // closing a running tab: "ctrl+w q again stops it"
   let lead = 2; // columns before the content: the border and a space (1 without the border)
   let shown = { w: 0, rows: 0 }; // the content area of the last frame
 
@@ -182,12 +182,12 @@ export function createSide(h: SideHost) {
   }
 
   // A tab's own keys before the panel's: its last group has to end, or the two
-  // would run together ("esc stop typingctrl-w n p tabs").
+  // would run together ("esc stop typingctrl+w n p tabs").
   const ended = (h: Hint[]): Hint[] => h.map(([k, l, s], i) => [k, i === h.length - 1 && !l.endsWith(' · ') ? `${l} · ` : l, s]);
   function foot(t: Tab | undefined): Hint[] {
-    if (!t) return [['ctrl-t', ' new shell · '], ['esc', ' chat']];
-    const tabs: Hint[] = [['ctrl-w n p', ' tabs · '], ['ctrl-w q', ' close · '], ['ctrl-w h', ' chat · '], ['?', ' all keys']];
-    if (asking !== null) return [['', 'it is still running · ', st.warn], ['ctrl-w q', ' stop it and close · '], ['esc', ' keep it']];
+    if (!t) return [['ctrl+t', ' new shell · '], ['esc', ' chat']];
+    const tabs: Hint[] = [['ctrl+w n p', ' tabs · '], ['ctrl+w q', ' close · '], ['ctrl+w h', ' chat · '], ['?', ' all keys']];
+    if (asking !== null) return [['', 'it is still running · ', st.warn], ['ctrl+w q', ' stop it and close · '], ['esc', ' keep it']];
     if (t.kind === 'custom') return [...ended(t.foot()), ...tabs];
     if (t.kind === 'shell')
       return t.state === 'running' ? [['ctrl+c', ' stop · '], ['j k', ' scroll · '], ...tabs] : [['enter', t.input || !t.cmd ? ' run · ' : ' run again · '], ['↑', ' last command · '], ...tabs];
@@ -220,7 +220,7 @@ export function createSide(h: SideHost) {
     const fh = hintLines(foot(t), w, st);
     const rows = Math.max(1, height - 2 - (fh.lines.length + 1));
     shown = { w, rows };
-    const content = t ? body(t, w, rows) : [[{ t: 'No tabs. ctrl-t opens a shell; ask Rime to open the files or the diff.', s: st.dim }] as Line];
+    const content = t ? body(t, w, rows) : [[{ t: 'No tabs. ctrl+t opens a shell; ask Rime to open the files or the diff.', s: st.dim }] as Line];
     const lines: Line[] = [bar, [{ t: '─'.repeat(w), s: st.line }], ...content.slice(0, rows), ...new Array(Math.max(0, rows - content.length)).fill([]), [{ t: '─'.repeat(w), s: st.line }], ...fh.lines];
     fh.segs.forEach((segs, i) => hits.push(...segs.map((s) => ({ row: 2 + rows + 2 + i, x0: s.x0 + lead, x1: s.x1 + lead, id: s.id }))));
     if (t?.kind === 'files') for (let i = 0; i < Math.min(rows, content.length); i++) hits.push({ row: 3 + i, x0: lead + 1, x1: width, id: `side:row:${i}` });

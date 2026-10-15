@@ -26,7 +26,7 @@ import { CUBE_COLS, type Header, type HeaderOpts, SCENE, playHeader, tildify } f
 import { type InputEvent, type Key, type Line, createParser, fit, lineWidth, sliceCols, stripAnsi, strWidth, truncAnsi, wrap } from './term.ts';
 import { colorMode, sgr } from './theme.ts';
 import { previewBox, sendLine, sendList } from './preview.ts';
-import { type BoxRow, type Hint, type Hit, type Item, box, caretOf, footRows, hintLines, packParts, layoutInput, listRow, offsetAt, prompt, renderItem, spaced, splitToolCalls, status, str, styles } from './view.ts';
+import { type BoxRow, type Hint, type Hit, type Item, type Styles, box, caretOf, footRows, hintLines, packParts, layoutInput, listRow, offsetAt, prompt, renderItem, spaced, splitToolCalls, status, str, styles } from './view.ts';
 import { type Turn, addTurns, createMeter, fmt$, fmtS, fmtT } from '../plugins/token-kit/meter.ts';
 import * as llama from '../providers/llamacpp.ts';
 import { PRESETS } from '../providers/presets.ts';
@@ -57,6 +57,7 @@ const CMDS: [string, string][] = [
   ['/conversations', 'search, open, fork or delete your conversations'],
   ['/compact', 'summarise the earlier conversation to free context'],
   ['/diff', 'what the last change did, file by file'],
+  ['/panel', 'split view: /panel · files | shell | diff | hide'],
   ['/browser', 'a page in a tab: /browser <url or file> · use chrome | chromium · uninstall'],
   ['/design', 'build a page by chatting: /design new <what>'],
   ['/undo', 'put the files back as they were before the last change'],
@@ -66,44 +67,79 @@ const CMDS: [string, string][] = [
 ];
 
 // SPEC §5: only keys every keyboard has and every terminal passes on (§5.1).
-// Split view (SPEC §8), listed when it's in use; ctrl+t is always there.
-const PANEL_KEYS: [string, string][] = [
-  ['ctrl-w v', 'split / bring the panel back'],
-  ['ctrl-w h  l', 'focus the chat / the panel'],
-  ['ctrl-w q', 'close the tab (asks first if its command still runs)'],
-  ['ctrl-w ← →', 'panel wider / narrower · ctrl-w e evenly · or drag the divider'],
-  ['ctrl-w 1…9', 'go to a tab · ctrl-w n p next / previous · ctrl-w u reopen'],
-  ['ctrl-w z', 'hide or show the panel (commands keep running)'],
-  ['ctrl-w ctrl-w', 'ctrl-w itself (delete the word before the cursor)'],
-  ['j k  g G', 'scroll, top and end (output, diff, a file)'],
+// The ? sheet, in four groups; split view's keys are always listed, so people
+// find ctrl+w v (or /panel where the terminal takes ctrl+w).
+const KEY_GROUPS: [string, [string, string][]][] = [
+  ['Send and edit', [
+    ['enter', 'send'],
+    ['ctrl+j', 'new line (or shift+enter)'],
+    ['ctrl+a ctrl+e', 'start / end of the line'],
+    ['ctrl+u ctrl+k', 'delete to the start / end'],
+    ['ctrl+w', 'delete the word before'],
+    ['ctrl+y', 'bring back what you deleted'],
+    ['ctrl+v', 'paste an image, or drag a file'],
+    ['ctrl+c', 'clear, or cancel what runs'],
+    ['ctrl+c twice', 'quit (when nothing is open)'],
+  ]],
+  ['Ask and pick', [
+    ['/', 'commands'],
+    ['@', 'mention a file or folder'],
+    ['ctrl+r', 'search your earlier prompts'],
+    ['tab  →', 'complete / take the suggestion'],
+    ['shift+tab', 'mode: ask · auto-edit · plan'],
+    ['ctrl+o', "show or hide the thinking"],
+    ['?', 'this list'],
+  ]],
+  ['Move around', [
+    ['↑ ↓', 'earlier prompts (esc: yours)'],
+    ['←', 'conversations (empty prompt)'],
+    ['ctrl+u ctrl+d', 'scroll (empty prompt) or wheel'],
+    ['esc', 'stop, go back, or close a box'],
+  ]],
+  ['Panel', [
+    ['ctrl+w v', 'split view (or /panel)'],
+    ['ctrl+t', 'new shell tab'],
+    ['ctrl+w h  l', 'focus the chat / the panel'],
+    ['ctrl+w q', 'close the tab'],
+    ['ctrl+w ← →', 'wider / narrower · e evenly'],
+    ['ctrl+w 1…9', 'a tab · n p next / previous'],
+    ['ctrl+w u', 'reopen the closed tab'],
+    ['ctrl+w z', 'hide or show (commands run on)'],
+    ['ctrl+w ctrl+w', 'delete a word in split view'],
+    ['j k  g G', 'scroll, top, end (in a tab)'],
+  ]],
 ];
-const KEYS: [string, string][] = [
-  ['enter', 'send'],
-  ['ctrl+j', 'new line (shift+enter also works where the terminal reports it)'],
-  ['esc', 'stop Rime, go back one screen, or close a box'],
-  ['ctrl+c', 'cancel what is open or running'],
-  ['ctrl+c twice', 'quit (only when nothing is open)'],
-  ['↑ ↓', 'your earlier prompts (esc goes back to what you typed)'],
-  ['ctrl+w', 'delete the word before the cursor'],
-  ['tab', 'complete a command'],
-  ['ctrl+v', 'paste an image from the clipboard (or drag in a file)'],
-  ['@', 'mention a file or folder'],
-  ['ctrl+r', 'search your earlier prompts'],
-  ['ctrl+o', "show or hide the model's thinking"],
-  ['tab  →', 'take the suggestion shown in dim text'],
-  ['shift+tab', 'permission mode: ask · auto-edit · plan'],
-  ['←', 'your conversations (on an empty prompt)'],
-  ['ctrl+u ctrl+d', 'scroll the conversation up / down when the prompt is empty (also the mouse wheel)'],
-  ['/', 'commands'],
-  ['?', 'this list'],
-];
+
+// The ? sheet: two columns when every row fits in half the box, else one; when
+// that's still too tall for the screen, whole groups go on pages (→ for the next).
+export function keysSheet(width: number, height: number, st: Styles, page = 0) {
+  const blocks = KEY_GROUPS.map(([t, keys]): BoxRow[] => [{ line: [{ t, s: st.accent }] }, ...keys.map(([k, h]) => listRow(k, h, false, st, undefined, 15))]);
+  const colW = Math.floor((width - 6) / 2);
+  const room = height - 9; // the box may take height - 5 rows: border, footer and its rule take 4
+  let pages = [blocks.flatMap((b, i) => (i ? [{ line: [] }, ...b] : b))];
+  if (pages[0].every((r) => lineWidth(r.line) <= colW)) {
+    const l = [...blocks[0], { line: [] }, ...blocks[1]], r = [...blocks[2], { line: [] }, ...blocks[3]];
+    pages = [l.map((x, i) => ({ line: [...x.line, { t: ' '.repeat(colW + 2 - lineWidth(x.line)), s: st.dim }, ...(r[i]?.line ?? [])] }))];
+  }
+  if (pages[0].length > room) {
+    pages = [[]];
+    for (const b of blocks) {
+      const p = pages.at(-1)!;
+      if (p.length && p.length + 1 + b.length > room) pages.push([...b]);
+      else p.push(...(p.length ? [{ line: [] }] : []), ...b);
+    }
+  }
+  const n = Math.min(page, pages.length - 1);
+  const foot = n + 1 < pages.length ? ['→', ` more (${n + 1}/${pages.length}) · `, 'esc', ' close'] : `${pages.length > 1 ? `${n + 1}/${pages.length} · ` : ''}any key to close`;
+  return { pages: pages.length, ...box('shortcuts', [...pages[n], ...footRows(foot, st)], width, st, st.accent, 'key:esc') };
+}
 
 // A clicked footer key acts like pressing it (`key:esc`, `key:b`, …).
 const CLICK_KEYS: Record<string, Key> = {
   esc: { name: 'escape' }, enter: { name: 'enter' }, tab: { name: 'tab' }, space: { name: 'space' }, backspace: { name: 'backspace' },
   'ctrl+c': { name: 'c', ctrl: true }, 'ctrl+j': { name: 'j', ctrl: true }, 'ctrl+v': { name: 'v', ctrl: true }, 'ctrl+o': { name: 'o', ctrl: true },
   'ctrl+r': { name: 'r', ctrl: true }, 'ctrl+d': { name: 'd', ctrl: true }, '→': { name: 'right' }, '←': { name: 'left' }, '↑': { name: 'up' }, '↓': { name: 'down' }, 'shift+tab': { name: 'tab', shift: true },
-  'ctrl-w': { name: 'w', ctrl: true }, 'ctrl-t': { name: 't', ctrl: true },
+  'ctrl+w': { name: 'w', ctrl: true }, 'ctrl+t': { name: 't', ctrl: true },
   'ctrl+p': { name: 'p', ctrl: true }, 'ctrl+f': { name: 'f', ctrl: true }, 'ctrl+e': { name: 'e', ctrl: true }, 'ctrl+x': { name: 'x', ctrl: true }, 'ctrl+u': { name: 'u', ctrl: true },
 };
 
@@ -201,6 +237,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let files: { list: string[]; recent: string[]; at: number } | null = null;
   const usedFiles: string[] = []; // attached with @ in this session, shown first
   let boxKind: 'keys' | 'usage' | null = null;
+  let keysPage = 0; // the ? sheet's page, when it needs more than one
   let panel: Panel | null = null;
   let quitArmed: NodeJS.Timeout | null = null;
   let quitting: string | null = null;
@@ -211,7 +248,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // ---- saving (SPEC §16): every message is written the moment it exists ----
   const project = projectOf(cwd);
   // Split view (Phase 10): the tabbed panel on the right, whether it has the keys,
-  // and a pending ctrl-w (the panel prefix).
+  // and a pending ctrl+w (the panel prefix).
   const side = createSide({
     root: project, st, redraw: () => schedule(),
     files: () => (index ? index.files().sort() : listFiles(project)),
@@ -500,7 +537,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       return box('commands', [...rows, ...footRows(['↑ ↓', ' choose · ', 'tab', ' complete · ', 'enter', ' run · ', 'esc', ' close'], st)], width, st, st.accent, 'key:esc');
     }
     if (boxKind === 'keys') {
-      return box('shortcuts', [...[...KEYS, ['ctrl+t', 'new shell tab (split view)'] as [string, string], ...(side.tabs.length ? PANEL_KEYS : [])].map(([k, h]) => listRow(k, h, false, st, undefined, 16)), ...footRows('any key to close', st)], width, st, st.accent, 'key:esc');
+      return keysSheet(width, H(), st, keysPage);
     }
     if (boxKind === 'usage') return box(`usage · this conversation${model ? ` · ${model.label}` : ''}`, usageRows(width), width, st, st.accent, 'key:esc');
     return null;
@@ -772,11 +809,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const key = (t: string) => ({ t, s: st.accentB });
       const parts: { line: Line; id?: string }[] = [];
       if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
-      // After ctrl-w: its keys, each a group of its own so they wrap whole.
-      if (prefix) for (const [k, l] of [['ctrl-w', ' …'], ['v', ' split'], ['h l', ' focus'], ['q', ' close'], ['1-9', ' tab'], ['n p', ' next / previous'], ['z', ' hide']]) parts.push({ line: [key(k), dim(l)] });
+      // After ctrl+w: its keys, each a group of its own so they wrap whole.
+      if (prefix) for (const [k, l] of [['ctrl+w', ' …'], ['v', ' split'], ['h l', ' focus'], ['q', ' close'], ['1-9', ' tab'], ['n p', ' next / previous'], ['z', ' hide']]) parts.push({ line: [key(k), dim(l)] });
       if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
-      if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl-w z')], id: 'panel' });
-      else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl-w l'), dim(' panel')], id: 'panel' });
+      if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+w z')], id: 'panel' });
+      else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl+w l'), dim(' panel')], id: 'panel' });
       if (running) parts.push({ line: [{ t: '⟳ ', s: st.accent }, dim(`${running.label} · `), key('ctrl+c'), dim(' stop')], id: 'key:ctrl+c' });
       if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
       if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
@@ -2313,7 +2350,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (!side.tabs[n]) return `No tab ${n + 1}; there are ${side.tabs.length}.`;
       side.go(n);
       if (action === 'tab.focus') return `Showing tab ${n + 1}.`;
-      if (side.asking() || (side.tabs[n].kind === 'shell' && (side.tabs[n] as { state: string }).state === 'running')) return 'That tab is still running a command; the user closes it with ctrl-w q.';
+      if (side.asking() || (side.tabs[n].kind === 'shell' && (side.tabs[n] as { state: string }).state === 'running')) return 'That tab is still running a command; the user closes it with ctrl+w q.';
       return side.close(), `Closed tab ${n + 1}.`;
     }
     // The browser tab: a web address, or a local file shown as file://. The first
@@ -2490,7 +2527,23 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     };
   }
 
-  // The key after ctrl-w.
+  // /panel: split view for terminals where ctrl+w and ctrl+t never arrive (a
+  // terminal in a browser tab closes or opens tabs on them).
+  function panelCmd(a = '') {
+    if (a === 'hide') return void (side.show(false), (sideFocus = false));
+    if (a === 'files') side.files();
+    else if (a === 'shell') side.shell();
+    else if (a === 'diff') {
+      const cps = checkpointsOf(), cp = cps?.last();
+      if (!cps || !cp) return note('No changes to show: Rime takes a checkpoint before it changes a file.', 'dim');
+      side.diff(cps.diff(cp), true);
+    } else if (a) return note(`/panel ${a}? Try /panel, /panel files, shell, diff or hide.`, 'dim');
+    else if (!side.tabs.length) side.files();
+    else side.show(true);
+    sideFocus = side.visible;
+  }
+
+  // The key after ctrl+w.
   function panelKey(k: Key) {
     const n = k.name === 'char' ? (k.ch ?? '') : '';
     if (n === 'v') {
@@ -3262,6 +3315,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     else if (c === '/compact') void compactNow();
     else if (c === '/diff') showDiff();
     else if (c === '/undo') undo();
+    else if (c === '/panel') panelCmd(args[0]);
     else {
       S.items.push({ kind: 'user', text: v });
       S.items.push({ kind: 'reply', text: `Unknown command ${c}. Press / to see the commands.`, done: true });
@@ -3399,6 +3453,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const label = id.slice(4);
       const k = CLICK_KEYS[label] ?? (/^[a-z0-9]$/.test(label) ? { name: 'char', ch: label } : null);
       if (k) onKey({ type: 'key', ...k });
+      // A panel key ("ctrl+w q"): the prefix, then the letter.
+      else if (/^ctrl\+w [a-z]$/.test(label)) (prefix = true), onKey({ type: 'key', name: 'char', ch: label.at(-1) });
       return;
     }
     if (id === 'stop') return stopBg();
@@ -3450,7 +3506,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   function onKey(k: Extract<InputEvent, { type: 'key' }>) {
     if (list) return listKey(k);
     if (boxKind === 'keys') {
-      boxKind = null; // any key closes the sheet
+      // → or tab turns the page when there's more; any other key closes the sheet.
+      if ((k.name === 'right' || k.name === 'tab') && keysPage + 1 < keysSheet(CW(), H(), st).pages) return void keysPage++;
+      boxKind = null;
+      keysPage = 0;
       return;
     }
     // The permission question takes the keys while it's open.
@@ -3476,8 +3535,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (k.name === 'enter' && !k.shift) return Q.done(Q.options[Q.sel].label);
       if (k.name === 'escape') return void (Q.tool ? S.busy?.abort() : (S.question = null));
     }
-    // Split view (SPEC §8): ctrl-w is the panel prefix once there are tabs (or on an
-    // empty prompt, so ctrl-w v opens the first); ctrl-w ctrl-w is ctrl-w itself.
+    // Split view (SPEC §8): ctrl+w is the panel prefix once there are tabs (or on an
+    // empty prompt, so ctrl+w v opens the first); ctrl+w ctrl+w is ctrl+w itself.
     if (prefix) return void ((prefix = false), panelKey(k));
     if (k.ctrl && k.name === 'w' && !panel && (side.tabs.length > 0 || (!buf && !sideFocus))) return void (prefix = true);
     if (k.ctrl && k.name === 't' && !panel) return void (side.shell(), (sideFocus = true));

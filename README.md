@@ -89,6 +89,7 @@ rime connect http://localhost:8080 --name local
 | `/permissions` | permission mode and allow / ask / deny rules |
 | `/conversations` | this project's conversations |
 | `/usage` | tokens, cost and cache savings |
+| `/panel` | split view: `/panel files`, `shell`, `diff` or `hide` (where a browser terminal takes `ctrl+w`) |
 | `/clear` | start a new conversation |
 | `/exit` | quit |
 
