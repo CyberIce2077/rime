@@ -248,8 +248,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
 
   // ---- saving (SPEC §16): every message is written the moment it exists ----
   const project = projectOf(cwd);
-  // Split view (Phase 10): the tabbed panel on the right, whether it has the keys,
-  // and a pending ctrl+w (the panel prefix).
+  // Split view (Phase 10): the tabbed panel on the right (its ctrl+w keys live in
+  // the panel), and whether it has the keys.
   const side = createSide({
     root: project, st, redraw: () => schedule(),
     files: () => (index ? index.files().sort() : listFiles(project)),
