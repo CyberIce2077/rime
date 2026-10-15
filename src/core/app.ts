@@ -2932,7 +2932,16 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (k.ctrl && k.name === 'x' && r) {
       const many = L.picked.size ? rows.filter((x) => x.id !== null && L.picked.has(x.id)) : [r];
-      if (many.some((x) => x.id === null)) return say("nothing to delete: it isn't saved until you send something");
+      // The empty new conversation you're in: nothing to lose, so it goes at once
+      // and you're in the next one (there's always one you're in).
+      if (r.id === null && !L.picked.size) {
+        const next = rows.find((x) => x !== r && x.project === project && !x.other);
+        if (!next) return say("it's empty, and it's the only one");
+        openRow(next, true);
+        L.on = keyOf(next);
+        L.at = 0;
+        return say('✓ deleted the empty conversation');
+      }
       if (many.some((x) => x.other)) return say("it's open in another Rime window; close it there first");
       if (many.some((x) => x.session && (x.session.busy || x.session.waiting || x.session.approval))) return say("it's still working; stop it first");
       return void (L.confirm = many);
@@ -3053,10 +3062,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     say(`✓ exported to ${out.join(', ')}`);
   }
 
-  function openRow(r?: ListRow) {
+  // stay: open it behind the list, which stays open.
+  function openRow(r?: ListRow, stay = false) {
     if (!r) return;
     if (r.project !== project) return void note(`That conversation belongs to ${tildify(r.project)}. Run rime there to open it.`, 'dim'), (list = null);
-    list = null;
+    if (!stay) list = null;
     if (r.session) return show(r.session); // open here, maybe still working
     if (r.id === null) return;
     const c = save((d) => d.take(r.id!));
