@@ -67,7 +67,7 @@ test('status parts pack into rows whole, and nothing is ever cut', async () => {
   const sep = { t: ' · ', s: '' };
   const text = (rows: { line: { t: string }[] }[]) => rows.map((r) => r.line.map((x) => x.t).join(''));
   // The first row is narrow (beside the meter); whole parts move down.
-  assert.deepEqual(text(packParts([p('ctrl+w …'), p('v split'), p('h l focus'), p('q close')], 20, 40, sep)), ['ctrl+w … · v split', 'h l focus · q close']);
+  assert.deepEqual(text(packParts([p('ctrl+w …'), p('v split'), p('1-9 tab'), p('q close')], 20, 40, sep)), ['ctrl+w … · v split', '1-9 tab · q close']);
   // A part wider than any row wraps by words, nothing dropped.
   const long = text(packParts([p('one two three four five six seven eight')], 12, 16, sep));
   assert.equal(long.join(' ').replace(/\s+/g, ' '), 'one two three four five six seven eight');

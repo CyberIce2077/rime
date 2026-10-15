@@ -186,7 +186,7 @@ export function createSide(h: SideHost) {
   const ended = (h: Hint[]): Hint[] => h.map(([k, l, s], i) => [k, i === h.length - 1 && !l.endsWith(' · ') ? `${l} · ` : l, s]);
   function foot(t: Tab | undefined): Hint[] {
     if (!t) return [['ctrl+t', ' new shell · '], ['esc', ' chat']];
-    const tabs: Hint[] = [['ctrl+w n p', ' tabs · '], ['ctrl+w q', ' close · '], ['ctrl+w h', ' chat · '], ['?', ' all keys']];
+    const tabs: Hint[] = [['ctrl+w n p', ' tabs · '], ['ctrl+w q', ' close · '], ['esc', ' chat · '], ['?', ' all keys']];
     if (asking !== null) return [['', 'it is still running · ', st.warn], ['ctrl+w q', ' stop it and close · '], ['esc', ' keep it']];
     if (t.kind === 'custom') return [...ended(t.foot()), ...tabs];
     if (t.kind === 'shell')

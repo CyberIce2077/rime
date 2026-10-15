@@ -99,7 +99,7 @@ const KEY_GROUPS: [string, [string, string][]][] = [
   ['Panel', [
     ['ctrl+w v', 'split view (or /panel)'],
     ['ctrl+t', 'new shell tab'],
-    ['ctrl+w h  l', 'focus the chat / the panel'],
+    ['esc', 'from the panel, back to chat'],
     ['ctrl+w q', 'close the tab'],
     ['ctrl+w ← →', 'wider / narrower · e evenly'],
     ['ctrl+w 1…9', 'a tab · n p next / previous'],
@@ -813,11 +813,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (S.declining) parts.push({ line: [dim('type what Rime should do instead')] });
       // After ctrl+w: its keys, each a group of its own so they wrap whole.
       // Not split: only the keys that do something then.
-      const pk = side.visible ? [['v', ' split'], ['h l', ' focus'], ['q', ' close'], ['1-9', ' tab'], ['n p', ' next / previous'], ['z', ' hide']] : [['v', ' split'], ...(side.tabs.length ? [['z', ' show']] : [])];
+      const pk = side.visible ? [['v', ' split'], ['q', ' close'], ['1-9', ' tab'], ['n p', ' next / previous'], ['z', ' hide']] : [['v', ' split'], ...(side.tabs.length ? [['z', ' show']] : [])];
       if (prefix) for (const [k, l] of [['ctrl+w', ' …'], ...pk]) parts.push({ line: [key(k), dim(l)] });
       if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
       if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+w z')], id: 'panel' });
-      else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl+w l'), dim(' panel')], id: 'panel' });
+      else if (side.visible && !sideFocus) parts.push({ line: [key(`ctrl+w ${side.active + 1}`), dim(' panel')], id: 'panel' });
       if (running) parts.push({ line: [{ t: '⟳ ', s: st.accent }, dim(`${running.label} · `), key('ctrl+c'), dim(' stop')], id: 'key:ctrl+c' });
       if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
       if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
@@ -2558,9 +2558,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (!side.tabs.length) side.files();
       else side.show(true);
       sideFocus = true;
-    } else if (n === 'h') sideFocus = false;
-    else if (n === 'l') sideFocus = side.visible;
-    else if (n === 'q') side.close(side.asking());
+    } else if (n === 'q') side.close(side.asking());
     else if (k.name === 'left') side.resize(0.05);
     else if (k.name === 'right') side.resize(-0.05);
     else if (n === 'e') side.resize(0);
