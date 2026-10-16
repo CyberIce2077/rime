@@ -2,9 +2,11 @@
 // chatting and watch it in a split-view tab. A design is a plain HTML file in the
 // project (design/<name>.html), so it can be diffed, reviewed and committed. Every
 // change is kept as a version (.rime/design/<name>/), ← → step through them, and
-// a change made on an older version starts a branch from it. d t p switch the
-// viewport, i picks a part of the page into the prompt (@Headline), e asks the
-// model to turn it into code. Rendered by the browser plug-in's engine.
+// a change made on an older version starts a branch from it. v cycles the
+// viewport, p picks a part of the page into the prompt (@Headline), c compares
+// with v1, a applies it to the project (docs/split-v2.md §4.6). A design can
+// start from the project's own page (capture). Rendered by the browser plug-in's
+// engine.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 import { rimeDir } from '../../core/config.ts';
 import type { Key, Line } from '../../core/term.ts';
 import type { Hint } from '../../core/view.ts';
-import { type BrowserHost, openEngine } from '../browser/browser.ts';
+import { type BrowserHost, openEngine, withScheme } from '../browser/browser.ts';
 import type { CustomTab } from '../shell-panel/panel.ts';
 
 export const VIEWPORTS = { desktop: 1280, tablet: 834, phone: 390 } as const;
@@ -53,17 +55,24 @@ export function starter(what: string) {
 export function createVersions(project: string, name: string) {
   const dir = () => rimeDir(project, 'design', name);
   const stateFile = () => path.join(dir(), 'state.json');
-  const load = (): { count: number; current: number } => {
+  type State = { count: number; current: number; from?: From };
+  const load = (): State => {
     try {
       return JSON.parse(fs.readFileSync(stateFile(), 'utf8'));
     } catch {
       return { count: 0, current: 0 };
     }
   };
-  const save = (s: { count: number; current: number }) => fs.writeFileSync(stateFile(), JSON.stringify(s));
+  const save = (s: State) => fs.writeFileSync(stateFile(), JSON.stringify(s));
   const read = (n: number) => fs.readFileSync(path.join(dir(), `${n}.html`), 'utf8');
   return {
     state: load,
+    file: (n: number) => path.join(dir(), `${n}.html`),
+    // The page a design was captured from, for apply.
+    setFrom(from: From) {
+      fs.mkdirSync(dir(), { recursive: true });
+      save({ ...load(), from });
+    },
     // The file as it is now becomes a version, unless it's the one showing.
     record(html: string) {
       const s = load();
@@ -101,8 +110,42 @@ export function pickName(e: { tag: string; text: string; id: string; cls: string
   return cap(e.tag);
 }
 
+export type From = { url?: string; file?: string };
 export type Pick = { name: string; selector: string; html: string; file: string };
-export type DesignHost = BrowserHost & { project: string; insert(text: string): void; pick(p: Pick): void; exportDesign(file: string, version: number): void; credit(): void };
+export type DesignHost = BrowserHost & { project: string; insert(text: string): void; pick(p: Pick): void; apply(file: string, version: number, from?: From): void; credit(): void };
+
+// "Your page" (§4.6): the running page as a static copy, its DOM with the CSS
+// that applies to it in one <style>, scripts stripped, links resolved against
+// its address. Nothing in the project changes.
+export async function capture(h: BrowserHost, url: string): Promise<string> {
+  const e = await openEngine(h);
+  try {
+    e.width(1280);
+    await e.page.goto(withScheme(url), { waitUntil: 'load', timeout: 20000 });
+    return await e.page.evaluate(() => {
+      const css = [...document.styleSheets].map((s) => {
+        if ((s.ownerNode as Element | null)?.id === 'rime-text-off') return ''; // Rime's own, for drawing text as characters
+        try {
+          return [...s.cssRules].map((r) => r.cssText).join('\n');
+        } catch {
+          return ''; // a sheet from another origin can't be read
+        }
+      }).join('\n');
+      const doc = document.documentElement.cloneNode(true) as HTMLElement;
+      doc.querySelectorAll('script, noscript, link[rel="stylesheet"], link[rel="modulepreload"], style').forEach((n) => n.remove());
+      const head = doc.querySelector('head') ?? doc.insertBefore(document.createElement('head'), doc.firstChild);
+      const base = document.createElement('base');
+      base.href = location.href;
+      const style = document.createElement('style');
+      style.textContent = css;
+      head.prepend(base);
+      head.append(style);
+      return '<!doctype html>\n' + doc.outerHTML;
+    });
+  } finally {
+    e.close();
+  }
+}
 
 // The design tab for design/<name>.html.
 export async function openDesign(h: DesignHost, name: string) {
@@ -110,10 +153,10 @@ export async function openDesign(h: DesignHost, name: string) {
   const abs = path.join(h.project, file);
   const v = createVersions(h.project, name);
   const e = await openEngine(h);
-  let vp: Viewport = 'desktop', picking = false, note = '';
+  let vp: Viewport = 'desktop', picking = false, comparing = false, note = '';
   e.width(VIEWPORTS[vp]);
   await e.page.goto(pathToFileURL(abs).href);
-  if (!v.state().count) v.record(fs.readFileSync(abs, 'utf8'));
+  v.record(fs.readFileSync(abs, 'utf8')); // a new file (a capture) becomes the next version
   // Every save is a version and a redraw (also saves made outside Rime).
   let timer: NodeJS.Timeout | undefined;
   const watcher = fs.watch(abs, () => {
@@ -122,45 +165,60 @@ export async function openDesign(h: DesignHost, name: string) {
       try {
         v.record(fs.readFileSync(abs, 'utf8'));
       } catch {}
-      void e.page.reload().catch(() => {});
+      comparing = false;
+      void e.page.goto(pathToFileURL(abs).href).catch(() => {});
       h.redraw();
     }, 120);
   });
   const step = (d: number) => {
     const s = v.state();
+    comparing = false;
     if (v.show(s.current + d) !== null) (note = ''), h.credit(); // no API call: counted as saved
   };
+  const order: Viewport[] = ['desktop', 'tablet', 'phone'];
   const tab: Omit<CustomTab, 'id' | 'kind'> = {
-    title: `design · ${name}`,
+    title: `${name} v${v.state().current}`,
+    icon: '✎',
     byRime: true,
     render(w, rows) {
       const { st } = h;
       const s = v.state();
+      tab.title = `${name} v${s.current}`;
       const bar: Line = [
-        { t: '▣ ', s: st.accent }, { t: file, s: st.title },
-        { t: ` · v${s.current} of ${s.count} · ${vp} ${VIEWPORTS[vp]}`, s: st.dim },
-        ...(picking ? [{ t: '  pick: click a part of the page', s: st.warn }] : note ? [{ t: `  ${note}`, s: st.dim }] : []),
+        { t: '✎ ', s: st.accent }, { t: file, s: st.title },
+        { t: ` · v${s.current} of ${s.count} · ${vp} ${VIEWPORTS[vp]} · ${s.from ? `from ${s.from.url ?? s.from.file}` : 'sketch'}`, s: st.dim },
       ];
-      return [bar, ...e.draw(w, rows - 1)];
+      const foot: Line = picking ? [{ t: 'pick: click an element and it goes to the chat prompt as @Name', s: st.warn }]
+        : comparing ? [{ t: `showing v1 · c to go back to v${s.current}`, s: st.warn }]
+        : e.cramped() ? [{ t: `${vp} ${VIEWPORTS[vp]} needs ${e.cramped()} columns to read here · z zooms · v ${vp === 'phone' ? 'desktop' : 'a narrower viewport'}`, s: st.warn }]
+        : [{ t: note || `v${s.current} of ${s.count}`, s: st.dim }];
+      const room = Math.max(1, rows - 2);
+      return [bar, ...[...e.draw(w, room), ...new Array(room).fill([])].slice(0, room), foot];
     },
-    overlay: (col, row, w, rows) => e.overlay(col, row + 1, w, rows - 1),
+    overlay: (col, row, w, rows) => e.overlay(col, row + 1, w, Math.max(1, rows - 2)),
     hide: e.hide,
     key(k: Key) {
       const ch = k.name === 'char' ? k.ch : '';
-      if (picking && k.name === 'escape') return (picking = false), true;
+      if (picking && (k.name === 'escape' || ch === 'p')) return (picking = false), true;
       if (k.name === 'left') return step(-1), true;
       if (k.name === 'right') return step(1), true;
-      if (ch === 'd' || ch === 't' || ch === 'p') {
-        vp = ch === 'd' ? 'desktop' : ch === 't' ? 'tablet' : 'phone';
+      if (ch === 'v') {
+        vp = order[(order.indexOf(vp) + 1) % order.length];
         e.width(VIEWPORTS[vp]);
         h.credit();
         return true;
       }
-      if (ch === 'i') return (picking = !picking), true;
-      if (ch === 'e') return h.exportDesign(file, v.state().current), true;
-      if (ch === 'r') return void e.page.reload().catch(() => {}), true;
-      if (ch === 'j' || k.name === 'down') return void e.page.mouse.wheel(0, 200).catch(() => {}), true;
-      if (ch === 'k' || k.name === 'up') return void e.page.mouse.wheel(0, -200).catch(() => {}), true;
+      if (ch === 'p') return (picking = true), true;
+      // Compare: v1 (as captured, or the first sketch) and back, with no API call.
+      if (ch === 'c') {
+        comparing = !comparing && v.state().count > 1;
+        void e.page.goto(pathToFileURL(comparing ? v.file(1) : abs).href).catch(() => {});
+        if (comparing) h.credit();
+        return true;
+      }
+      if (ch === 'a') return h.apply(file, v.state().current, v.state().from), true;
+      if (k.name === 'down') return void e.page.mouse.wheel(0, 200).catch(() => {}), true;
+      if (k.name === 'up') return void e.page.mouse.wheel(0, -200).catch(() => {}), true;
       return false;
     },
     // In pick mode a click names the element under it; otherwise it clicks the page.
@@ -192,7 +250,11 @@ export async function openDesign(h: DesignHost, name: string) {
         .catch(() => {});
     },
     wheel: (d: number) => void e.page.mouse.wheel(0, d * 60).catch(() => {}),
-    foot: (): Hint[] => (picking ? [['', 'click a part of the page · '], ['esc', ' stop picking']] : [['← →', ' versions · '], ['d t p', ' viewport · '], ['i', ' pick · '], ['e', ' export to code · ']]),
+    foot: (): Hint[] => {
+      const s = v.state();
+      if (picking) return [['', 'click a part of the page · '], ['p', ' stop picking']];
+      return [['← →', ` v${s.current} of ${s.count} · `], ['v', ` ${vp} · `], ['p', ' pick · '], ['c', comparing ? ` show v${s.current} · ` : ' compare · '], ['a', s.from ? ' apply to project' : ' make it a page in my project']];
+    },
     close() {
       clearTimeout(timer);
       watcher.close();
@@ -228,5 +290,5 @@ export async function overflow(h: BrowserHost, abs: string): Promise<string> {
 export const DESIGN_TOOL = {
   name: 'design',
   description: 'Write the design page the user is building (design/<name>.html, plain HTML and CSS in one file). Each write is a new version the user can step through, and the reply says whether anything overflows at desktop, tablet and phone widths. When the user picked a part (@Headline), change just that part.',
-  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'the design, e.g. landing' }, html: { type: 'string' } }, required: ['name', 'html'] },
+  input_schema: { type: 'object', properties: { name: { type: 'string', description: 'the design, e.g. landing' }, html: { type: 'string' }, from: { type: 'object', description: "first version only, when it redesigns the user's page: {url} or {file} it came from, so apply knows what to change", properties: { url: { type: 'string' }, file: { type: 'string' } } } }, required: ['name', 'html'] },
 };

@@ -86,5 +86,5 @@ test('the ? sheet: two columns at 100, pages of whole groups when the screen is 
   const narrow = keysSheet(60, 30, st);
   assert.equal(narrow.pages, 2);
   assert.ok(narrow.lines.length <= 30 - 5);
-  assert.match(stripAnsi(keysSheet(60, 30, st, 1).lines.join('\n')), /Panel[^]*ctrl\+t +split view on \/ off[^]*2\/2 · any key to close/);
+  assert.match(stripAnsi(keysSheet(60, 30, st, 1).lines.join('\n')), /Panel[^]*ctrl\+g +to the panel and back[^]*2\/2 · any key to close/);
 });

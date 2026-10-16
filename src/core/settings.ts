@@ -181,5 +181,22 @@ export function phrase(text: string): { key: string; value: string } | null {
   if (/^(?:open|show)(?: me)? (?:the )?(?:codebase|files|file tree|project)(?: in a (?:new )?tab)?$/.test(t)) return { key: 'tab', value: 'files' };
   if (/^(?:open|show)(?: me)? (?:the )?diff(?: in a (?:new )?tab)?$/.test(t)) return { key: 'tab', value: 'diff' };
   if (/^run (?:the )?tests in a (?:new )?tab$/.test(t)) return { key: 'tab', value: 'tests' };
+  // Split view v2 (docs/split-v2.md §5): the panel, servers, commands, the
+  // browser, file search and the design studio, by name. The app checks each
+  // still makes sense (a real address, a dev script) before handling it.
+  if (/^(?:open|show)(?: the)? (?:split|panel)(?: view| screen)?$|^split(?: screen| view)?$/.test(t)) return { key: 'panel', value: 'show' };
+  if (/^(?:close|hide)(?: the)? (?:split|panel)(?: view| screen)?$/.test(t)) return { key: 'panel', value: 'hide' };
+  if (/^(?:start|run)(?: the)?(?: dev)? server$|^run npm (?:run dev|start)$/.test(t)) return { key: 'serve', value: '' };
+  const raw = text.trim().replace(/[.!]+$/, '');
+  m = /^run ((?:npm|pnpm|yarn|bun|npx|node|make|cargo|go|pytest|python3?|deno|git|ls|tsc|vitest|jest)\b.*?)(?: in a (?:new )?tab)?$/i.exec(raw);
+  if (m) return { key: 'run', value: m[1] };
+  m = /^search (?:the |my )?(?:files|code|codebase|project) for (.+)$/i.exec(raw);
+  if (m) return { key: 'search', value: `text:${m[1].replace(/^["']|["']$/g, '')}` };
+  m = /^find (?:the file )?(\S*[./]\S*)$/i.exec(raw);
+  if (m) return { key: 'search', value: `name:${m[1]}` };
+  m = /^(?:open |start )?(?:the )?design studio (?:on|for|from) (?:my |the )?(.+?)(?: page)?$|^redesign (?:my |the )?(.+?)(?: page)?$/i.exec(raw);
+  if (m) return { key: 'design', value: m[1] ?? m[2] };
+  m = /^(?:go to|open|visit|browse to) (\S*[.:/]\S*?)(?: in (?:the|a) (?:browser|tab))?$/i.exec(raw);
+  if (m) return { key: 'open', value: m[1] };
   return null;
 }

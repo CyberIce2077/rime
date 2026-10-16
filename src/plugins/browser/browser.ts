@@ -4,10 +4,13 @@
 // ~/.rime/plugins/browser (not into Rime, which keeps no runtime dependencies)
 // and uses your installed Chrome, or downloads Chromium when there's none.
 //
-// Frames come from Chrome's screencast and are drawn as ▀ half-blocks in any
-// truecolor terminal, or as images with the Kitty graphics protocol or iTerm2
-// inline images where the terminal says it has them (RIME_GFX=kitty|iterm|blocks
-// forces one). Clicks on the page go to the page; keys too once you've clicked
+// Frames come from Chrome's screencast and are drawn as images with the Kitty
+// graphics protocol or iTerm2 inline images where the terminal has them
+// (RIME_GFX=kitty|iterm|blocks forces one). Anywhere else (Apple's Terminal, which
+// shows no images) the page is quadrant blocks (2×2 pixels a cell) with its text
+// as real characters on top: the picture is taken with the text hidden, and each
+// letter is drawn in its own colour in the cell where the page puts it, so text
+// stays sharp and only pictures are blocky. Clicks on the page go to the page; keys too once you've clicked
 // into it.
 
 import { spawn } from 'node:child_process';
@@ -15,7 +18,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { type Key, type Line, wrap } from '../../core/term.ts';
+import { type Key, type Line, strWidth, wrap } from '../../core/term.ts';
 import type { RGB } from '../../core/theme.ts';
 import type { Hint, Styles } from '../../core/view.ts';
 import type { CustomTab } from '../shell-panel/panel.ts';
@@ -23,6 +26,9 @@ import type { CustomTab } from '../shell-panel/panel.ts';
 export const DIR = path.join(process.env.RIME_PLUGINS_DIR ?? path.join(os.homedir(), '.rime', 'plugins'), 'browser');
 const PACKAGES = ['playwright-core@1.56.1', 'pngjs@7.0.0'];
 const CELL = { w: 9, h: 18 }; // pixels per cell when the terminal doesn't say
+// Drawn as characters: a cell is about one letter of 16px text wide, so a page's
+// words fit their cells.
+const TEXT_CELL = { w: 8, h: 16 };
 
 export const installed = () => fs.existsSync(path.join(DIR, 'node_modules', 'playwright-core', 'package.json'));
 const choice = (): { channel?: string } => {
@@ -112,25 +118,139 @@ export function gfxMode(env = process.env): 'kitty' | 'iterm' | 'blocks' {
   return 'blocks';
 }
 
-// The page as ▀ cells: the top pixel is the foreground, the bottom the background.
-export function blocks(png: { width: number; height: number; data: Uint8Array | Buffer }, cols: number, rows: number, color: (rgb: RGB, bg: boolean) => string): Line[] {
+// The page's text by cell: a letter and its colour.
+export type TextCell = { ch: string; rgb: RGB };
+
+// The page as quadrant cells (▘▝▖▗▌▐▚▞▀▄…): 2×2 pixels a cell in two colours.
+// Each pixel is the average of its patch of the picture (so a bigger picture is
+// smoother, not sharper); the two most different pixels seed the cell's colours
+// and the other two join the nearer one. A cell with text shows the letter
+// instead, on the average colour of the page under it.
+const QUAD = ' ▗▖▄▝▐▞▟▘▚▌▙▀▜▛█'; // bit 8 top-left, 4 top-right, 2 bottom-left, 1 bottom-right
+export function blocks(png: { width: number; height: number; data: Uint8Array | Buffer }, cols: number, rows: number, color: (rgb: RGB, bg: boolean) => string, text?: Map<number, TextCell>): Line[] {
   const { width: W, height: H, data } = png;
+  // The average colour of the picture under pixel (x, y) of a cols*2 × rows*2 grid.
   const px = (x: number, y: number): RGB => {
-    const sx = Math.min(W - 1, Math.floor((x * W) / cols)), sy = Math.min(H - 1, Math.floor((y * H) / (rows * 2)));
-    const i = (sy * W + sx) * 4;
-    return [data[i], data[i + 1], data[i + 2]];
+    const x0 = Math.floor((x * W) / (cols * 2)), x1 = Math.max(x0 + 1, Math.floor(((x + 1) * W) / (cols * 2)));
+    const y0 = Math.floor((y * H) / (rows * 2)), y1 = Math.max(y0 + 1, Math.floor(((y + 1) * H) / (rows * 2)));
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let sy = y0; sy < Math.min(y1, H); sy++)
+      for (let sx = x0; sx < Math.min(x1, W); sx++) {
+        const i = (sy * W + sx) * 4;
+        (r += data[i]), (g += data[i + 1]), (b += data[i + 2]), n++;
+      }
+    return n ? [Math.round(r / n), Math.round(g / n), Math.round(b / n)] : [0, 0, 0];
   };
+  const dist = (a: RGB, b: RGB) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+  const avg = (ps: RGB[]): RGB => [0, 1, 2].map((k) => Math.round(ps.reduce((s, p) => s + p[k], 0) / ps.length)) as RGB;
   const out: Line[] = [];
   for (let r = 0; r < rows; r++) {
     const line: Line = [];
-    for (let c = 0; c < cols; c++) line.push({ t: '▀', s: color(px(c, r * 2), false) + color(px(c, r * 2 + 1), true) });
+    for (let c = 0; c < cols; c++) {
+      const q = [px(c * 2, r * 2), px(c * 2 + 1, r * 2), px(c * 2, r * 2 + 1), px(c * 2 + 1, r * 2 + 1)];
+      const t = text?.get(r * cols + c);
+      if (t === undefined) {
+        // The two pixels furthest apart are the cell's two colours.
+        let a = 0, b = 0, far = -1;
+        for (let i = 0; i < 4; i++) for (let j = i + 1; j < 4; j++) if (dist(q[i], q[j]) > far) (far = dist(q[i], q[j])), (a = i), (b = j);
+        if (far === 0) line.push({ t: ' ', s: color(q[0], true) });
+        else {
+          let mask = 0;
+          const fg: RGB[] = [], bg: RGB[] = [];
+          q.forEach((p, i) => (dist(p, q[a]) <= dist(p, q[b]) ? (mask |= 8 >> i, fg.push(p)) : bg.push(p)));
+          line.push({ t: QUAD[mask], s: color(avg(fg), false) + color(avg(bg), true) });
+        }
+      } else if (t.ch) {
+        const bg = avg(q);
+        line.push({ t: t.ch, s: color(readable(t.rgb, bg), false) + color(bg, true) });
+        if (strWidth(t.ch) === 2) c++; // a wide letter takes the next cell too
+      }
+    }
     out.push(line);
+  }
+  return out;
+}
+// Text drawn the page's colour, unless that colour can't be read on the cell
+// (gradient or clipped text, a colour that only works over an image).
+const lum = ([r, g, b]: RGB) => 0.299 * r + 0.587 * g + 0.114 * b;
+export const readable = (fg: RGB, bg: RGB): RGB => (Math.abs(lum(fg) - lum(bg)) >= 60 ? fg : lum(bg) > 128 ? [20, 20, 20] : [240, 240, 240]);
+
+// Hides the page's text in the picture (the layout stays the same: only the
+// letters aren't painted); `color` still reads the text's own colour.
+const HIDE_TEXT = `(() => {
+  const add = () => {
+    if (document.getElementById('rime-text-off')) return;
+    const s = document.createElement('style');
+    s.id = 'rime-text-off';
+    s.textContent = '*, *::before, *::after, ::placeholder { -webkit-text-fill-color: transparent !important; text-shadow: none !important; }';
+    (document.head || document.documentElement).appendChild(s);
+  };
+  if (document.documentElement) add();
+  document.addEventListener('DOMContentLoaded', add);
+})()`;
+
+// The letters on screen, each at its cell (cell width and height in CSS pixels):
+// text nodes, and what's typed in (or the placeholder of) form fields.
+type Cells = [number, number, string, string, number][]; // x, y, letter, colour, word
+function textOnScreen([cw, ch, cols, rows]: [number, number, number, number]): Cells {
+  const out: Cells = [];
+  let word = 0;
+  const put = (x: number, y: number, c: string, color: string) => {
+    const cx = Math.floor(x / cw), cy = Math.floor(y / ch);
+    if (cx >= 0 && cy >= 0 && cx < cols && cy < rows) out.push([cx, cy, c, color, word]);
+  };
+  const vw = innerWidth, vh = innerHeight;
+  const seen = (r: DOMRect) => r.width > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+  const range = document.createRange();
+  const walk = document.createTreeWalker(document.body ?? document.documentElement, NodeFilter.SHOW_TEXT);
+  for (let n = walk.nextNode(); n && out.length < 12000; n = walk.nextNode()) {
+    const text = n.nodeValue ?? '';
+    const el = n.parentElement;
+    if (!el || !text.trim() || /^(SCRIPT|STYLE|NOSCRIPT|TEXTAREA|OPTION)$/.test(el.tagName)) continue;
+    range.selectNodeContents(n);
+    if (!seen(range.getBoundingClientRect())) continue;
+    const cs = getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.opacity === '0') continue;
+    const shown = cs.textTransform === 'uppercase' ? text.toUpperCase() : cs.textTransform === 'lowercase' ? text.toLowerCase() : text;
+    // Each word starts in the cell where the page puts it (a space after the
+    // word before, on the same row) and its letters follow one per cell, so no
+    // letter is lost to a narrow font.
+    let last = { y: -1, x: -1 };
+    for (const w of shown.matchAll(/\S+/g)) {
+      range.setStart(n, w.index!);
+      range.setEnd(n, w.index! + [...w[0]][0].length);
+      const b = range.getBoundingClientRect();
+      if (!b.width) continue;
+      // Covered by something else (a dialog, a sticky bar): not drawn.
+      const top = document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
+      if (top && top !== el && !el.contains(top) && !top.contains(el)) continue;
+      const y = Math.floor((b.top + b.height / 2) / ch);
+      let x = Math.round(b.left / cw);
+      if (y === last.y) x = Math.max(x, last.x + 2);
+      word++;
+      for (const c of w[0]) put(x++ * cw + cw / 2, y * ch + ch / 2, c, cs.color);
+      last = { y, x: x - 1 };
+    }
+  }
+  for (const f of document.querySelectorAll('input, textarea, select')) {
+    const e = f as HTMLInputElement, r = e.getBoundingClientRect();
+    if (!seen(r) || /^(hidden|checkbox|radio|range|color|file|image)$/.test(e.type)) continue;
+    const cs = getComputedStyle(e);
+    const shown = e.tagName === 'SELECT' ? (e as unknown as HTMLSelectElement).selectedOptions[0]?.text ?? '' : e.type === 'password' ? '•'.repeat(e.value.length) : e.value || e.placeholder || (/^(submit|button|reset)$/.test(e.type) ? e.value : '');
+    const color = e.value ? cs.color : 'rgb(140, 140, 140)';
+    word++;
+    let x = r.left + parseFloat(cs.paddingLeft || '0') + parseFloat(cs.borderLeftWidth || '0');
+    for (const c of shown.split('\n')[0]) {
+      if (x + cw / 2 > r.right) break;
+      if (c.trim()) put(x + cw / 2, r.top + r.height / 2, c, color);
+      x += cw;
+    }
   }
   return out;
 }
 
 const KEYS: Record<string, string> = { enter: 'Enter', backspace: 'Backspace', tab: 'Tab', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', delete: 'Delete', home: 'Home', end: 'End', space: ' ' };
-const withScheme = (url: string) => (/^[a-z]+:\/\//i.test(url) ? url : (/^(localhost|127\.|\d+\.\d+\.\d+\.\d+)/.test(url) ? 'http://' : 'https://') + url);
+export const withScheme = (url: string) => (/^[a-z]+:\/\//i.test(url) ? url : (/^(localhost|127\.|\d+\.\d+\.\d+\.\d+)/.test(url) ? 'http://' : 'https://') + url);
 
 export type BrowserHost = { st: Styles; color: (rgb: RGB, bg: boolean) => string; redraw(): void; onClose(): void; log(line: string): void };
 
@@ -175,7 +295,8 @@ export async function openEngine(h: BrowserHost) {
   const browser = await chromeNow();
   let size = { cols: 60, rows: 20 };
   let css: number | null = null; // a fixed page width in CSS pixels
-  const viewport = () => (css ? { width: css, height: Math.max(200, Math.round((css * size.rows * CELL.h) / (size.cols * CELL.w))) } : { width: size.cols * CELL.w, height: size.rows * CELL.h });
+  const cell = gfx === 'blocks' ? TEXT_CELL : CELL;
+  const viewport = () => (css ? { width: css, height: Math.max(200, Math.round((css * size.rows * cell.h) / (size.cols * cell.w))) } : { width: size.cols * cell.w, height: size.rows * cell.h });
   const page = await browser.newPage({ viewport: viewport() });
   const cdp = await page.context().newCDPSession(page);
   const logs: string[] = [];
@@ -187,11 +308,57 @@ export async function openEngine(h: BrowserHost) {
   });
   page.on('pageerror', (e: Error) => logs.push(`page error: ${e.message}`));
   page.on('framenavigated', () => h.redraw());
+  // No images in this terminal: the text is drawn as characters, not pixels.
+  let text: Map<number, TextCell> | undefined;
+  let reading = false, again = false;
+  const parse = (c: string): RGB | null => {
+    const m = /rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?/.exec(c);
+    return m && (m[4] === undefined || +m[4] > 0.1) ? [+m[1], +m[2], +m[3]] : null;
+  };
+  // Read where the letters are now; one read at a time, the last frame wins.
+  const readText = () => {
+    if (reading) return void (again = true);
+    reading = true;
+    const v = viewport();
+    void page
+      .evaluate(textOnScreen, [v.width / size.cols, v.height / size.rows, size.cols, size.rows])
+      .then((cells: Cells) => {
+        // Words in page order; one that runs into a word already drawn ends in …
+        // (a page too wide for its columns), and one with no room is left out.
+        const next = new Map<number, TextCell>();
+        let w = -1, cut = false, prev = -1;
+        for (const [x, y, ch, color, word] of cells) {
+          if (word !== w) (w = word), (cut = false), (prev = -1);
+          if (cut) continue;
+          const key = y * size.cols + x;
+          if (next.has(key) || (strWidth(ch) === 2 && (x + 1 >= size.cols || next.has(key + 1)))) {
+            cut = true;
+            if (prev >= 0 && next.get(prev)!.ch) next.set(prev, { ...next.get(prev)!, ch: '…' });
+            continue;
+          }
+          next.set(key, { ch, rgb: parse(color) ?? [20, 20, 20] });
+          if (strWidth(ch) === 2) next.set(key + 1, { ch: '', rgb: [0, 0, 0] });
+          prev = key;
+        }
+        text = next;
+        h.redraw();
+      })
+      .catch(() => {})
+      .finally(() => {
+        reading = false;
+        if (again) (again = false), readText();
+      });
+  };
+  if (gfx === 'blocks') {
+    await page.addInitScript(HIDE_TEXT);
+    await page.evaluate(HIDE_TEXT).catch(() => {});
+  }
   cdp.on('Page.screencastFrame', ({ data, sessionId }: { data: string; sessionId: number }) => {
     cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
     frame = data;
     decoded = null;
     fresh = true;
+    if (gfx === 'blocks') readText();
     h.redraw();
   });
   const cast = async () => {
@@ -199,7 +366,8 @@ export async function openEngine(h: BrowserHost) {
     await cdp.send('Page.startScreencast', {
       format: gfx === 'iterm' ? 'jpeg' : 'png',
       quality: 80,
-      ...(gfx === 'blocks' ? { maxWidth: size.cols, maxHeight: size.rows * 2 } : { maxWidth: size.cols * CELL.w, maxHeight: size.rows * CELL.h }),
+      // Quadrants: 2×2 pixels a cell, each the average of a 2×2 patch of the picture.
+      ...(gfx === 'blocks' ? { maxWidth: size.cols * 4, maxHeight: size.rows * 8 } : { maxWidth: size.cols * CELL.w, maxHeight: size.rows * CELL.h }),
     });
   };
   await cast();
@@ -214,14 +382,17 @@ export async function openEngine(h: BrowserHost) {
     gfx,
     logs,
     url: () => (closed ? '' : page.url()),
-    // The picture in `rows` rows of `w` cells (half-blocks), or nothing when an
+    // Drawn as characters, a page wider than its columns can hold (the design
+    // tab's 1280 desktop in a narrow panel): the columns it needs to be read.
+    cramped: () => (gfx === 'blocks' && css && css / size.cols > TEXT_CELL.w * 1.25 ? Math.ceil(css / TEXT_CELL.w) : 0),
+    // The picture in `rows` rows of `w` cells (quadrant blocks), or nothing when an
     // image protocol draws it (overlay).
     draw(w: number, rows: number): Line[] {
       if (w !== size.cols || rows !== size.rows) (size = { cols: w, rows }), refit();
       if (gfx !== 'blocks') return frame ? [] : [[{ t: 'loading…', s: h.st.dim }]];
       if (!frame) return [[{ t: 'loading…', s: h.st.dim }]];
       decoded ??= PNG.sync.read(Buffer.from(frame, 'base64'));
-      return blocks(decoded!, w, rows, h.color);
+      return blocks(decoded!, w, rows, h.color, text);
     },
     // Kitty and iTerm2 draw the picture after the text at (col, row); Kitty keeps
     // image 1, so a new frame replaces the last. null: no picture; '': unchanged.
@@ -257,51 +428,83 @@ export async function openEngine(h: BrowserHost) {
 }
 export type Engine = Awaited<ReturnType<typeof openEngine>>;
 
-// The browser tab and the model's actions on it. One per Rime window.
+// The browser tab and the model's actions on it. One per Rime window
+// (docs/split-v2.md §4.5): the address on top, the page, and a status row with
+// its state and console errors.
 export async function openBrowser(h: BrowserHost) {
   const e = await openEngine(h);
   const { page, logs } = e;
-  let typing = false;
+  let typing = false, driving = false, consoleView = false, loading = false;
+  let status: number | null = null;
+  page.on('request', (r: any) => {
+    if (r.isNavigationRequest() && r.frame() === page.mainFrame()) (loading = true), h.redraw();
+  });
+  page.on('response', (r: any) => {
+    if (r.request().isNavigationRequest() && r.frame() === page.mainFrame()) status = r.status();
+  });
+  page.on('load', () => ((loading = false), h.redraw()));
+  page.on('requestfailed', (r: any) => {
+    if (r.isNavigationRequest() && r.frame() === page.mainFrame()) (loading = false), (status = 0), h.redraw();
+  });
+  const where = () => e.url().replace(/^https?:\/\//, '').replace(/\/$/, '');
+  const errors = () => logs.filter((l) => /^(error|page error)/.test(l)).length;
+  const go = (url: string) => void page.goto(withScheme(url), { waitUntil: 'domcontentloaded', timeout: 20000 }).catch((x: Error) => h.log(`Couldn't open ${url}: ${x.message.split('\n')[0]}`));
+  const blank = () => !e.url() || e.url() === 'about:blank';
   const tab: Omit<CustomTab, 'id' | 'kind'> = {
     title: 'browser',
+    icon: '◐',
     byRime: true,
     render(w, rows) {
       const { st } = h;
-      const host = e.url().replace(/^https?:\/\//, '').replace(/\/$/, '') || 'blank';
-      tab.title = `browser · ${host.length > 20 ? host.slice(0, 19) + '…' : host}`;
-      const bar: Line = [{ t: '◍ ', s: st.accent }, { t: e.url() || 'about:blank', s: st.title }, ...(typing ? [{ t: '  typing into the page · esc stops', s: st.warn }] : [])];
+      tab.title = blank() ? 'browser' : where();
+      const bar: Line = [
+        { t: '◐ ', s: st.dim }, { t: blank() ? 'no page' : where(), s: st.title },
+        ...(driving ? [{ t: '  ● Rime is using this page', s: st.warn }] : typing ? [{ t: '  typing into the page', s: st.warn }] : []),
+      ];
+      const state: Line = [{ t: loading ? 'loading' : status === null ? '' : status === 0 ? 'no answer' : String(status), s: status && status >= 400 ? st.del : st.dim }, { t: `${status !== null || loading ? ' · ' : ''}console: ${errors()} error${errors() === 1 ? '' : 's'}`, s: errors() ? st.warn : st.dim }, ...(consoleView ? [{ t: ' · showing the console · c page', s: st.dim }] : [])];
       // No page yet: say how to open one, not a white page.
-      if (!e.url() || e.url() === 'about:blank') {
-        const help: Line[] = [[{ t: 'No page open yet.', s: st.title }], [], [{ t: '/browser <url>', s: st.accentB }, { t: '  a web address, localhost:5173, or a file like index.html', s: st.dim }], [{ t: '/browser use chrome', s: st.accentB }, { t: ' · ', s: st.dim }, { t: '/browser use chromium', s: st.accentB }, { t: '  switch browsers', s: st.dim }], [{ t: '/browser uninstall', s: st.accentB }, { t: '  remove the plug-in', s: st.dim }], [], [{ t: 'Or ask Rime to open a page.', s: st.dim }], [{ t: `Using ${usesChrome() ? 'your Chrome' : 'Chromium'}.`, s: st.dim }]];
+      if (blank()) {
+        const help: Line[] = [[{ t: 'No page open yet.', s: st.title }], [], [{ t: 'g', s: st.accentB }, { t: '  type an address: localhost:5173, example.com, or a file like index.html', s: st.dim }], [{ t: ':open <url>', s: st.accentB }, { t: '  the same, from the panel line', s: st.dim }], [{ t: ':browser use chrome', s: st.accentB }, { t: ' · ', s: st.dim }, { t: ':browser use chromium', s: st.accentB }, { t: '  switch browsers', s: st.dim }], [], [{ t: 'Or ask Rime to open a page.', s: st.dim }], [{ t: `Using ${usesChrome() ? 'your Chrome' : 'Chromium'}.`, s: st.dim }]];
         return [bar, [], ...help.flatMap((l) => (l.length ? wrap(l, w, w - 2).map((x, i) => (i ? [{ t: '  ', s: '' }, ...x] : x)) : [l]))];
       }
-      return [bar, ...e.draw(w, rows - 1)];
+      const room = Math.max(1, rows - 2);
+      const view = consoleView
+        ? [...(logs.length ? logs.slice(-40).slice(-room).map((l): Line => [{ t: l, s: /^(error|page error)/.test(l) ? st.del : st.fg }]) : [[{ t: 'The console is empty.', s: st.dim }]]), ...new Array(room).fill([])].slice(0, room)
+        : [...e.draw(w, room), ...new Array(room).fill([])].slice(0, room);
+      return [bar, ...view, state];
     },
-    overlay: (col, row, w, rows) => (!e.url() || e.url() === 'about:blank' ? null : e.overlay(col, row + 1, w, rows - 1)),
+    overlay: (col, row, w, rows) => (blank() || consoleView ? null : e.overlay(col, row + 1, w, Math.max(1, rows - 2))),
     hide: e.hide,
+    busy: () => false,
+    typing: () => typing,
     key(k: Key) {
       if (typing) {
         if (k.name === 'escape') return (typing = false), true;
+        if (driving) return true; // Rime is using the page: keys wait until it's done
         if (k.name === 'char' && !k.ctrl) void page.keyboard.type(k.ch ?? '').catch(() => {});
+        else if (k.ctrl && /^[a-z]$/.test(k.name)) void page.keyboard.press(`Control+${k.name}`).catch(() => {});
         else if (KEYS[k.name]) void page.keyboard.press(KEYS[k.name]).catch(() => {});
         return true;
       }
       const ch = k.name === 'char' ? k.ch : '';
+      if (k.name === 'enter' && !blank()) return (typing = true);
+      if (ch === 'g') return { label: 'address ›', value: blank() ? '' : where(), placeholder: 'localhost:5173/pricing or example.com', submit: (v: string) => v.trim() && go(v.trim()) };
       if (ch === 'r') return void page.reload().catch(() => {}), true;
-      if (ch === 'o') return void spawn(process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open', [e.url()], { detached: true, stdio: 'ignore' }).unref(), true;
-      if (ch === 'j' || k.name === 'down') return void page.mouse.wheel(0, 120).catch(() => {}), true;
-      if (ch === 'k' || k.name === 'up') return void page.mouse.wheel(0, -120).catch(() => {}), true;
+      if (ch === 'o' && !blank()) return void spawn(process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open', [e.url()], { detached: true, stdio: 'ignore' }).unref(), true;
+      if (ch === 'c') return (consoleView = !consoleView), true;
+      if (k.name === 'down') return void page.mouse.wheel(0, 120).catch(() => {}), true;
+      if (k.name === 'up') return void page.mouse.wheel(0, -120).catch(() => {}), true;
       if (ch === 'b') return void page.goBack().catch(() => {}), true;
       return false;
     },
     click(x: number, y: number) {
-      if (y < 1) return;
+      if (y < 1 || blank() || consoleView) return;
       const p = e.toPage(x, y - 1);
       typing = true;
-      void page.mouse.click(p.x, p.y).catch(() => {});
+      if (!driving) void page.mouse.click(p.x, p.y).catch(() => {});
     },
     wheel: (d: number) => void page.mouse.wheel(0, d * 40).catch(() => {}),
-    foot: (): Hint[] => (typing ? [['', 'keys go to the page · '], ['esc', ' stop typing']] : [['click', ' the page · '], ['r', ' reload · '], ['o', ' open in your browser · '], ['b', ' back · '], ['j k', ' scroll · ']]),
+    foot: (): Hint[] => (typing ? [['', 'typing into the page · '], ['esc', ' stop typing']] : [['enter', ' type in page · '], ['g', ' address · '], ['r', ' reload · '], ['b', ' back · '], ['o', ' your browser · '], ['c', consoleView ? ' page' : ' console']]),
     close() {
       e.close();
       h.onClose();
@@ -310,6 +513,16 @@ export async function openBrowser(h: BrowserHost) {
 
   // The model's actions. Each returns what the model reads.
   async function act(input: Record<string, unknown>): Promise<string> {
+    driving = true;
+    h.redraw();
+    try {
+      return await acting(input);
+    } finally {
+      driving = false;
+      h.redraw();
+    }
+  }
+  async function acting(input: Record<string, unknown>): Promise<string> {
     const a = String(input.action ?? '');
     const ref = input.ref ? page.locator(`aria-ref=${input.ref}`) : null;
     const target = () => ref ?? (input.selector ? page.locator(String(input.selector)) : page.getByText(String(input.text ?? ''), { exact: false })).first();
@@ -343,7 +556,7 @@ export async function openBrowser(h: BrowserHost) {
     }
   }
 
-  return { tab, act, url: e.url, close: () => tab.close?.() };
+  return { tab, act, url: e.url, reload: () => void page.reload().catch(() => {}), close: () => tab.close?.() };
 }
 export type BrowserSession = Awaited<ReturnType<typeof openBrowser>>;
 

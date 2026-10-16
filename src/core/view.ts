@@ -20,6 +20,7 @@ export function styles(mode: ColorMode) {
     dim: c(G.dim), ok: c(G.ok), del: c(G.del), warn: c(G.warn), line: c(G.line),
     think: (mode === 'none' ? '' : '\x1b[3m') + c(G.dim),
     bold: b, placeholder: c(PLACEHOLDER), panelBg: sgr(G.panel, true, mode),
+    faint: mode === 'none' ? '' : '\x1b[2m', // the unfocused side of split view
     selection: mode === 'none' ? '\x1b[7m' : sgr(SELECTION, true, mode) + c(G.title),
     // A chip in the prompt or a sent message; `chipOn` when the caret is on it.
     chip: mode === 'none' ? '' : sgr(G.water, true, mode) + c(G.accent),
