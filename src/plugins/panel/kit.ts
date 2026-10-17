@@ -4,7 +4,7 @@
 import { type Key, type Line, type Run, fit, lineWidth } from '../../core/term.ts';
 import { type Hint, type Styles } from '../../core/view.ts';
 
-// One view of the panel (review, plan, checks, run, git, files, context, log).
+// One view of the panel (changes, run, files).
 // It draws `rows` content rows, takes the keys the panel doesn't use, and names
 // its own keys for the footer. 'back' means esc had nothing left to close here,
 // so the chat gets the keys again.

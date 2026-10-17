@@ -1,17 +1,11 @@
-// The panel and its eight views, built from one host (the app). The order is
-// 1 review, 2 plan, 3 checks, 4 run, 5 git, 6 files, 7 context, 8 log until you
-// drag a tab somewhere else.
+// The panel and its three views, built from one host (the app). The order is
+// 1 changes, 2 run, 3 files until you drag a tab somewhere else.
 
 import type { Styles } from '../../core/view.ts';
-import { checksView } from './checks.ts';
-import { type Piece, contextView } from './context.ts';
+import { changesView } from './changes.ts';
 import { filesView } from './files.ts';
-import { gitView } from './git.ts';
 import { type Kit } from './kit.ts';
-import { type Entry, logView } from './log.ts';
 import { createPanel } from './panel.ts';
-import { type Step, planView } from './plan.ts';
-import { reviewView } from './review.ts';
 import { runView } from './run.ts';
 
 export type SideHost = {
@@ -24,27 +18,20 @@ export type SideHost = {
   open(url: string): void; // in the user's own browser
   files(): string[];
   recent?(): string[];
-  // review
+  // changes
   diff(): string;
   git(): boolean;
   undone(file: string, line: number, lines: string[]): void;
-  // plan
-  planChanged(steps: Step[]): void;
-  // git
   commitByRime(): void;
-  // context
-  pieces(): Piece[];
-  window(): number | undefined;
-  sent(): { prompt: number; cached: number } | null;
-  drop(at: [number, number]): void;
-  // log
-  entries(): Entry[];
   // the tab order you dragged, kept in the config
   order?: string[];
   reordered?(ids: string[]): void;
 };
 
-export const VIEWS = ['review', 'plan', 'checks', 'run', 'git', 'files', 'context', 'log'] as const;
+export const VIEWS = ['changes', 'run', 'files'] as const;
+
+// Names the views had before (and words for them) to the view that has that job now.
+export const OLD_VIEWS: Record<string, (typeof VIEWS)[number]> = { review: 'changes', diff: 'changes', git: 'changes', commit: 'changes', checks: 'run', tests: 'run', shell: 'run', server: 'run', servers: 'run', terminal: 'run', tab: 'run', codebase: 'files', tree: 'files', search: 'files' };
 
 export function createSide(h: SideHost) {
   // The panel exists after the views, so their kit reaches it through `panel`.
@@ -58,15 +45,18 @@ export function createSide(h: SideHost) {
     openFile: (p, line) => files.openFile(p, line) && panel.go('files'),
     env: () => h.env(),
   };
-  const review = reviewView({ ...kit, diff: h.diff, git: h.git, undone: h.undone, toChat: h.toChat });
-  const plan = planView({ ...kit, changed: h.planChanged });
-  const checks = checksView(kit);
+  const changes = changesView({ ...kit, diff: h.diff, git: h.git, undone: h.undone, toChat: h.toChat, commitByRime: h.commitByRime });
   const run = runView({ ...kit, open: h.open });
-  const git = gitView({ ...kit, commitByRime: h.commitByRime });
   const files = filesView({ ...kit, files: h.files, recent: h.recent });
-  const context = contextView({ ...kit, pieces: h.pieces, window: h.window, sent: h.sent, drop: h.drop });
-  const log = logView({ ...kit, entries: h.entries });
-  panel = createPanel(h.st, [review, plan, checks, run, git, files, context, log], h.redraw, { order: h.order, reordered: h.reordered });
-  return { panel, review, plan, checks, run, git, files, context, log };
+  panel = createPanel(h.st, [changes, run, files], h.redraw, { order: h.order, reordered: h.reordered });
+  // The view worth opening on: the one you were on while it has something,
+  // else changes waiting, else a failing check or something running, else files.
+  const best = () => {
+    changes.refresh();
+    const has = (id: string) => (id === 'changes' ? changes.pending > 0 : id === 'run' ? run.procs.some((p) => p.state !== 'idle') : !!files.viewing);
+    if (has(panel.active)) return panel.active;
+    return changes.pending ? 'changes' : run.badge() ? 'run' : 'files';
+  };
+  return { panel, changes, run, files, best };
 }
 export type Side = ReturnType<typeof createSide>;

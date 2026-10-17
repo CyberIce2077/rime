@@ -33,10 +33,8 @@ import { PRESETS } from '../providers/presets.ts';
 import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
-import { VIEWS, createSide } from '../plugins/panel/index.ts';
+import { OLD_VIEWS, VIEWS, createSide } from '../plugins/panel/index.ts';
 import { detect as detectChecks } from '../plugins/panel/checks.ts';
-import { DROPPED, piecesOf } from '../plugins/panel/context.ts';
-import { entriesOf } from '../plugins/panel/log.ts';
 import { type Step, stepsOf } from '../plugins/panel/plan.ts';
 import { compare as compareVersions, install as installVersion, latest as latestVersion, newest as newestVersion } from '../plugins/updater/update.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
@@ -59,13 +57,13 @@ const CMDS: [string, string][] = [
   ['/model', 'pick a model, effort and reasoning'],
   ['/setup', 'connect your server, this computer, or a provider'],
   ['/settings', 'every setting, applied right away'],
-  ['/panel', 'the panel: /panel review, plan, checks, run, git, files, context, log'],
+  ['/panel', 'the panel: /panel changes, run, files, or hide'],
   ['/undo', 'put back the files Rime changed in its last turn'],
   ['/compact', 'summarise the earlier conversation to free context'],
   ['/usage', 'tokens, cost and what the cache saved'],
   ['/exit', 'quit Rime'],
 ];
-const ALIASES: Record<string, string> = { '/clear': '/new', '/conversations': '/chats', '/connect': '/setup', '/diff': '/panel review', '/quit': '/exit' };
+const ALIASES: Record<string, string> = { '/clear': '/new', '/conversations': '/chats', '/connect': '/setup', '/diff': '/panel changes', '/quit': '/exit' };
 
 // SPEC §5: only keys every keyboard has and every terminal passes on (§5.1).
 // One meaning per key: the ? sheet in four groups.
@@ -96,7 +94,7 @@ const KEY_GROUPS: [string, [string, string][]][] = [
   ]],
   ['Panel', [
     ['ctrl+g', 'to the panel and back'],
-    ['← →  1-8', 'pick a view (in the panel)'],
+    ['← →  1-3', 'pick a view (in the panel)'],
     ['↑ ↓  enter', 'move, open'],
     ['esc', 'back, then the chat'],
     ['q', 'close the panel'],
@@ -149,14 +147,14 @@ const system = (cwd: string, agents = '', map = '') =>
   `Do the work with your tools: read files before you change them, create files with write, change them with edit, run commands with bash. Don't paste whole files into the chat; say in a line or two what you did.\n` +
   `When you need the user to choose before you go on, use the ask tool and stop there; never ask in text and then carry on in the same reply.\n` +
   `You run inside Rime. Use the rime tool to change Rime itself (the panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
-  `Beside the chat the user has a panel: review (your changes, hunk by hunk), plan, checks (types, lint, tests), run (commands and servers; bash with background: true starts a dev server there), git, files, context and a log of your tool calls. rime panel.read {view} gives you a view's text, such as the failing checks or a server's output. For a task with several steps, keep a short plan with rime plan {steps: [{text, state: done | now | next}]}. The user can /undo your last change.\n` +
+  `Beside the chat the user has a panel with three views: changes (your changes hunk by hunk, the branch, and a commit), run (the project's checks for types, lint and tests, every command you run, and servers; bash with background: true starts a dev server there) and files. rime panel.read {view} gives you a view's text, such as the failing checks or a server's output. For a task with several steps, keep a short plan with rime plan {steps: [{text, state: done | now | next}]}; the user sees it above the prompt. The user can /undo your last change.\n` +
   `The terminal can't show web pages or images: Rime has no browser. To show a page, start its server with bash background: true and tell the user to press o on it in the run view, which opens the address in their own browser.\n` +
   `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.` +
   (agents ? `\n\nAGENTS.md:\n${agents}` : '') +
   (map ? `\n\n${map}` : '');
 // Told once to a conversation from before the browser and design studio were
 // removed, so the model stops offering them (the system prompt stays frozen).
-const GONE = "[Rime: Rime no longer has a browser or a design studio; earlier mentions of a browser tab or design tab in this conversation are out of date. Beside the chat there is now a panel with review, plan, checks, run, git, files, context and log. To show a page, start its server with bash background: true; the user presses o on it in the run view to open it in their own browser.]";
+const GONE = "[Rime: Rime no longer has a browser or a design studio; earlier mentions of a browser tab or design tab in this conversation are out of date. Beside the chat there is now a panel with three views: changes, run (checks, commands and servers) and files. To show a page, start its server with bash background: true; the user presses o on it in the run view to open it in their own browser.]";
 const mentionsGone = (messages: Message[]) =>
   messages.some((m) => typeof m.content !== 'string' && m.content.some((b) =>
     (b.type === 'tool_use' && (b.name === 'browser' || b.name === 'design' || (b.name === 'rime' && /^(browser|design|tab)\./.test(String((b.input as { action?: string })?.action ?? ''))))) ||
@@ -250,7 +248,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
 
   // ---- saving (SPEC §16): every message is written the moment it exists ----
   const project = projectOf(cwd);
-  // The panel beside the chat, its eight views, and whether it has the keys
+  // The panel beside the chat, its three views, and whether it has the keys
   // (ctrl+g moves them to the other side).
   const sessionStart = Date.now();
   const side = createSide({
@@ -261,7 +259,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     open: (url) => openUrl(url),
     files: () => (index ? index.files().sort() : listFiles(project)),
     recent: () => [...edited, ...usedFiles],
-    // Review: Rime's changes since this window opened (in git, from its first
+    // Changes: Rime's changes since this window opened (in git, from its first
     // checkpoint since then; outside git a checkpoint knows only its own turn's files).
     diff: () => {
       const cps = checkpointsOf(), mine = cps?.list().filter((x) => x.at >= sessionStart) ?? [];
@@ -270,17 +268,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     },
     git: () => !!checkpointsOf()?.git,
     undone: (file, line) => void S.tell.push(`[Rime: the user undid one of your changes in ${file} near line ${line}; that part of the file is as it was before.]`),
-    planChanged: (steps) => void ((S.plan = steps), (S.planEdited = true)),
     commitByRime: () => void ((sideFocus = false), send("Commit the staged changes with a short message in the style of this repository's recent commits.")),
-    pieces: () => piecesOf(S.system, S.tools, S.messages),
-    window: () => (model ? contextOf(model) : undefined),
-    sent: () => (S.lastUsage ? { prompt: S.lastUsage.input + S.lastUsage.cached + S.lastUsage.written, cached: S.lastUsage.cached } : null),
-    drop: ([m, b]) => {
-      const blk = (S.messages[m]?.content as Block[] | undefined)?.[b];
-      if (blk?.type === 'tool_result') blk.content = DROPPED;
-      else if (blk?.type === 'text') blk.text = DROPPED;
-    },
-    entries: () => entriesOf(S.messages),
     order: cfg.panelOrder,
     reordered: (ids) => void ((cfg.panelOrder = ids), settings.save()),
   });
@@ -410,13 +398,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     costItem: Item | null; // this turn's ↳ line, kept last as its requests add up
     system: string; // its frozen system prompt: the stored one when reopened while the cache is warm
     tools: ToolDef[]; // its frozen tool list
-    plan: Step[]; // the model's plan (rime plan), shown in the panel
-    planEdited: boolean; // the user changed it: the model hears with the next message
-    lastUsage?: Usage; // the last request's tokens, for the context view
+    plan: Step[]; // the model's plan (rime plan), shown above the prompt
+    lastUsage?: Usage; // the last request's tokens
   };
   const newSession = (): Session => ({
     convId: null, messages: [], items: [headerItem], task: null, busy: null, waiting: null, live: null, lastUserSeq: 0,
-    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, tell: [], costItem: null, system: SYSTEM, tools: toolsNow(), plan: [], planEdited: false,
+    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, tell: [], costItem: null, system: SYSTEM, tools: toolsNow(), plan: [],
   });
   let S = newSession();
   const sessions: Session[] = [S]; // open in this window; the ones not on screen keep working
@@ -790,6 +777,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       lines.push(str(fit([{ t: '› ', s: st.dim }, { t, s: st.dim }, { t: ' · queued', s: st.accent }], width), st));
       rowHits.push([]);
     }
+    // The model's plan, while it has steps left: how far along, and the step now.
+    const plan = S.plan, todo = plan.filter((x) => x.state !== 'done');
+    if (todo.length && !panel) {
+      const now = todo.find((x) => x.state === 'now') ?? todo[0];
+      lines.push(str(fit([{ t: `plan ${plan.length - todo.length}/${plan.length} · `, s: st.dim }, { t: now.state === 'now' ? '▸ ' : '○ ', s: now.state === 'now' ? st.accentB : st.dim }, { t: now.text, s: st.title }, ...(todo[1] ? [{ t: `  then ${todo[1].text}`, s: st.dim }] : [])], width), st));
+      rowHits.push([]);
+    }
     // The line under the prompt sums up the next message.
     const sent = !panel && buf.trim() && !buf.startsWith('/') ? sendLine(buf, chips, listOpen, st, blind() && hasMedia(buf) ? `${blindNote()}` : undefined) : [];
     // The prompt grows to 10 rows (at most a third of the screen), then scrolls.
@@ -872,8 +866,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
           : ['⏵⏵⏵', 'auto', st.warn];
         parts.push({ line: [{ t: `${icon} ${name}`, s: ms }], id: 'mode' });
         // The panel: what's waiting there (changes to review, failing checks, servers).
-        const rv = side.review.badge();
-        const b = [rv && { ...rv, t: ` ±${rv.t.trim()}` }, side.checks.badge(), side.run.badge()].filter((x) => x).map((x) => x!);
+        const rv = side.changes.badge();
+        const b = [rv && { ...rv, t: ` ±${rv.t.trim()}` }, side.run.badge()].filter((x) => x).map((x) => x!);
         parts.push({ line: [key('←'), dim(' conversations')], id: 'conversations' });
         parts.push({ line: [key('ctrl+g'), dim(' panel'), ...b], id: 'panel:show' });
         parts.push({ line: [key('?'), dim(' keys')], id: '?' });
@@ -1347,11 +1341,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       }
       content = [...results, ...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content)];
     }
-    // A plan the user edited in the panel goes to the model with this message.
-    if (C.planEdited) {
-      C.planEdited = false;
-      C.tell.push(`[Rime: the user edited your plan in the panel. It is now:\n${C.plan.map((p) => `${p.state === 'done' ? '[x]' : p.state === 'now' ? '[>]' : '[ ]'} ${p.text}`).join('\n') || '(empty)'}]`);
-    }
     // What Rime did meanwhile (an /undo) goes to the model with this message.
     if (C.tell.length) content = [...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content), ...C.tell.splice(0).map((t): Block => ({ type: 'text', text: t }))];
     // Plan mode is told to the model in the message (the system prompt stays frozen).
@@ -1379,7 +1368,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     } finally {
       if (C.busy === me) C.busy = null;
       C.nextStep = nextFor(said, did, project);
-      if (C === S && (did.wrote.length || did.ran.length)) side.review.refresh(); // the status line counts files to review
+      if (C === S && (did.wrote.length || did.ran.length)) side.changes.refresh(); // the status line counts files to review
       offerChoices(said, C);
       if (C === S) askTrust(); // the rules file changed during the reply
       if (upd.state === 'ready' && upd.folded && C === S) offerRestart();
@@ -1747,7 +1736,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     S.items.push({ kind: 'lines', lines: [[{ t: '↶ ', s: st.accent }, { t: `undid "${cp.label}" · `, s: st.dim }, { t: what, s: st.title }]] });
     S.tell.push(`[Rime: the user undid your changes from "${cp.label}": ${what}. Those files are as they were before that.]`);
     if (S.convId) bound(S).event('edit', `undid "${cp.label}"`);
-    side.review.refresh();
+    side.changes.refresh();
     handled();
   }
 
@@ -1833,10 +1822,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const mirrored = async (u: Block, r: ToolResult | Promise<ToolResult>) => {
       const res = await r;
       mirrors.get(u.id)?.done(res.error ? Number(/exit (\d+)/.exec(res.summary)?.[1] ?? 1) : 0);
-      // Files may have changed: the review and the checks (when watching) catch up.
+      // Files may have changed: the changes view and the checks (when watching) catch up.
       if (u.name === 'write' || u.name === 'edit' || u.name === 'bash') {
-        side.checks.changed();
-        if (pane.visible) side.review.refresh();
+        side.run.checks.changed();
+        if (pane.visible) side.changes.refresh();
       }
       return res;
     };
@@ -2218,7 +2207,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const viewOf = (v: unknown) => {
       const x = String(v ?? '').toLowerCase();
       const n = Number(x);
-      return n >= 1 && n <= VIEWS.length ? viewIds()[n - 1] : (VIEWS as readonly string[]).includes(x) ? x : { diff: 'review', changes: 'review', tests: 'checks', shell: 'run', server: 'run', servers: 'run', tab: 'run', tools: 'log' }[x];
+      return n >= 1 && n <= VIEWS.length ? viewIds()[n - 1] : (VIEWS as readonly string[]).includes(x) ? x : OLD_VIEWS[x];
     };
     if (action === 'panel.show' || action === 'panel.split' || action === 'tab.focus') {
       const v = viewOf(args.view ?? args.tab ?? args.n) ?? (args.view || args.tab || args.n ? null : pane.active);
@@ -2231,20 +2220,19 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (action === 'panel.read' || action === 'tab.read') {
       const v = viewOf(args.view ?? args.tab ?? 'run');
       if (!v) return `No view ${args.view ?? args.tab}. Views: ${VIEWS.join(', ')}.`;
-      return pane.view(v).read?.(Number(args.n ?? args.lines) || undefined) ?? `The ${v} view has nothing to read; the log is the tool calls you already have.`;
+      return pane.view(v).read?.(Number(args.n ?? args.lines) || undefined) ?? `The ${v} view has nothing to read.`;
     }
     if (action === 'plan') {
       const steps = stepsOf(args.steps ?? args);
       if (!steps) return 'plan takes {steps: [{text, state: done | now | next}]}.';
       C.plan = steps;
-      C.planEdited = false;
-      if (C === S) side.plan.set(steps);
+      schedule();
       const done = steps.filter((x) => x.state === 'done').length;
-      return steps.length ? `Plan updated: ${done} of ${steps.length} done. The user sees it in the panel's plan view.` : 'Plan cleared.';
+      return steps.length ? `Plan updated: ${done} of ${steps.length} done. The user sees it above the chat prompt until every step is done.` : 'Plan cleared.';
     }
     if (action === 'file.open' || action === 'tab.open') {
       const kind = String(args.kind ?? (args.path ? 'file' : 'files'));
-      if (kind === 'diff') return pane.show(true), pane.go('review'), side.review.refresh(), 'Showing your changes in the review view.';
+      if (kind === 'diff') return pane.show(true), pane.go('changes'), 'Showing your changes in the changes view.';
       if (kind === 'files') {
         pane.show(true);
         if (args.query) side.files.search(args.text ? 'text' : 'name', String(args.query));
@@ -2412,9 +2400,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (x === 'hide' || (!x && pane.visible && sideFocus)) return void (pane.show(false), (sideFocus = false));
     if (!x) return otherSide();
     const n = Number(x);
-    const v = n >= 1 && n <= VIEWS.length ? viewIds()[n - 1] : x === 'diff' ? 'review' : x === 'shell' ? 'run' : (VIEWS as readonly string[]).includes(x) ? x : null;
+    const v = n >= 1 && n <= VIEWS.length ? viewIds()[n - 1] : (VIEWS as readonly string[]).includes(x) ? x : OLD_VIEWS[x];
     if (!v) return note(`/panel ${a}? Views: ${viewIds().map((v, i) => `${i + 1} ${v}`).join(', ')}, or hide.`, 'dim');
-    if (v === 'review') side.review.refresh();
     openView(v);
   }
 
@@ -2423,6 +2410,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // back there.
   function otherSide() {
     if (sideFocus && pane.visible) return void ((sideFocus = false), pane.zoom(false));
+    // Opening: on the view that has something to show.
+    if (!pane.visible) pane.go(side.best());
     pane.show(true);
     sideFocus = true;
   }
@@ -2491,7 +2480,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (!sessions.includes(x)) sessions.push(x);
     S = x;
-    side.plan.set(x.plan); // the panel shows this conversation's plan
     scrollOff = 0;
     browsing = null;
     blindAsk = false;
@@ -3098,8 +3086,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (ph.key === 'checks') {
       if (!detectChecks(project).length) return false; // no checks here: the model finds out how
       said();
-      openView('checks');
-      side.checks.run();
+      side.run.checks.run();
+      side.run.checks.focus();
+      openView('run');
       return void handled();
     }
     if (ph.key === 'run' || ph.key === 'serve') {
@@ -3237,7 +3226,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (ph && local(v, ph) !== false) return;
       return void send(v, false, [...v].some(isChip) ? blocksFor(v, chips, cwd, see) : v);
     }
-    // Older names still work: /clear is /new, /diff is /panel review.
+    // Older names still work: /clear is /new, /diff is /panel changes.
     const [c0, ...rest] = v.split(/\s+/);
     const [c, ...args] = [...(ALIASES[c0] ?? c0).split(' '), ...rest];
     boxKind = null;
@@ -3887,7 +3876,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     quitting = 'bye';
     finishDelete(); // a delete waiting for undo is done now
     side.run.killAll(); // commands in the panel stop with Rime
-    side.checks.stop();
     // Every open conversation: a reply being streamed is kept as interrupted.
     for (const x of sessions) {
       if (x.live && x.convId) save((d) => d.update(x.convId!, x.live!.seq, [{ type: 'text', text: x.live!.text() }], true));
@@ -3964,7 +3952,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     // The plan as the model last set it.
     const planned = C.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => b.type === 'tool_use' && b.name === 'rime' && (b.input as { action?: string })?.action === 'plan').at(-1);
     if (planned) C.plan = stepsOf(((planned.input as { args?: { steps?: unknown } }).args ?? {}).steps ?? []) ?? [];
-    if (C === S) side.plan.set(C.plan);
     // Pick up from the last reply: if it offered something, that's the suggestion.
     const lastReply = stored.at(-1)!;
     if (lastReply.role === 'assistant' && !lastReply.interrupted) {

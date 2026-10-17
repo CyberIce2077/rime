@@ -179,8 +179,8 @@ export function phrase(text: string): { key: string; value: string } | null {
   if (m) return { key: 'use', value: m[1] };
   // The panel and its views by name (SPEC §8), the checks, servers, commands and
   // file search. The app checks each still makes sense (a dev script) first.
-  m = /^(?:open|show)(?: me)? (?:the )?(codebase|files|file tree|project|diff|changes|review|plan|checks|git|context|log|tool log)(?: view| tab| in the panel)?$/.exec(t);
-  if (m) return { key: 'panel', value: ({ codebase: 'files', 'file tree': 'files', project: 'files', diff: 'review', changes: 'review', 'tool log': 'log' } as Record<string, string>)[m[1]] ?? m[1] };
+  m = /^(?:open|show)(?: me)? (?:the |my )?(codebase|files|file tree|project|diff|changes|review|git|checks|run|commands|servers|shell)(?: view| tab| in the panel)?$/.exec(t);
+  if (m) return { key: 'panel', value: ({ codebase: 'files', 'file tree': 'files', project: 'files', diff: 'changes', review: 'changes', git: 'changes', checks: 'run', commands: 'run', servers: 'run', shell: 'run' } as Record<string, string>)[m[1]] ?? m[1] };
   if (/^(?:open|show)(?: the)? (?:split|panel)(?: view| screen)?$|^split(?: screen| view)?$/.test(t)) return { key: 'panel', value: 'show' };
   if (/^(?:close|hide)(?: the)? (?:split|panel)(?: view| screen)?$/.test(t)) return { key: 'panel', value: 'hide' };
   if (/^run (?:the )?(?:tests|checks)(?: in (?:a|the) (?:new )?(?:tab|panel))?$/.test(t)) return { key: 'checks', value: 'run' };

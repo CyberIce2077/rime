@@ -1,7 +1,7 @@
-// The panel beside the chat (split view): eight views in an order that only
+// The panel beside the chat (split view): its views in an order that only
 // changes when you drag a tab, so a number always means the same thing. ctrl+g
 // moves the keys between the chat and the panel. In the panel: ← → or tab move
-// between views, 1-8 jump to one, ↑ ↓ and enter work inside it, esc steps back
+// between views, a number jumps to one, ↑ ↓ and enter work inside it, esc steps back
 // (and finally to the chat), z zooms, q closes, ? lists the keys. Each view adds at most a
 // few letters of its own, shown in the footer.
 
@@ -68,7 +68,7 @@ export function createPanel(st: Styles, all: View[], redraw: () => void, o: { or
   const PANEL_KEYS: [string, string][] = [
     ['ctrl+g', 'back to the chat'],
     ['← →  tab', 'the next view, the one before'],
-    ['1-8', 'jump to a view (drag a tab to reorder)'],
+    [`1-${views.length}`, 'jump to a view (drag a tab to reorder)'],
     ['↑ ↓  enter', 'move, open'],
     ['ctrl+u ctrl+d', 'page up, down'],
     ['esc', 'back one step, then the chat'],
