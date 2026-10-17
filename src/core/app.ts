@@ -18,7 +18,7 @@ import { type Decision, MODE_HELP, MODES, type Mode, addProjectRule, decide, pro
 import { type RunAs, type ToolDef, type ToolResult, TOOLS, bash as bashTool, commandEnv, sandboxed, diffOf, edit as editTool, optionsOf, planEdit, read as readTool, rel, textOf, write as writeTool } from './tools.ts';
 import { type AgentEvent, type TurnHost, result, runTools, runTurn } from './agent.ts';
 import { WHEN, createSettings, phrase } from './settings.ts';
-import { type Did, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
+import { type Did, STALE, choicesOf, example as exampleFor, nextStep as nextFor } from './suggest.ts';
 import { toolEvents } from './timeline.ts';
 import { parse as parseQuery, rank, suggestions } from './rank.ts';
 import { type Config, rimeDir, saveConfig } from './config.ts';
@@ -150,9 +150,18 @@ const system = (cwd: string, agents = '', map = '') =>
   `When you need the user to choose before you go on, use the ask tool and stop there; never ask in text and then carry on in the same reply.\n` +
   `You run inside Rime. Use the rime tool to change Rime itself (the panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
   `Beside the chat the user has a panel: review (your changes, hunk by hunk), plan, checks (types, lint, tests), run (commands and servers; bash with background: true starts a dev server there), git, files, context and a log of your tool calls. rime panel.read {view} gives you a view's text, such as the failing checks or a server's output. For a task with several steps, keep a short plan with rime plan {steps: [{text, state: done | now | next}]}. The user can /undo your last change.\n` +
+  `The terminal can't show web pages or images: Rime has no browser. To show a page, start its server with bash background: true and tell the user to press o on it in the run view, which opens the address in their own browser.\n` +
   `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.` +
   (agents ? `\n\nAGENTS.md:\n${agents}` : '') +
   (map ? `\n\n${map}` : '');
+// Told once to a conversation from before the browser and design studio were
+// removed, so the model stops offering them (the system prompt stays frozen).
+const GONE = "[Rime: Rime no longer has a browser or a design studio; earlier mentions of a browser tab or design tab in this conversation are out of date. Beside the chat there is now a panel with review, plan, checks, run, git, files, context and log. To show a page, start its server with bash background: true; the user presses o on it in the run view to open it in their own browser.]";
+const mentionsGone = (messages: Message[]) =>
+  messages.some((m) => typeof m.content !== 'string' && m.content.some((b) =>
+    (b.type === 'tool_use' && (b.name === 'browser' || b.name === 'design' || (b.name === 'rime' && /^(browser|design|tab)\./.test(String((b.input as { action?: string })?.action ?? ''))))) ||
+    (b.type === 'text' && /\bbrowser (?:tab|plug-?in)|design (?:studio|tab)\b/i.test(String(b.text ?? '')))));
+
 const agentsMd = (dir: string) => {
   try {
     return fs.readFileSync(path.join(dir, 'AGENTS.md'), 'utf8').trim().slice(0, 8000);
@@ -609,7 +618,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
 
   // Your earlier prompts, newest first: this session, then this project's saved ones.
   let past: string[] = [];
-  const earlier = () => [...history].reverse().concat(past).filter((p, i, a) => !/[\ue000-\uf8ff]/.test(p) && a.indexOf(p) === i);
+  const earlier = () => [...history].reverse().concat(past).filter((p, i, a) => !/[\ue000-\uf8ff]/.test(p) && !STALE.test(p) && a.indexOf(p) === i);
   // Dim ghost text completing the line from an earlier prompt in this
   // conversation (↑ and ctrl+r search the whole project's).
   function ghost() {
@@ -2135,6 +2144,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (name === 'rime') {
       return Promise.resolve(rimeTool(String(input.action ?? ''), (input.args ?? {}) as Record<string, any>, C, signal)).then((text) => ({ content: text, summary: text.split('\n')[0] }));
     }
+    if (name === 'browser' || name === 'design') return { content: "Rime no longer has a browser or a design studio. To show a page, start its server with bash background: true; the user opens it from the run view in their own browser.", error: true, summary: 'not in Rime anymore' };
     return { content: `Unknown tool ${name}.`, error: true, summary: 'unknown tool' };
   }
 
@@ -3950,6 +3960,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (!stored.length) return;
     C.continuing = { title: c.title || 'untitled', at: c.updated, cost: resumeCost(stored) };
+    if (mentionsGone(C.messages) && !C.messages.some((m) => typeof m.content !== 'string' && m.content.some((b) => b.type === 'text' && b.text === GONE))) C.tell.push(GONE);
     // The plan as the model last set it.
     const planned = C.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => b.type === 'tool_use' && b.name === 'rime' && (b.input as { action?: string })?.action === 'plan').at(-1);
     if (planned) C.plan = stepsOf(((planned.input as { args?: { steps?: unknown } }).args ?? {}).steps ?? []) ?? [];

@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { choicesOf, example, nextStep, offerOf } from '../src/core/suggest.ts';
+import { STALE, choicesOf, example, nextStep, offerOf } from '../src/core/suggest.ts';
 import { optionsOf } from '../src/core/tools.ts';
 
 test('a reply that offers something is answered with its first offer', () => {
@@ -93,4 +93,11 @@ test('S-1: a failing test names its file', () => {
   assert.equal(nextStep('Done.', ran(['> node --test', '✖ test/signup.test.ts (12ms)', "  TypeError: Cannot read properties of undefined"]), '/nowhere'), 'fix the failing test in signup.test.ts');
   assert.equal(nextStep('Done.', ran([' FAIL  src/auth.spec.ts', '  ● login › rejects']), '/nowhere'), 'fix the failing test in auth.spec.ts');
   assert.equal(nextStep('Done.', ran(['1 failed']), '/nowhere'), 'fix the failing tests');
+});
+
+test("removed features (the browser, the design studio) are never suggested", () => {
+  for (const p of ['Can you open it in the split screen browser of rime, the current editor?', 'open localhost:3000 in the browser tab', 'redesign it in the design studio', '/browser localhost:3000', '/design pricing']) assert.ok(STALE.test(p), p);
+  for (const p of ['open index.html in my browser', 'fix the browser test', 'run the tests']) assert.ok(!STALE.test(p), p);
+  const p = fs.mkdtempSync(path.join(os.tmpdir(), 'rime-stale-'));
+  assert.doesNotMatch(nextStep('The page is up. Want me to open it in the browser tab?', { wrote: [], ran: [] }, p) ?? '', /browser/);
 });

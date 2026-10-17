@@ -31,6 +31,11 @@ function shorten(offer: string) {
   return offer.length > 90 ? 'yes, go ahead' : `yes, ${offer}`;
 }
 
+// Things Rime can no longer do (the browser and the design studio were removed:
+// a terminal can't draw pages). Old prompts and offers about them are never
+// suggested again.
+export const STALE = /\bbrowser (?:tab|panel|pane|plug-?in)\b|\b(?:split[- ]?(?:screen|view|panel)|panel)(?:'s)? browser\b|\bbrowser (?:in|of|beside) (?:the |rime|split)|\bdesign (?:studio|tab|plug-?in)\b|^\/(?:browser|design)\b/i;
+
 // "Want me to save it to a file, or make an animated one?" → "yes, save it to a
 // file". "Let me know if you want me to add tests." → "yes, add tests". A real
 // question ("Which framework do you prefer?") gets '' since only you can answer it;
@@ -102,7 +107,7 @@ export function nextStep(reply: string, did: Did, project: string): string {
     return file ? `fix the failing test in ${path.basename(file)}` : 'fix the failing tests';
   }
   const offer = offerOf(reply);
-  if (offer) return offer;
+  if (offer && !STALE.test(offer)) return offer;
   if (offer === '') return ''; // it asked a question only you can answer
   if (did.wrote.length && !failed && hasTests(project)) return 'run the tests';
   if ((did.wrote.length || failed?.ok) && changed(project)?.length) return 'commit this';
