@@ -45,7 +45,7 @@ test('the next step follows what just happened', () => {
   assert.equal(nextStep('Fixed. Want me to run the tests?', { wrote: ['a.ts'], ran: [{ cmd: 'npm test', ok: false }] }, p), 'fix the failing tests');
   assert.equal(nextStep('Here is the cat. Want me to save it to a file?', none, p), 'yes, save it to a file');
   assert.equal(nextStep('Which colour should the button be?', { wrote: ['index.html'], ran: [] }, p), '', "no suggestion when it's your call");
-  assert.equal(nextStep('Created the page.', { wrote: ['index.html'], ran: [] }, p), 'open index.html in the browser');
+  assert.equal(nextStep('Created the page.', { wrote: ['index.html'], ran: [] }, p), 'run the tests', 'a page is checked like any change');
   assert.equal(nextStep('Updated the parser.', { wrote: ['src/parse.ts'], ran: [] }, p), 'run the tests');
   assert.equal(nextStep('Hi! What are we working on?', none, p), '');
 });

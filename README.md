@@ -59,48 +59,73 @@ rime connect http://localhost:8080 --name local
 
 ## Using it
 
+Every key has one meaning, and only keys every keyboard has are used. `?` shows them all.
+
 | Key | Does |
 |---|---|
 | `enter` | send |
 | `ctrl+j` | new line (`shift+enter` too, where the terminal reports it) |
-| `esc` | stop the reply, go back one screen, or close a box |
-| `ctrl+c` | cancel what is open or running, or clear the prompt |
-| `ctrl+y` | bring back what `ctrl+c`, `ctrl+u`, `ctrl+k` or `ctrl+w` removed |
-| `↑ ↓` | your earlier prompts (`esc` goes back to what you were typing) |
-| `tab` | take the suggestion shown in dim text |
-| `@` | attach a file or folder from the project |
-| `ctrl+r` | search your earlier prompts |
-| `option+⌫` `ctrl+w` | delete the word before the cursor |
-| `ctrl+u` `ctrl+d` | scroll the conversation (on an empty prompt); `esc` jumps to the end |
+| `ctrl+a` `ctrl+e` | start / end of the line |
+| `ctrl+w` `ctrl+k` | delete a word / to the end of the line |
+| `ctrl+c` | clear the prompt (`ctrl+y` brings it back), or stop what is running |
 | `ctrl+v` | paste an image from the clipboard |
-| `shift+tab` | permission mode: ask · auto-edit · plan |
-| `ctrl+g` | split view: files, shells, servers, the browser or design beside the chat; `ctrl+g` moves between the chat and the panel. In the panel: `space` tabs, `:` commands, `/` search, `?` its keys |
-| `←` | your conversations (on an empty prompt) |
 | `/` | commands |
-| `?` | shortcuts |
-| `ctrl+c` twice | quit (only when nothing is open) |
+| `@` | attach a file or folder from the project |
+| `tab` | take the suggestion shown in dim text |
+| `shift+tab` | permission mode: ask · auto-edit · plan |
+| `↑ ↓` | your earlier prompts |
+| `ctrl+r` | search your earlier prompts |
+| `ctrl+u` `ctrl+d` | scroll the conversation up / down |
+| `ctrl+o` | show the model's thinking |
+| `←` | your conversations (on an empty prompt) |
+| `esc` | stop the reply, or close what is open |
+| `ctrl+g` | to the panel and back |
+| `ctrl+c` twice | quit |
 
 | Command | Does |
 |---|---|
-| `/model` | pick a model, grouped by provider, plus effort and reasoning |
+| `/new` | start a new conversation |
+| `/chats` | this project's conversations: search, open, rename, delete |
+| `/model` | pick a model, effort and reasoning |
 | `/setup` | connect your own server, this computer, or a provider |
-| `/server` | status and controls for your server: load, restart, stop, power off |
-| `/connect` | add a provider or URL directly |
-| `/settings` | every setting, applied right away, with undo |
-| `/permissions` | permission mode and allow / ask / deny rules |
-| `/conversations` | this project's conversations |
+| `/settings` | every setting, applied right away (permissions too) |
+| `/panel` | the panel, or one view: `/panel review`, `plan`, `checks`, `run`, `git`, `files`, `context`, `log`, or `hide` |
+| `/undo` | put back the files Rime changed in its last turn |
+| `/compact` | summarise the earlier conversation to free context |
 | `/usage` | tokens, cost and cache savings |
-| `/panel` | show or hide split view (where a terminal takes `ctrl+g`): `/panel files`, `shell`, `diff` or `hide` |
-| `/clear` | start a new conversation |
 | `/exit` | quit |
 
+`/server` (your own server) and `/update` (when there is one) join the list when they
+apply. The older names still work: `/clear`, `/conversations`, `/connect`, `/diff`.
+
 There are no sessions to manage: `rime` always reopens the project's last conversation,
-and everything is saved as it happens, so quitting is instant. `/clear` starts a new one.
+and everything is saved as it happens, so quitting is instant. `/new` starts a new one.
 
 Suggestions come from your project and your history, never from an extra AI call: an
 empty prompt shows `Try "…"` with a real file from the project, after a reply Rime
-suggests the next step ("run the tests", "open index.html in the browser", "commit
-this"), and as you type, earlier prompts complete in dim text. `tab` takes any of them.
+suggests the next step ("run the tests", "commit this"), and as you type, earlier
+prompts complete in dim text. `tab` takes any of them.
+
+### The panel
+
+`ctrl+g` opens the panel beside the chat and moves the keys to it; `ctrl+g` again goes
+back. The views are always in the same order, so a number always means the same thing:
+
+| | View | What it shows | Its keys |
+|---|---|---|---|
+| 1 | review | Rime's changes this session, hunk by hunk | `y` keep · `u` undo the hunk · `a` keep all · `enter` ask about a line · `← →` hunks |
+| 2 | plan | Rime's steps for a longer task | `enter` done · `a` add · `x` drop · `k` `j` move |
+| 3 | checks | your type check, lint and tests, with problems as file:line | `r` run · `w` watch · `enter` open |
+| 4 | run | every command Rime runs, your shells, and dev servers | `n` new shell · `r` rerun · `x` stop · `o` open the address |
+| 5 | git | branch, staged and changed files, recent commits | `s` stage · `enter` diff · `c` commit (empty: Rime writes the message) |
+| 6 | files | the project tree, name and text search, a viewer | `/` search · `enter` open · `@` attach |
+| 7 | context | what the model sees and what it costs | `enter` show · `x` drop a big result · `s` biggest first |
+| 8 | log | each tool call and exactly what came back | `enter` show it in full |
+
+In the panel, `1`-`8` or `tab` pick a view, `↑ ↓` and `enter` work inside it, `esc`
+steps back and finally to the chat, `z` zooms the panel to the full screen, and `?`
+lists the keys. You can also say it: "show the diff", "run the tests", "start the dev
+server", "search the files for validate".
 
 Drag a file, folder, screenshot or video onto the terminal, or paste a long log, and it
 becomes a chip in the prompt. Put the cursor on a chip or point at it to see exactly what

@@ -1,4 +1,4 @@
-// Files tab search (docs/split-v2.md §4.1): file names by fuzzy match, or text in
+// The files view's search: file names by fuzzy match, or text in
 // files (ripgrep when it's on the PATH, otherwise a plain JS walk). No index, no
 // model.
 
@@ -43,7 +43,8 @@ const hasRg = () => (rg ??= spawnSync('rg', ['--version'], { stdio: 'ignore' }).
 export function grep(root: string, q: string, files: string[], max = 200, useRg = hasRg()): TextHit[] {
   if (!q) return [];
   if (useRg) {
-    const r = spawnSync('rg', ['--line-number', '--no-heading', '--color', 'never', '--fixed-strings', '--smart-case', '--max-columns', '300', '--max-count', '50', '--', q], { cwd: root, encoding: 'utf8', timeout: 5000, maxBuffer: 8 << 20 });
+    // The '.' matters: with no path and stdin a pipe, rg searches stdin and finds nothing.
+    const r =spawnSync('rg', ['--line-number', '--no-heading', '--color', 'never', '--fixed-strings', '--smart-case', '--max-columns', '300', '--max-count', '50', '--', q, '.'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: 5000, maxBuffer: 8 << 20 });
     if (r.status === 0 || r.status === 1) {
       const out: TextHit[] = [];
       for (const l of r.stdout.split('\n')) {
@@ -73,12 +74,3 @@ export function grep(root: string, q: string, files: string[], max = 200, useRg 
   }
   return out;
 }
-
-// What looks like an address (docs/split-v2.md §3.4): localhost:3000, example.com,
-// /pricing (on the running server), :5173.
-// A file name (README.md, app.ts) isn't one.
-const CODE = /\.(md|mdx|ts|tsx|js|jsx|mjs|cjs|json|css|scss|txt|py|rs|go|java|rb|c|h|cpp|ya?ml|toml|lock|sh|sql|svg|png|jpe?g|gif)$/i;
-export const addressLike = (q: string) => {
-  const t = q.trim();
-  return !/\s/.test(t) && !CODE.test(t) && /^(localhost|127\.|https?:|file:|[\w-]+(\.[\w-]+)*\.[a-z]{2,}(\/|:|$)|\/[\w-]|:\d)/i.test(t);
-};

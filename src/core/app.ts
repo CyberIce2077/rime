@@ -33,10 +33,11 @@ import { PRESETS } from '../providers/presets.ts';
 import { connOf, keyOf as providerKey, listModels, modelOf, pickUrl, streamFor } from '../providers/registry.ts';
 import { type Checkpoints, createCheckpoints } from '../plugins/diff-undo/checkpoints.ts';
 import { type CodeIndex, openIndex } from '../plugins/code-index/index.ts';
-import { type ShellTab, createSide } from '../plugins/shell-panel/panel.ts';
-import { addressLike } from '../plugins/shell-panel/search.ts';
-import { BROWSER_TOOL, type BrowserSession, type Progress, chrome as hasChrome, closeChrome, install as installBrowser, installed as browserInstalled, openBrowser, uninstall as uninstallBrowser, usesChrome } from '../plugins/browser/browser.ts';
-import { DESIGN_TOOL, type DesignSession, type From, type Pick, capture, createVersions, designFile, openDesign, overflow, slug as designSlug, starter } from '../plugins/design/design.ts';
+import { VIEWS, createSide } from '../plugins/panel/index.ts';
+import { detect as detectChecks } from '../plugins/panel/checks.ts';
+import { DROPPED, piecesOf } from '../plugins/panel/context.ts';
+import { entriesOf } from '../plugins/panel/log.ts';
+import { type Step, stepsOf } from '../plugins/panel/plan.ts';
 import { compare as compareVersions, install as installVersion, latest as latestVersion, newest as newestVersion } from '../plugins/updater/update.ts';
 import { SUMMARY_SYSTEM, clearOld, compacted, cutPoint, tokensOf, transcript as historyText } from '../plugins/token-kit/compact.ts';
 import { recheck } from '../providers/probe.ts';
@@ -47,66 +48,57 @@ import { SSH_OPTS } from '../setup/ssh.ts';
 import { Cancelled, NAMES, type Run, runSteps } from '../setup/steps.ts';
 import { type Host, type Panel, type Tunnel, createSetup, createStopped } from '../setup/ui.ts';
 
+type Progress = { step: string; done?: number; total?: number };
+
+// The / list: what most people need, in one short list. Commands that only
+// apply sometimes (/server with your own server, /update when there is one) join
+// it then; older names still work (ALIASES).
 const CMDS: [string, string][] = [
+  ['/new', 'start a new conversation'],
+  ['/chats', 'your conversations: search, open, rename, delete'],
   ['/model', 'pick a model, effort and reasoning'],
   ['/setup', 'connect your server, this computer, or a provider'],
-  ['/server', 'status and controls for your server'],
   ['/settings', 'every setting, applied right away'],
-  ['/permissions', 'permission mode and allow / ask / deny rules'],
-  ['/connect', 'add a provider or URL: /connect <url>'],
-  ['/clear', 'start a new conversation'],
-  ['/conversations', 'search, open, fork or delete your conversations'],
+  ['/panel', 'the panel: /panel review, plan, checks, run, git, files, context, log'],
+  ['/undo', 'put back the files Rime changed in its last turn'],
   ['/compact', 'summarise the earlier conversation to free context'],
-  ['/diff', 'what the last change did, file by file'],
-  ['/panel', 'split view: /panel shows or hides it · files | shell | diff | hide'],
-  ['/browser', 'a page in a tab: /browser <url or file> · use chrome | chromium · uninstall'],
-  ['/design', 'build a page by chatting: /design new <what>'],
-  ['/undo', 'put the files back as they were before the last change'],
-  ['/usage', 'token, cost and savings breakdown'],
-  ['/update', 'install the newest Rime and restart into it'],
+  ['/usage', 'tokens, cost and what the cache saved'],
   ['/exit', 'quit Rime'],
 ];
+const ALIASES: Record<string, string> = { '/clear': '/new', '/conversations': '/chats', '/connect': '/setup', '/diff': '/panel review', '/quit': '/exit' };
 
 // SPEC §5: only keys every keyboard has and every terminal passes on (§5.1).
-// The ? sheet, in four groups; split view's keys are always listed, so people
-// find ctrl+g (or /panel where the terminal takes it).
+// One meaning per key: the ? sheet in four groups.
 const KEY_GROUPS: [string, [string, string][]][] = [
-  ['Send and edit', [
+  ['Type', [
     ['enter', 'send'],
     ['ctrl+j', 'new line (or shift+enter)'],
     ['ctrl+a ctrl+e', 'start / end of the line'],
-    ['ctrl+u ctrl+k', 'delete to the start / end'],
-    ['ctrl+w', 'delete the word before'],
-    ['ctrl+y', 'bring back what you deleted'],
-    ['ctrl+v', 'paste an image, or drag a file'],
-    ['ctrl+c', 'clear, or cancel what runs'],
-    ['ctrl+c twice', 'quit (when nothing is open)'],
+    ['ctrl+w ctrl+k', 'delete a word / to the end'],
+    ['ctrl+c', 'clear (ctrl+y brings it back)'],
+    ['ctrl+v', 'paste an image'],
   ]],
-  ['Ask and pick', [
+  ['Ask', [
     ['/', 'commands'],
-    ['@', 'mention a file or folder'],
-    ['ctrl+r', 'search your earlier prompts'],
-    ['tab  →', 'complete / take the suggestion'],
+    ['@', 'attach a file or folder'],
+    ['tab', 'take the suggestion'],
     ['shift+tab', 'mode: ask · auto-edit · plan'],
-    ['ctrl+o', "show or hide the thinking"],
-    ['?', 'this list'],
+    ['?', 'these keys'],
   ]],
-  ['Move around', [
-    ['↑ ↓', 'earlier prompts (esc: yours)'],
+  ['Move', [
+    ['↑ ↓', 'earlier prompts'],
+    ['ctrl+r', 'search earlier prompts'],
+    ['ctrl+u ctrl+d', 'scroll up / down'],
+    ['ctrl+o', 'show the thinking'],
     ['←', 'conversations (empty prompt)'],
-    ['ctrl+u ctrl+d', 'scroll (empty prompt) or wheel'],
-    ['esc', 'stop, go back, or close a box'],
+    ['esc', 'stop, or close what is open'],
+    ['ctrl+c twice', 'quit Rime'],
   ]],
   ['Panel', [
-    ['ctrl+g', 'to the panel and back · /panel'],
-    ['', 'in the panel:'],
-    ['esc', 'back one step, then the chat'],
-    ['space  n', 'tabs · new tab'],
-    ['1…9  tab', 'go to a tab · next tab'],
-    ['x  z', 'close the tab · zoom'],
-    [':  /', 'panel command · search the tab'],
-    ['enter', 'type into a shell or page'],
-    ['?', "this tab's keys"],
+    ['ctrl+g', 'to the panel and back'],
+    ['1-8  tab', 'pick a view'],
+    ['↑ ↓  enter', 'move, open'],
+    ['esc', 'back, then the chat'],
   ]],
 ];
 
@@ -155,8 +147,8 @@ const system = (cwd: string, agents = '', map = '') =>
   `Working directory: ${cwd}\n` +
   `Do the work with your tools: read files before you change them, create files with write, change them with edit, run commands with bash. Don't paste whole files into the chat; say in a line or two what you did.\n` +
   `When you need the user to choose before you go on, use the ask tool and stop there; never ask in text and then carry on in the same reply.\n` +
-  `You run inside Rime. Use the rime tool to change Rime itself (tabs, panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
-  `The user sees a split view next to the chat with tabs: the project's files, a file at a line, the diff of your last change, command output, servers (bash with background: true runs a dev server in a tab that keeps running; rime tab.read {tab} shows its latest output), a browser (rime browser.open {url}; the browser tool clicks and reads pages) and the design studio (the design tool; it can start from the user's own page). The user can /diff and /undo your last change and /compact. Offer these instead of saying Rime can't.\n` +
+  `You run inside Rime. Use the rime tool to change Rime itself (the panel, settings, model, servers). Never tell the user to restart Rime or edit its config.\n` +
+  `Beside the chat the user has a panel: review (your changes, hunk by hunk), plan, checks (types, lint, tests), run (commands and servers; bash with background: true starts a dev server there), git, files, context and a log of your tool calls. rime panel.read {view} gives you a view's text, such as the failing checks or a server's output. For a task with several steps, keep a short plan with rime plan {steps: [{text, state: done | now | next}]}. The user can /undo your last change.\n` +
   `Be brief and direct. Use plain text with light markdown (lists, \`code\`, fenced blocks); no tables.` +
   (agents ? `\n\nAGENTS.md:\n${agents}` : '') +
   (map ? `\n\n${map}` : '');
@@ -207,8 +199,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let cleared = ''; // the prompt ctrl+c cleared, first on ↑
   let heldPrompt: string | null = null; // sent with no model: waits for /setup
   const cwd = process.cwd();
-  // The tools a new conversation freezes: the core ones, plus enabled plug-ins'.
-  const toolsNow = (): ToolDef[] => [...TOOLS, ...(cfg.plugins?.browser ? [BROWSER_TOOL] : []), ...(cfg.plugins?.design ? [DESIGN_TOOL] : [])];
+  // The tools a new conversation freezes.
+  const toolsNow = (): ToolDef[] => TOOLS;
   let SYSTEM = system(cwd, agentsMd(projectOf(cwd))); // the prefix for new conversations (the repo map joins once the index is ready)
 
   // ---- state ----
@@ -248,44 +240,51 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
 
   // ---- saving (SPEC §16): every message is written the moment it exists ----
   const project = projectOf(cwd);
-  // Split view (docs/split-v2.md): the tabbed panel on the right, and whether it
-  // has the keys (ctrl+g moves them to the other side).
+  // The panel beside the chat, its eight views, and whether it has the keys
+  // (ctrl+g moves them to the other side).
+  const sessionStart = Date.now();
   const side = createSide({
-    root: project, st, redraw: () => schedule(),
-    files: () => (index ? index.files().sort() : listFiles(project)),
+    st, root: project, redraw: () => schedule(),
     env: () => commandEnv(process.env, cfg.passEnv),
-    asks: () => needsYou(S),
-    plan: () => mode === 'plan',
-    scripts: () => scriptsOf(),
-    recent: () => [...edited, ...usedFiles],
-    addresses: () => addresses,
-    designs: () => designNames(),
-    browse: (url, from) => void browse(url, from),
-    design: (arg) => designAny(arg),
-    idea: (text) => designIdea(text),
-    diff: () => {
-      const cps = checkpointsOf(), cp = cps?.last();
-      if (!cps || !cp) return 'no change on record to diff yet';
-      side.diff(cps.diff(cp), true);
-    },
-    browser: (args) => browserCmd(args),
     mention: (ref, lines) => mention(ref, lines),
-    ready: (t) => {
-      // A server ready again (after a restart): a browser on its address reloads.
-      if (browser && t.serve?.url && browser.url().startsWith(t.serve.url)) browser.reload();
+    toChat: () => void ((sideFocus = false), pane.zoom(false)),
+    open: (url) => openUrl(url),
+    files: () => (index ? index.files().sort() : listFiles(project)),
+    recent: () => [...edited, ...usedFiles],
+    // Review: Rime's changes since this window opened (in git, from its first
+    // checkpoint since then; outside git a checkpoint knows only its own turn's files).
+    diff: () => {
+      const cps = checkpointsOf(), mine = cps?.list().filter((x) => x.at >= sessionStart) ?? [];
+      const cp = cps?.git ? mine[0] : mine.at(-1);
+      return cps && cp ? cps.diff(cp) : '';
     },
+    git: () => !!checkpointsOf()?.git,
+    undone: (file, line) => void S.tell.push(`[Rime: the user undid one of your changes in ${file} near line ${line}; that part of the file is as it was before.]`),
+    planChanged: (steps) => void ((S.plan = steps), (S.planEdited = true)),
+    commitByRime: () => void ((sideFocus = false), send("Commit the staged changes with a short message in the style of this repository's recent commits.")),
+    pieces: () => piecesOf(S.system, S.tools, S.messages),
+    window: () => (model ? contextOf(model) : undefined),
+    sent: () => (S.lastUsage ? { prompt: S.lastUsage.input + S.lastUsage.cached + S.lastUsage.written, cached: S.lastUsage.cached } : null),
+    drop: ([m, b]) => {
+      const blk = (S.messages[m]?.content as Block[] | undefined)?.[b];
+      if (blk?.type === 'tool_result') blk.content = DROPPED;
+      else if (blk?.type === 'text') blk.text = DROPPED;
+    },
+    entries: () => entriesOf(S.messages),
   });
+  const pane = side.panel;
   const edited: string[] = []; // files Rime changed this session, first in name search
-  const addresses: string[] = []; // browser addresses, most recent first
   let quitServers = false; // quitting with servers running asks first
   let sideFocus = false, dragging = false; // dragging: the divider, with the mouse
+  // A view in the panel, shown and with the keys.
+  const openView = (id: string) => void (pane.show(true), pane.go(id), (sideFocus = true));
   // The chat's width and where the panel starts (0: no panel). Under 72 columns
   // there's room for one pane, so the one with focus takes the screen.
   const layout = () => {
     const width = W();
-    if (!side.visible) return { cw: width, px: 0, full: false };
-    if (width < 72 || side.zoomed) return sideFocus ? { cw: 0, px: 1, full: true } : { cw: width, px: 0, full: false };
-    const pw = Math.max(30, Math.min(width - 40, Math.round(width * side.ratio)));
+    if (!pane.visible) return { cw: width, px: 0, full: false };
+    if (width < 72 || pane.zoomed) return sideFocus ? { cw: 0, px: 1, full: true } : { cw: width, px: 0, full: false };
+    const pw = Math.max(30, Math.min(width - 40, Math.round(width * pane.ratio)));
     return { cw: width - pw, px: width - pw + 1, full: false };
   };
   const CW = () => layout().cw || W();
@@ -394,11 +393,14 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     tell: string[]; // notes for the model, sent with the next message (an /undo)
     costItem: Item | null; // this turn's ↳ line, kept last as its requests add up
     system: string; // its frozen system prompt: the stored one when reopened while the cache is warm
-    tools: ToolDef[]; // its frozen tool list: the core tools, plus plug-ins' (browser) on when it started
+    tools: ToolDef[]; // its frozen tool list
+    plan: Step[]; // the model's plan (rime plan), shown in the panel
+    planEdited: boolean; // the user changed it: the model hears with the next message
+    lastUsage?: Usage; // the last request's tokens, for the context view
   };
   const newSession = (): Session => ({
     convId: null, messages: [], items: [headerItem], task: null, busy: null, waiting: null, live: null, lastUserSeq: 0,
-    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, tell: [], costItem: null, system: SYSTEM, tools: toolsNow(),
+    continuing: null, resumeOk: false, approval: null, question: null, queued: [], declining: null, convRules: {}, meter: createMeter(), nextStep: '', title: '', mark: '', planSaid: false, tell: [], costItem: null, system: SYSTEM, tools: toolsNow(), plan: [], planEdited: false,
   });
   let S = newSession();
   const sessions: Session[] = [S]; // open in this window; the ones not on screen keep working
@@ -704,13 +706,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         ...footRows(['↑ ↓', ' choose · ', 'enter', ' use it · ', 'esc', ' close'], st),
       ], width, st, st.accent, 'key:esc');
     }
-    if (/^\/browser\s+$/.test(buf))
-      return box('/browser', [
-        { line: [{ t: '<url or file>', s: st.title }, dim('  a web address, localhost:5173, or a file like index.html')] },
-        { line: [{ t: 'use chrome', s: st.title }, dim(' · '), { t: 'use chromium', s: st.title }, dim(`  switch browsers${browserInstalled() ? ` (now ${usesChrome() ? 'your Chrome' : 'Chromium'})` : ''}`)] },
-        { line: [{ t: 'uninstall', s: st.title }, dim('  remove the plug-in and the Chromium it downloaded')] },
-      ], width, st);
-    if (/^\/connect\s+$/.test(buf)) return box('/connect', [{ line: [{ t: '<url> [name]', s: st.title }, dim('  a llama.cpp, Ollama, LM Studio or OpenAI-compatible server')] }], width, st);
+    if (/^\/panel\s+$/.test(buf)) return box('/panel', [{ line: [{ t: VIEWS.map((v, i) => `${i + 1} ${v}`).join('  '), s: st.title }] }, { line: [dim('a view by name or number, or hide')] }], width, st);
+    if (/^\/(connect|setup)\s+$/.test(buf)) return box(buf.trim(), [{ line: [{ t: '<url> [name]', s: st.title }, dim('  a llama.cpp, Ollama, LM Studio or OpenAI-compatible server')] }], width, st);
     return null;
   }
   const knownModels = () => [...new Set([model?.ref, cfg.model, ...Object.entries(cfg.providers).map(([n, p]) => (p.model ? `${n}/${p.model}` : undefined)), ...Object.entries(served).flatMap(([n, ids]) => ids.map((i) => `${n}/${i}`)), ...Object.keys(cfg.models)].filter((x): x is string => !!x))];
@@ -804,7 +801,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const ps = panel?.status?.();
     if (quitting) left = [{ t: quitting, s: st.dim }];
     else if (quitServers) {
-      const n = side.servers(), lead = `${n} server${n === 1 ? '' : 's'} running · `;
+      const n = side.run.servers(), lead = `${n} server${n === 1 ? '' : 's'} running · `;
       left = [{ t: lead, s: st.warn }, { t: 'enter', s: st.accentB }, { t: ' stop them and quit · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' stay', s: st.dim }];
       const x = strWidth(lead) + 1;
       leftHits = [{ x0: x, x1: x + 4, id: 'key:enter' }, { x0: x + 26, x1: x + 28, id: 'key:esc' }];
@@ -820,7 +817,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       // Keys every keyboard has (SPEC §5.1); page up/down still work where they exist.
       left = [
         { t: '↓', s: st.accentB }, { t: ` ${scrollOff} lines below · `, s: st.dim },
-        ...(buf ? [] : [{ t: 'ctrl+u ctrl+d', s: st.accentB }, { t: ' scroll · ', s: st.dim }]),
+        { t: 'ctrl+u ctrl+d', s: st.accentB }, { t: ' scroll · ', s: st.dim },
         { t: 'esc', s: st.accentB }, { t: ' to the end', s: st.dim },
       ];
       leftHits = [{ x0: 1, x1: lineWidth(left), id: 'bottom' }];
@@ -831,20 +828,17 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       left = [{ t: 'backspace', s: st.accentB }, { t: ' delete selection · ', s: st.dim }, { t: 'esc', s: st.accentB }, { t: ' clear selection', s: st.dim }];
       leftHits = [{ x0: 1, x1: 9, id: 'key:backspace' }, { x0: 30, x1: 32, id: 'key:esc' }];
     } else {
-      // One line of parts, most important first: other conversations, the permission
-      // mode, then the keys. What doesn't fit drops from the end. Stopping sits at
-      // the far right, after the meter.
+      // A short line: what needs you, the permission mode, the panel and ? for the
+      // rest. Every part is clickable.
       const dim = (t: string) => ({ t, s: st.dim });
       const key = (t: string) => ({ t, s: st.accentB });
       const parts: { line: Line; id?: string }[] = [];
       // The panel has the keys: the chat's own keys would do nothing, so only the way back.
-      const away = sideFocus && side.visible;
-      if (away) parts.push(needsYou(S) ? { line: [{ t: '● Rime is asking · ', s: st.warn }, key('ctrl+g'), dim(' answer')], id: 'chat' } : { line: [key('ctrl+g'), dim(' focus')], id: 'chat' });
+      const away = sideFocus && pane.visible;
+      if (away) parts.push(needsYou(S) ? { line: [{ t: '● Rime is asking · ', s: st.warn }, key('ctrl+g'), dim(' answer')], id: 'chat' } : { line: [key('ctrl+g'), dim(' chat')], id: 'chat' });
       if (S.declining && !away) parts.push({ line: [dim('type what Rime should do instead')] });
       if (!away) {
         if (S.queued.length && !buf) parts.push({ line: [key('↑'), dim(' edit queued')] });
-        if (side.tabs.length && !side.visible) parts.push({ line: [dim(`panel hidden · ${side.tabs.length} tab${side.tabs.length === 1 ? '' : 's'}${side.running() ? `, ${side.running()} running` : ''} · `), key('ctrl+g')], id: 'panel' });
-        else if (side.visible && !sideFocus) parts.push({ line: [key('ctrl+g'), dim(' panel')], id: 'panel' });
         if (running) parts.push({ line: [{ t: '⟳ ', s: st.accent }, dim(`${running.label} · `), key('ctrl+c'), dim(' stop')], id: 'key:ctrl+c' });
         if ((upd.state === 'available' && upd.folded) || (upd.state === 'ready' && upd.folded)) parts.push({ line: [{ t: '↑ ', s: st.ok }, dim(`${upd.version} · `), key('/update')], id: 'update' });
         if (browsing?.edited) parts.push({ line: [key('esc'), dim(browsing.draft.trim() ? ' back to your text' : ' clear')], id: 'key:esc' });
@@ -853,7 +847,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const working = sessions.filter((x) => x !== S && (x.busy || x.waiting) && !needsYou(x)).length;
       if (asking) parts.push({ line: [{ t: '● ', s: st.warn }, { t: `${asking} needs you`, s: st.fg }], id: 'conversations' });
       if (working) parts.push({ line: [{ t: '● ', s: st.accent }, { t: `${working} working`, s: st.fg }], id: 'conversations' });
-      // The permission mode shows whenever the chat has the keys; a click cycles it.
       if (!away) {
         const [icon, name, ms] =
           mode === 'ask' ? ['⏵', 'ask', st.accent]
@@ -861,10 +854,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
           : mode === 'plan' ? ['⏸', 'plan', st.accentB]
           : mode === 'god' ? ['⏵⏵⏵⏵', 'god mode', st.del]
           : ['⏵⏵⏵', 'auto', st.warn];
-        // Short labels keep it to one row down to about 85 columns; each part is clickable.
         parts.push({ line: [{ t: `${icon} ${name}`, s: ms }], id: 'mode' });
-        parts.push({ line: [key('←'), dim(' chats')], id: 'conversations' });
-        parts.push({ line: [key('/'), dim(' commands')], id: '/' });
+        // The panel: what's waiting there (changes to review, failing checks, servers).
+        const rv = side.review.badge();
+        const b = [rv && { ...rv, t: ` ±${rv.t.trim()}` }, side.checks.badge(), side.run.badge()].filter((x) => x).map((x) => x!);
+        parts.push({ line: [key('ctrl+g'), dim(' panel'), ...b], id: 'panel:show' });
         parts.push({ line: [key('?'), dim(' keys')], id: '?' });
       }
       // Parts are never cut: what doesn't fit beside the meter moves to a line
@@ -909,11 +903,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     // Narrow or zoomed, with the panel focused: the panel is the screen, under
     // one line for the chat (Rime asking shows on the panel's own line).
     if (L.full) {
-      const v = side.render(full, height - 1, true, false);
+      const v = pane.render(full, height - 1, true, false);
       hits = [{ row: 1, x0: 1, x1: 15, id: 'chat' }, ...v.hits.map((h) => ({ ...h, row: h.row + 1 }))];
       rows = [str([{ t: 'chat · ', s: st.dim }, { t: 'ctrl+g', s: st.accentB }], st), ...v.lines];
-      paint(rows.map((l) => [l, '']), full, '\x1b[?25l');
-      return images(side.overlay(1, 1));
+      return paint(rows.map((l) => [l, '']), full, '\x1b[?25l');
     }
     const width = L.cw;
     const { lines, gears, pins } = transcript(width);
@@ -969,22 +962,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     for (const h of hits) if (h.id.startsWith('pin:') && h.row !== hoverRow && !(S.items[+h.id.slice(4)] as { pinned?: boolean })?.pinned) marks[h.row - 1] += `\x1b[${h.row};${h.x0}H${st.reset} `;
     // Split: the panel takes the columns right of the chat, top to bottom.
     if (L.px) {
-      const v = side.render(full - width, height, sideFocus);
+      const v = pane.render(full - width, height, sideFocus);
       rows = rows.map((r, i) => `${r}${st.reset}${' '.repeat(Math.max(0, width - strWidth(stripAnsi(r))))}${v.lines[i] ?? ''}`);
       hits.push(...v.hits.map((h) => ({ ...h, x0: h.x0 + width, x1: h.x1 + width })));
     }
     const cursor = sideFocus ? '\x1b[?25l' : `\x1b[${viewH + 1 + u.cursor.row};${u.cursor.col + 1}H\x1b[?25h`;
     paint(rows.map((l, i) => [l, marks[i]]), full, cursor);
-    images(L.px ? side.overlay(L.px) : null, cursor);
-  }
-
-  // A plug-in tab's picture (Kitty, iTerm2), drawn over its cells after the text;
-  // when it stops showing, Kitty is told to drop it.
-  let imaged = false;
-  function images(seq: string | null, cursor = '') {
-    if (seq) write(`\x1b[?25l${seq}${cursor}`);
-    else if (seq === null && imaged) write(side.hideImages());
-    imaged = seq !== null;
   }
 
   // Writes only the rows that changed since the last frame, each overwritten in
@@ -1344,10 +1327,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       }
       content = [...results, ...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content)];
     }
-    // A part picked in a design tab (@Headline) goes along as its selector and HTML.
-    if (!held && picks.size) {
-      const named = [...picks.values()].filter((p) => text.includes(`@${p.name}`));
-      if (named.length) content = [...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content), ...named.map((p): Block => ({ type: 'text', text: `[Rime: @${p.name} is ${p.selector} in ${p.file}]\n${p.html}` }))];
+    // A plan the user edited in the panel goes to the model with this message.
+    if (C.planEdited) {
+      C.planEdited = false;
+      C.tell.push(`[Rime: the user edited your plan in the panel. It is now:\n${C.plan.map((p) => `${p.state === 'done' ? '[x]' : p.state === 'now' ? '[>]' : '[ ]'} ${p.text}`).join('\n') || '(empty)'}]`);
     }
     // What Rime did meanwhile (an /undo) goes to the model with this message.
     if (C.tell.length) content = [...(typeof content === 'string' ? [{ type: 'text', text: content } as Block] : content), ...C.tell.splice(0).map((t): Block => ({ type: 'text', text: t }))];
@@ -1375,8 +1358,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       said = (await runTurn(h, ac.signal, userSeq)).said;
     } finally {
       if (C.busy === me) C.busy = null;
-      C.nextStep = did.dev ? `/browser ${did.dev}` : nextFor(said, did, project);
-      if (applying && C === S && did.wrote.length) finishApply();
+      C.nextStep = nextFor(said, did, project);
+      if (C === S && (did.wrote.length || did.ran.length)) side.review.refresh(); // the status line counts files to review
       offerChoices(said, C);
       if (C === S) askTrust(); // the rules file changed during the reply
       if (upd.state === 'ready' && upd.folded && C === S) offerRestart();
@@ -1657,187 +1640,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     };
   }
 
-  // ---- browser plug-in (Phase 11) ----
-  // One browser per window, in a split-view tab; it starts with the first /browser
-  // or the first browser tool call, and closes with its tab or with Rime.
-  let browser: BrowserSession | null = null;
-  let opening: Promise<BrowserSession> | null = null;
-  let browserTab: object | null = null;
-  function browserNow() {
-    if (browser) {
-      // Already open: bring its tab into view.
-      const i = side.tabs.indexOf(browserTab as never);
-      if (i >= 0) side.go(i);
-      return Promise.resolve(browser);
-    }
-    opening ??= openBrowser({ st, color: (rgb, bg) => sgr(rgb, bg, st.mode), redraw: () => schedule(), onClose: () => (browser = null), log: (l) => note(l, 'dim') })
-      .then((b) => {
-        browser = b;
-        browserTab = side.custom(b.tab, true); // you'll want to watch it, so it's the tab showing
-        return b;
-      })
-      .finally(() => (opening = null));
-    return opening;
-  }
-  // The browser and design plug-ins share Playwright in ~/.rime/plugins/browser:
-  // asked about once, then each is turned on (its tool joins new conversations).
-  function withPlaywright(plugin: 'browser' | 'design', then: () => void) {
-    const on = () => {
-      if (!cfg.plugins?.[plugin]) {
-        cfg.plugins = { ...cfg.plugins, [plugin]: true };
-        settings.save();
-        note(`${plugin} plug-in on · its tool joins your next conversation (/clear starts one)`, 'dim');
-      }
-      then();
-    };
-    if (browserInstalled()) return on();
-    const chromeHere = hasChrome();
-    S.question = {
-      q: `Turn on the ${plugin} plug-in? It shows ${plugin === 'browser' ? 'your web app' : 'the page you design'} in a tab here, rendered by Chrome. Playwright goes into ~/.rime/plugins/browser, not into your project.`,
-      options: [
-        ...(chromeHere ? [{ label: 'Use my Chrome', detail: 'downloads Playwright only (~10 MB)' }] : []),
-        { label: 'Download Chromium', detail: '~150 MB, once' },
-        { label: 'Not now', detail: 'nothing is installed' },
-      ],
-      sel: 0, tool: false,
-      done: (a) => {
-        S.question = null;
-        if (!a || a === 'Not now') return schedule();
-        const useChrome = a === 'Use my Chrome';
-        const ac = new AbortController();
-        const pr = progressRow(() => ac.abort());
-        void installBrowser(useChrome, (p) => pr.update(p), ac.signal).then((r) => {
-          if (r.stopped) return pr.finish(`stopped · nothing was turned on; /${plugin} starts again`, 'stopped');
-          if (!r.ok) return pr.finish(`couldn't set up Playwright: ${r.error}`, false);
-          pr.finish(useChrome ? 'Playwright installed · it uses your Chrome' : 'Playwright and Chromium installed', true);
-          on();
-        });
-        schedule();
-      },
-    };
-    schedule();
-  }
-  // A local file (index.html, ./site/a.html, ~/x.html) as a file:// address.
-  const pageUrl = (raw: string) => {
-    const p = path.resolve(cwd, raw.replace(/^~(?=\/)/, os.homedir()));
-    return !/^[a-z]+:\/\//i.test(raw) && fs.existsSync(p) ? pathToFileURL(p).href : raw;
-  };
-  // /browser [url | file] · /browser use chrome | chromium · /browser uninstall
-  function browserCmd(args: string[] | string = []) {
-    const a = typeof args === 'string' ? [args] : args;
-    if (a[0] === 'uninstall') return browserUninstall();
-    if (a[0] === 'use') {
-      if (!/^(chrome|chromium)$/i.test(a[1] ?? '')) return void note('/browser use chrome, or /browser use chromium', 'dim');
-      return browserUse(a[1].toLowerCase() === 'chrome');
-    }
-    const url = a.join(' ').trim() ? pageUrl(a.join(' ').trim()) : '';
-    withPlaywright('browser', async () => {
-      try {
-        const b = await browserNow();
-        if (url) note((await b.act({ action: 'open', url })).split('.')[0], 'dim');
-      } catch (e) {
-        note(`The browser didn't start: ${(e as Error).message.split('\n')[0]}`);
-      }
-    });
-  }
-
-  // Switching browsers: the open browser and design tabs close (they share one
-  // Chrome), and the next /browser starts the other one. Chromium downloads with
-  // its progress the first time.
-  function browserUse(chrome: boolean) {
-    if (chrome && !hasChrome()) return void note("Google Chrome isn't installed on this computer; /browser use chromium downloads Chromium instead.", 'dim');
-    if (browserInstalled() && usesChrome() === chrome) return void note(`The browser plug-in already uses ${chrome ? 'your Chrome' : 'Chromium'}.`, 'dim');
-    side.closePlugins();
-    closeChrome();
-    browser = null;
-    const ac = new AbortController();
-    const pr = progressRow(() => ac.abort());
-    void installBrowser(chrome, (p) => pr.update(p), ac.signal).then((r) => {
-      if (r.stopped) return pr.finish('stopped · the browser plug-in is as it was', 'stopped');
-      if (!r.ok) return pr.finish(`couldn't switch: ${r.error}`, false);
-      if (!cfg.plugins?.browser) (cfg.plugins = { ...cfg.plugins, browser: true }), settings.save();
-      pr.finish(`the browser plug-in now uses ${chrome ? 'your Chrome' : 'Chromium'} · /browser opens it`, true);
-    });
-  }
-  // /browser uninstall: asks, then removes Playwright, the Chromium it downloaded
-  // and the plug-ins' settings; their tools leave new conversations.
-  function browserUninstall() {
-    if (!browserInstalled() && !cfg.plugins?.browser && !cfg.plugins?.design) return void note('The browser plug-in isn\'t installed.', 'dim');
-    S.question = {
-      q: `Remove the browser plug-in? It deletes ~/.rime/plugins/browser${usesChrome() ? '' : ' and the Chromium it downloaded'}; the browser and design tabs close. Your Chrome and your design files stay.`,
-      options: [{ label: 'Remove it' }, { label: 'Keep it' }],
-      sel: 1, tool: false,
-      done: (a) => {
-        S.question = null;
-        if (a !== 'Remove it') return schedule();
-        side.closePlugins();
-        browser = null;
-        const pr = progressRow(() => {});
-        pr.update({ step: 'Removing the browser plug-in' });
-        void uninstallBrowser().then((r) => {
-          if (!r.ok) return pr.finish(`couldn't remove it: ${r.error}`, false);
-          cfg.plugins = { ...cfg.plugins, browser: false, design: false };
-          settings.save();
-          pr.finish('the browser plug-in is removed · its tools leave your next conversation; /browser sets it up again', true);
-        });
-        schedule();
-      },
-    };
-    schedule();
-  }
-
-  // ---- design plug-in (Phase 12) ----
-  const designs = new Map<string, DesignSession>();
-  const picks = new Map<string, Pick>(); // @Name in the prompt -> what was picked
-  const designHost = () => ({
-    st, color: (rgb: [number, number, number], bg: boolean) => sgr(rgb, bg, st.mode), redraw: () => schedule(), onClose: () => {}, log: (l: string) => note(l, 'dim'), project,
-    insert: (t: string) => ((buf = buf.slice(0, cur) + t + buf.slice(cur)), (cur += t.length), (sideFocus = false), schedule()),
-    pick: (p: Pick) => void picks.set(p.name, p),
-    // a: a sketch becomes a page in the project (today's export); a design made
-    // from the project's page changes that page's real source (docs/split-v2.md §4.6).
-    apply: (file: string, version: number, from?: From) => {
-      sideFocus = false;
-      if (!from?.url && !from?.file) return void send(`Turn ${file} (version ${version}) into components in this project's stack (for example src/pages/${file.replace(/^design\/|\.html$/g, '').replace(/(^|-)(\w)/g, (_, _d, c) => c.toUpperCase())}.tsx), following its conventions, and start the dev server if it isn't running.`);
-      applying = { file, url: from.url };
-      void send(`Apply ${file} (version ${version}) to the project: change the source files that render ${from.url ?? from.file}${from.file ? ` (${from.file} and its CSS)` : " (the route's component and its CSS)"} so the page matches it. Read ${file} first, and keep the project's components and conventions.`);
-    },
-    credit: () => void credit(),
-  });
-  async function designTab(name: string) {
-    const open = designs.get(name);
-    if (open && side.tabs.some((t) => t.title === open.tab.title)) return side.go(side.tabs.findIndex((t) => t.title === open.tab.title)), open;
-    const d = await openDesign(designHost(), name);
-    designs.set(name, d);
-    const close = d.tab.close;
-    side.custom({ ...d.tab, close: () => (close?.(), designs.delete(name)) }, true);
-    return d;
-  }
-  // /design new <what> · /design <name> · /design (the last one)
-  function designCmd(args: string[]) {
-    withPlaywright('design', async () => {
-      try {
-        let name = args[0] === 'new' ? designSlug(args.slice(1).join(' ') || 'page') : args[0] ? designSlug(args[0]) : '';
-        if (!name) {
-          const dir = path.join(project, 'design');
-          const last = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.html')).sort((a, b) => fs.statSync(path.join(dir, b)).mtimeMs - fs.statSync(path.join(dir, a)).mtimeMs)[0] : '';
-          if (!last) return note('No design yet. /design new <what> starts one, e.g. /design new landing page for a notes app', 'dim');
-          name = last.replace(/\.html$/, '');
-        }
-        const abs = path.join(project, designFile(name));
-        if (!fs.existsSync(abs)) {
-          if (args[0] !== 'new') return note(`There's no ${designFile(name)}. /design new ${args.join(' ')} starts it.`, 'dim');
-          fs.mkdirSync(path.dirname(abs), { recursive: true });
-          fs.writeFileSync(abs, starter(args.slice(1).join(' ') || name));
-          S.tell.push(`[Rime: the user started a design in ${designFile(name)}. Change it with the design tool (name "${name}").]`);
-        }
-        await designTab(name);
-      } catch (e) {
-        note(`The design tab didn't open: ${(e as Error).message.split('\n')[0]}`);
-      }
-    });
-  }
-
-  // ---- split view v2 (docs/split-v2.md): what the panel asks of the app ----
+  // ---- the panel: what its views ask of the app ----
   const scriptsOf = (): Record<string, string> => {
     try {
       return JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).scripts ?? {};
@@ -1845,101 +1648,26 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       return {};
     }
   };
-  const designNames = () => {
-    try {
-      return fs.readdirSync(path.join(project, 'design')).filter((f) => f.endsWith('.html')).map((f) => f.slice(0, -5));
-    } catch {
-      return [];
-    }
-  };
-  const runningServer = () => side.tabs.find((t): t is ShellTab & { serve: { url: string } } => t.kind === 'shell' && !!t.serve?.url && t.state === 'running');
   const shortUrl = (u: string) => u.replace(/^https?:\/\//, '').replace(/\/$/, '');
   // @ in the panel: the file (or its lines) goes into the chat prompt as a chip;
   // focus stays where it is.
   function mention(ref: string, lines?: [number, number]) {
     try {
       addChip(chipFor(path.join(project, ref), nextN, cwd, schedule, lines));
-      side.toast(`@${ref}${lines ? `:${lines[0]}${lines[1] !== lines[0] ? `-${lines[1]}` : ''}` : ''} is in the chat prompt`);
+      pane.toast(`@${ref}${lines ? `:${lines[0]}${lines[1] !== lines[0] ? `-${lines[1]}` : ''}` : ''} is in the chat prompt`);
     } catch (e) {
-      side.toast(`can't add ${ref}: ${(e as Error).message}`);
+      pane.toast(`can't add ${ref}: ${(e as Error).message}`);
     }
   }
-  // The browser tab at an address (or a local HTML file); `from`: the server tab
-  // it came from (found by its address when not given). `say`: one chat line.
-  function browse(raw: string, from?: number, say = false): Promise<void> {
-    const url = pageUrl(raw);
-    const short = shortUrl(url);
-    addresses.splice(0, addresses.length, short, ...addresses.filter((a) => a !== short).slice(0, 9));
-    from ??= side.tabs.find((t) => t.kind === 'shell' && t.serve?.url && /^(https?:\/\/)?/.test(url) && shortUrl(url).startsWith(shortUrl(t.serve.url)))?.id;
-    return new Promise((done) =>
-      withPlaywright('browser', async () => {
-        try {
-          const b = await browserNow();
-          if (browserTab) side.link(browserTab, { from });
-          await b.act({ action: 'open', url });
-          if (say) S.items.push({ kind: 'tool', verb: '◐', rest: `opened ${short} → tab ${side.tabs.indexOf(browserTab as never) + 1}` });
-        } catch (e) {
-          side.toast(`couldn't open ${short}: ${(e as Error).message.split('\n')[0]}`);
-        }
-        done();
-        schedule();
-      }),
-    );
-  }
-  // :design [name or url], the switcher's rows, "redesign my pricing page": your
-  // page at an address, a source file's page on the running server, or a sketch.
-  function designAny(arg: string) {
-    const a = arg.trim(), sv = runningServer();
-    if (!a) return sv ? designFromPage(shortUrl(sv.serve.url)) : designCmd([]);
-    if (/^(localhost|127\.|https?:|\/)/.test(a)) return designFromPage(a.startsWith('/') ? `${sv ? shortUrl(sv.serve.url) : 'localhost:3000'}${a}` : a);
-    if (!a.startsWith('design/') && /\.\w+$/.test(a) && fs.existsSync(path.join(project, a))) {
-      if (!sv) return note(`Start the server first (:serve in the panel), then :design ${a} captures its page.`, 'dim');
-      const route = path.basename(a).replace(/\.\w+$/, '').toLowerCase().replace(/^(index|home|app|page)$/, '');
-      return designFromPage(`${shortUrl(sv.serve.url)}/${route}`, a);
+  // A server's address in the user's own browser.
+  function openUrl(url: string) {
+    const u = /^https?:\/\//.test(url) ? url : `http://${url}`;
+    const [cmd, args] = process.platform === 'darwin' ? ['open', [u]] : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', u]] : ['xdg-open', [u]];
+    try {
+      spawn(cmd, args, { detached: true, stdio: 'ignore' }).on('error', () => pane.toast(`couldn't open ${shortUrl(u)}`)).unref();
+    } catch {
+      pane.toast(`couldn't open ${shortUrl(u)}`);
     }
-    designCmd(fs.existsSync(path.join(project, designFile(designSlug(a)))) ? [a] : ['new', a]);
-  }
-  // A design idea typed in the panel: the tab starts, and the idea goes to the
-  // chat as a message, so the conversation keeps the record.
-  function designIdea(text: string) {
-    designCmd(['new', text]);
-    sideFocus = false;
-    void send(`design ${text}`);
-  }
-  // "Your page" (§4.6): the running page saved as design/<name>.html v1, a static
-  // copy; nothing in the project changes until the user applies a version.
-  function designFromPage(url: string, file?: string) {
-    const short = shortUrl(url);
-    const name = designSlug(short.split('/').slice(1).filter(Boolean).pop() || 'home');
-    withPlaywright('design', async () => {
-      try {
-        const html = await capture(designHost(), url);
-        const abs = path.join(project, designFile(name));
-        fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.writeFileSync(abs, html);
-        createVersions(project, name).setFrom({ url: short, ...(file ? { file } : {}) });
-        index?.put(designFile(name));
-        const d = await designTab(name);
-        S.items.push({ kind: 'tool', verb: '✎', rest: `captured ${short} as ${designFile(name)} v${d.version()} → tab ${side.active + 1}` });
-        S.tell.push(`[Rime: the user started a design from their page ${short}${file ? ` (${file})` : ''}: ${designFile(name)}, a static copy. Change it with the design tool (name "${name}"); nothing in the project changes until they apply it.]`);
-      } catch (e) {
-        note(`Couldn't capture ${short}: ${(e as Error).message.split('\n')[0]}`);
-      }
-      schedule();
-    });
-  }
-  // After an apply's turn wrote files: the page opens in the browser tab, linked
-  // from the server and from the design (✎ pricing v3 → 3).
-  let applying: { file: string; url?: string } | null = null;
-  function finishApply() {
-    const a = applying!;
-    applying = null;
-    if (!a.url) return;
-    const sv = runningServer();
-    if (!sv) return note(`No server is running: :serve in the panel starts it, then :open ${a.url} shows the page.`, 'dim');
-    const name = path.basename(a.file, '.html');
-    const d = side.tabs.find((t) => t.kind === 'custom' && t.title.startsWith(`${name} v`));
-    void browse(a.url, sv.id).then(() => d && browserTab && side.link(d, { to: (browserTab as { id: number }).id }));
   }
 
   // ---- code-index (Phase 5) ----
@@ -1982,24 +1710,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       }
     return cpsMade;
   };
-  const changeLine = (ch: { file: string; how: string }[]) => ch.map((c) => `${c.file} ${c.how === 'added' ? 'created' : c.how}`).join(' · ');
-  // /diff: what changed since the last checkpoint, coloured, at most 400 lines.
-  function showDiff() {
-    S.items.push({ kind: 'user', text: '/diff' });
-    const cps = checkpointsOf(), cp = cps?.last();
-    if (!cps || !cp) return void (note('No changes to show: Rime takes a checkpoint before it changes a file.', 'dim'), handled());
-    const ch = cps.changes(cp);
-    if (!ch.length) return void (note(`Nothing changed since before "${cp.label}".`, 'dim'), handled());
-    if (side.visible) {
-      side.diff(cps.diff(cp), true);
-      S.items.push({ kind: 'lines', lines: [[{ t: '± ', s: st.accent }, { t: `since before "${cp.label}" · `, s: st.dim }, { t: changeLine(ch), s: st.title }, { t: ' → diff tab', s: st.accent }]] });
-      return void handled();
-    }
-    const lines = cps.diff(cp).split('\n').filter((l) => !/^(index |diff --git|new file mode|deleted file mode|similarity)/.test(l));
-    const show = lines.slice(0, 400).map((l): Line => [{ t: '  ' + l, s: l.startsWith('+++') || l.startsWith('---') ? st.titleB : l.startsWith('+') ? st.ok : l.startsWith('-') ? st.del : l.startsWith('@@') ? st.accent : st.dim }]);
-    S.items.push({ kind: 'lines', lines: [[{ t: '± ', s: st.accent }, { t: `since before "${cp.label}" · ${ago(cp.at)} · `, s: st.dim }, { t: changeLine(ch), s: st.title }], ...show, ...(lines.length > 400 ? [[{ t: `  … ${lines.length - 400} more lines`, s: st.dim }]] : []), [{ t: '  /undo', s: st.accent }, { t: ' puts them back', s: st.dim }]] });
-    handled();
-  }
   // /undo: the files go back to the last checkpoint, and the model hears about it
   // with the next message. Again goes one change further back.
   function undo() {
@@ -2017,6 +1727,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     S.items.push({ kind: 'lines', lines: [[{ t: '↶ ', s: st.accent }, { t: `undid "${cp.label}" · `, s: st.dim }, { t: what, s: st.title }]] });
     S.tell.push(`[Rime: the user undid your changes from "${cp.label}": ${what}. Those files are as they were before that.]`);
     if (S.convId) bound(S).event('edit', `undid "${cp.label}"`);
+    side.review.refresh();
     handled();
   }
 
@@ -2097,11 +1808,16 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // request, storage, permissions and questions, and the screen built from its
   // events (thinking, the reply, the live "writing…" row, tool rows, cost).
   function turnHost(C: Session, m: Model, cn: Conn, c: Controls, ac: AbortController, did: Did, setEsc: (f: () => void) => void, label = ''): TurnHost {
-    // Commands mirrored into split view's tabs, by tool call; the tab learns how it ended.
-    const mirrors = new Map<unknown, { tab: number; write: (s: string) => void; done: (code: number) => void }>();
-    const tabbed = async (u: Block, r: ToolResult | Promise<ToolResult>) => {
+    // Commands copied into the panel's run view, by tool call; it learns how each ended.
+    const mirrors = new Map<unknown, { write: (s: string) => void; done: (code: number) => void }>();
+    const mirrored = async (u: Block, r: ToolResult | Promise<ToolResult>) => {
       const res = await r;
       mirrors.get(u.id)?.done(res.error ? Number(/exit (\d+)/.exec(res.summary)?.[1] ?? 1) : 0);
+      // Files may have changed: the review and the checks (when watching) catch up.
+      if (u.name === 'write' || u.name === 'edit' || u.name === 'bash') {
+        side.checks.changed();
+        if (pane.visible) side.review.refresh();
+      }
       return res;
     };
     const { store, note, drop, addConvRule, detail, event } = bound(C);
@@ -2109,11 +1825,11 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     let cp: ReturnType<Checkpoints['begin']> | null = null;
     const checkpoint = (u: Block, d: Decision) => {
       const cps = checkpointsOf();
-      const writes = u.name === 'write' || u.name === 'edit' || u.name === 'design';
+      const writes = u.name === 'write' || u.name === 'edit';
       if (!cps || !(writes || (u.name === 'bash' && !d.parts?.every((p) => p.why === 'read-only')))) return;
       try {
         cp ??= cps.begin(label || 'a turn');
-        if (writes) cps.touch(cp, u.name === 'design' ? designFile(designSlug(String((u.input as Record<string, unknown>)?.name ?? 'page'))) : rel(project, path.resolve(cwd, String((u.input as Record<string, unknown>)?.path ?? ''))));
+        if (writes) cps.touch(cp, rel(project, path.resolve(cwd, String((u.input as Record<string, unknown>)?.path ?? ''))));
       } catch {} // no git binary, unreadable file: the change still runs
     };
     const root = llama.rootOf(cn.base);
@@ -2149,6 +1865,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     // What a reply cost: the ↳ line, the meter, rime.db, and the cache-safety measure.
     const charge = (usage: Usage | null, seq: number) => {
       if (!usage) return;
+      C.lastUsage = usage;
       const turn = C.meter.charge(usage, m.price, cn.local);
       addCost(C, turn);
       if (seq) save((d) => d.setUsage(C.convId!, seq, { usage, ...(m.price ? { price: m.price } : {}), ...(cn.local ? { local: true } : {}) }));
@@ -2221,11 +1938,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         C.items.push(toolLine(e.use));
         detail([[e.answer === null ? { t: 'not answered', s: st.dim } : { t: e.answer, s: st.title }]]);
       } else if (e.type === 'run') {
-        // In split view a command's output streams into its own tab ("→ tab 4").
+        // A command's output also streams into the panel's run view.
         const bg = e.use.name === 'bash' && !!(e.use.input as Record<string, unknown>)?.background;
-        const tab = e.use.name === 'bash' && !bg && side.visible && C === S ? side.mirror(String((e.use.input as Record<string, unknown>)?.command ?? '')) : null;
-        if (tab) mirrors.set(e.use.id, tab);
-        const extra = [...(e.decision.verdict === 'allow' && e.use.name === 'bash' ? [{ t: ` · ${e.decision.why}`, s: st.dim }] : []), ...(tab ? [{ t: ` → tab ${tab.tab}`, s: st.accent }] : bg ? [{ t: ` → tab ${side.tabs.length + 1} · server, stays running`, s: st.accent }] : [])];
+        if (e.use.name === 'bash' && !bg) mirrors.set(e.use.id, side.run.mirror(String((e.use.input as Record<string, unknown>)?.command ?? '')));
+        const extra = [...(e.decision.verdict === 'allow' && e.use.name === 'bash' ? [{ t: ` · ${e.decision.why}`, s: st.dim }] : []), ...(bg ? [{ t: ' → run · server, stays running', s: st.accent }] : [])];
         C.items.push({ ...toolLine(e.use), ...(extra.length ? { extra } : {}) } as Item);
       }
       else if (e.type === 'ran') {
@@ -2237,8 +1953,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
           edited.splice(0, edited.length, rp, ...edited.filter((x) => x !== rp).slice(0, 19));
         }
         if (e.use.name === 'bash') did.ran.push({ cmd: String(input.command), ok: !r.error, out: r.output });
-        // A dev server's address in a command's output: the next step offers it in the browser tab.
-        if (e.use.name === 'bash') did.dev = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d+[^\s'")]*/.exec(r.output?.join('\n') ?? r.content)?.[0] ?? did.dev;
         if (e.use.name === 'read' && !r.error) (did.about ??= []).push(file);
         for (const x of toolEvents(String(e.use.name), input, r, file)) event(x.kind, x.text, x.ref);
         // What it did, short: the diff of an edit, the end of a command's output.
@@ -2261,8 +1975,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       emit: on,
       decide: (u) => {
         const inp = (u.input ?? {}) as Record<string, any>;
-        // The design tool writes design/<name>.html: the same check as a write.
-        const d = u.name === 'design' ? decide('write', { path: designFile(designSlug(String(inp.name ?? 'page'))), content: inp.html }, permCtx(C)) : decide(String(u.name), inp, permCtx(C));
+        const d = decide(String(u.name), inp, permCtx(C));
         decisions.unshift({ at: Date.now(), tool: String(u.name), what: `${describe(u).verb} ${describe(u).rest}`, verdict: d.verdict, why: d.why, src: d });
         decisions.length = Math.min(decisions.length, 50);
         return d;
@@ -2287,7 +2000,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
           const edits = u.name === 'write' || u.name === 'edit';
           if (edits || d.rule) {
             for (const r of edits ? ['edit(**)'] : (d.rules ?? [d.rule!])) addConvRule('allow', r);
-            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${edits ? 'edits' : u.name === 'browser' ? `pages on ${d.label}` : `${d.label} commands`} in this conversation · /permissions`, s: st.dim }]] });
+            C.items.push({ kind: 'lines', lines: [[{ t: '⚙ ', s: st.accent }, { t: `allowed ${edits ? 'edits' : `${d.label} commands`} in this conversation · /permissions`, s: st.dim }]] });
           }
         }
         return 'yes';
@@ -2307,7 +2020,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         }),
       // Auto mode's unasked commands run in the sandbox; read-only ones get git
       // hardened. Asked-and-approved commands run as you approved them.
-      run: async (u, d, signal) => (checkpoint(u, d), tabbed(u, runTool(String(u.name), (u.input ?? {}) as Record<string, any>, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv, onOutput: mirrors.get(u.id)?.write }))),
+      run: async (u, d, signal) => (checkpoint(u, d), mirrored(u, runTool(String(u.name), (u.input ?? {}) as Record<string, any>, signal, C, { project, sandbox: mode === 'auto' && d.verdict === 'allow', readOnly: !!d.parts?.length && d.parts.every((p) => p.why === 'read-only'), passEnv: cfg.passEnv, onOutput: mirrors.get(u.id)?.write }))),
       optionsOf,
       queued: () => takeQueued(C),
       afterRound: (signal) => makeRoom(C, m, cn, signal),
@@ -2388,8 +2101,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   };
   const describe = (u: Block) => {
     const i = (u.input ?? {}) as Record<string, any>;
-    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime', ask: 'Asked', search: 'Search', browser: 'Browser', design: 'Design' }[String(u.name)] ?? String(u.name);
-    const rest = u.name === 'design' ? designFile(designSlug(String(i.name ?? 'page'))) : u.name === 'browser' ? [i.action, i.url ?? (i.ref ? `[ref=${i.ref}]` : ''), i.text ? `"${i.text}"` : ''].filter(Boolean).join(' ') : u.name === 'search' ? String(i.query ?? '') : u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'ask' ? String(i.question ?? '') : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
+    const verb = { read: 'Read', write: 'Write', edit: 'Edit', bash: 'Bash', rime: 'Rime', ask: 'Asked', search: 'Search' }[String(u.name)] ?? String(u.name);
+    const rest = u.name === 'search' ? String(i.query ?? '') : u.name === 'bash' ? String(i.command ?? '').split('\n')[0] : u.name === 'ask' ? String(i.question ?? '') : u.name === 'rime' ? `${i.action ?? ''}${i.args ? ' ' + JSON.stringify(i.args) : ''}` : rel(cwd, path.resolve(cwd, String(i.path ?? '')));
     return { verb, rest };
   };
   const toolLine = (u: Block): Item => ({ kind: 'tool', ...describe(u) });
@@ -2402,26 +2115,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (name === 'edit') return editTool(cwd, input as { path: string; old: string; new: string });
     if (name === 'bash' && input.background) return background(String(input.command ?? ''), as);
     if (name === 'bash') return bashTool(cwd, input as { command: string }, signal, as);
-    if (name === 'browser') {
-      if (!cfg.plugins?.browser || !browserInstalled()) return { content: 'The browser plug-in is off; the user turns it on with /browser.', error: true, summary: 'browser off' };
-      return browserNow()
-        .then((b) => b.act(input))
-        .then((text) => ({ content: text, summary: text.split('\n')[0].slice(0, 80) }))
-        .catch((e) => ({ content: (e as Error).message.split('\n').slice(0, 3).join('\n'), error: true, summary: (e as Error).message.split('\n')[0].slice(0, 80) }));
-    }
-    if (name === 'design') {
-      const n = designSlug(String(input.name ?? 'page'));
-      const abs = path.join(project, designFile(n));
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, textOf(input.html));
-      index?.put(designFile(n));
-      return designTab(n)
-        .then(async (d) => {
-          const fits = await overflow(designHost(), abs).catch((e) => `couldn't check the sizes: ${(e as Error).message.split('\n')[0]}`);
-          return { content: `Saved ${designFile(n)} as version ${d.version()}. ${fits}.`, summary: `version ${d.version()} · ${/overflows/.test(fits) ? 'overflows' : 'fits'}` };
-        })
-        .catch((e) => ({ content: `Saved ${designFile(n)}; the tab didn't open: ${(e as Error).message.split('\n')[0]}`, summary: 'saved' }));
-    }
     if (name === 'search') {
       if (!index) return { content: 'The code index is still being built; use bash with rg or grep for now.', error: true, summary: 'index not ready' };
       const hits = index.search(String(input.query ?? ''), Math.min(20, Math.max(1, Number(input.limit) || 20)));
@@ -2434,25 +2127,24 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     return { content: `Unknown tool ${name}.`, error: true, summary: 'unknown tool' };
   }
 
-  // bash with background: true (docs/split-v2.md §4.4, §6): the command runs in a
-  // server tab, not bound to the bash timeout, and the model gets its first lines
-  // once it prints an address or after 10 s. Auto mode's sandbox still applies.
+  // bash with background: true: the command runs in the panel's run view as a
+  // server, not bound to the bash timeout, and the model gets its first lines once
+  // it prints an address or after 10 s. Auto mode's sandbox still applies.
   async function background(cmd: string, as: RunAs): Promise<ToolResult> {
     const box = as.sandbox ? sandboxed(cmd, project) : null;
-    const t = side.serve(cmd, { byRime: true, focus: false, ...(box ? { argv: box } : {}) });
+    const t = side.run.serve(cmd, { byRime: true, focus: false, ...(box ? { argv: box } : {}) });
     for (const t0 = Date.now(); Date.now() - t0 < 10000 && t.state === 'running' && !t.serve?.url; ) await new Promise((r) => setTimeout(r, 200));
-    const n = side.tabs.indexOf(t) + 1;
     const first = t.out.slice(1, 31).join('\n');
     const up = t.state === 'running';
-    const where = up ? `running in tab ${n} (tab.read to see more)` : `ended in tab ${n} (exit ${t.code ?? '?'})`;
-    return { content: `${t.serve?.url ? `Serving at ${t.serve.url}, ` : ''}${where}\n${first}`, error: !up, summary: t.serve?.url ? `${shortUrl(t.serve.url)} · tab ${n}` : where, output: t.out.slice(1, 31) };
+    const where = up ? "running in the panel's run view (rime panel.read {view: 'run'} shows more)" : `ended (exit ${t.code ?? '?'})`;
+    return { content: `${t.serve?.url ? `Serving at ${t.serve.url}, ` : ''}${where}\n${first}`, error: !up, summary: t.serve?.url ? `${shortUrl(t.serve.url)} · run view` : up ? 'running · run view' : where, output: t.out.slice(1, 31) };
   }
 
   // The rime tool (SPEC §15): Rime acting on itself. It never reads or writes API
   // keys, and it can't change permission modes or rules (it opens /permissions).
   function rimeTool(action: string, args: Record<string, any>, C: Session = S, signal?: AbortSignal): string | Promise<string> {
     const { conversation, store, note, drop, addConvRule, detail } = bound(C);
-    const ACTIONS = 'help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · tab.open {kind: files {query?, text?: true} | file {path, line} | diff | browser {url} | design {name | url}} · tab.read {tab, lines?} · tab.close {n} · tab.focus {n} · panel.show · panel.hide · browser.open {url: a web address or a local HTML file} · design.open {name} or {new: what to build} or {url: the user\'s page}';
+    const ACTIONS = `help · settings.list · settings.get {key} · settings.set {key, value} · command {name: /model | /server | /setup | /settings | /permissions | /usage} · panel.show {view?: ${VIEWS.join(' | ')}} · panel.hide · panel.read {view, n?} · plan {steps: [{text, state: done | now | next}]} · file.open {path, line?}`;
     if (action === 'help') return `Actions: ${ACTIONS}\nSettings: ${settings.list().map((d) => `${d.key} (${d.values.join(' | ')}; applies ${WHEN[d.applies]})`).join(', ')}`;
     if (action === 'settings.list') return settings.list().map((d) => `${d.key} = ${d.get(cfg)} · ${d.help} · applies ${WHEN[d.applies]}`).join('\n');
     if (action === 'settings.get') return `${args.key} = ${settings.get(String(args.key)) ?? '(no such setting)'}`;
@@ -2499,80 +2191,53 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       schedule();
       return `Opened ${name} for the user; they answer it there.`;
     }
-    // Split view's tabs (SPEC §8, §15). The model opens tabs without taking the
-    // keys from the chat; it never runs a command this way (that's bash, with its
-    // permission check, whose output shows in a tab while the panel is open).
-    if (action === 'tab.open') {
+    // The panel (SPEC §8, §15). The model shows views without taking the keys from
+    // the chat; it never runs a command this way (that's bash, with its permission
+    // check, whose output shows in the run view).
+    const viewOf = (v: unknown) => {
+      const x = String(v ?? '').toLowerCase();
+      const n = Number(x);
+      return n >= 1 && n <= VIEWS.length ? VIEWS[n - 1] : (VIEWS as readonly string[]).includes(x) ? x : { diff: 'review', changes: 'review', tests: 'checks', shell: 'run', server: 'run', servers: 'run', tab: 'run', tools: 'log' }[x];
+    };
+    if (action === 'panel.show' || action === 'panel.split' || action === 'tab.focus') {
+      const v = viewOf(args.view ?? args.tab ?? args.n) ?? (args.view || args.tab || args.n ? null : pane.active);
+      if (!v) return `No view ${args.view ?? args.tab ?? args.n}. Views: ${VIEWS.join(', ')}.`;
+      pane.show(true);
+      pane.go(v);
+      return `The panel is showing the ${v} view.${layout().px ? '' : ` The terminal is narrow (${W()} columns), so the user sees it with ctrl+g.`}`;
+    }
+    if (action === 'panel.hide' || action === 'tab.close') return pane.show(false), (sideFocus = false), 'The panel is hidden; commands in it keep running.';
+    if (action === 'panel.read' || action === 'tab.read') {
+      const v = viewOf(args.view ?? args.tab ?? 'run');
+      if (!v) return `No view ${args.view ?? args.tab}. Views: ${VIEWS.join(', ')}.`;
+      return pane.view(v).read?.(Number(args.n ?? args.lines) || undefined) ?? `The ${v} view has nothing to read; the log is the tool calls you already have.`;
+    }
+    if (action === 'plan') {
+      const steps = stepsOf(args.steps ?? args);
+      if (!steps) return 'plan takes {steps: [{text, state: done | now | next}]}.';
+      C.plan = steps;
+      C.planEdited = false;
+      if (C === S) side.plan.set(steps);
+      const done = steps.filter((x) => x.state === 'done').length;
+      return steps.length ? `Plan updated: ${done} of ${steps.length} done. The user sees it in the panel's plan view.` : 'Plan cleared.';
+    }
+    if (action === 'file.open' || action === 'tab.open') {
       const kind = String(args.kind ?? (args.path ? 'file' : 'files'));
-      if (kind === 'files') return side.files(true, args.query ? { mode: args.text ? 'text' : 'name', q: String(args.query) } : undefined), args.query ? `Opened the files tab searching for "${args.query}".` : 'Opened the files tab.';
-      if (kind === 'file') {
-        const rp = rel(project, path.resolve(cwd, String(args.path ?? '')));
-        return side.file(rp, Number(args.line) || undefined) ? `Opened ${rp}${args.line ? ` at line ${args.line}` : ''} in a tab.` : `Couldn't open ${rp}.`;
+      if (kind === 'diff') return pane.show(true), pane.go('review'), side.review.refresh(), 'Showing your changes in the review view.';
+      if (kind === 'files') {
+        pane.show(true);
+        if (args.query) side.files.search(args.text ? 'text' : 'name', String(args.query));
+        else side.files.tree();
+        pane.go('files');
+        return args.query ? `Showing the files view searching for "${args.query}".` : 'Showing the files view.';
       }
-      if (kind === 'diff') {
-        const cps = checkpointsOf(), cp = cps?.last();
-        if (!cps || !cp) return 'No change on record to diff.';
-        return side.diff(cps.diff(cp), true), 'Opened the diff of the last change in a tab.';
-      }
-      if (kind === 'browser' || kind === 'web' || kind === 'page') return openPage(args);
-      if (kind === 'design') return openDesign_(args);
-      if (kind === 'shell' || kind === 'server') return 'Run commands with the bash tool; while the panel is open their output shows in a tab of its own. A server: bash with background: true.';
-      return `No tab kind ${kind}. Kinds: files {query?}, file {path, line}, diff, browser {url: a web address or a local HTML file}, design {name} or {new: what to build} or {url}.`;
+      if (kind !== 'file') return `Rime can't open ${kind} in the terminal. file.open {path, line?} shows a file; panel.show {view} shows a view.`;
+      const rp = rel(project, path.resolve(cwd, String(args.path ?? '')));
+      pane.show(true);
+      return side.files.openFile(rp, Number(args.line) || undefined) ? (pane.go('files'), `Showing ${rp}${args.line ? ` at line ${args.line}` : ''} in the files view.`) : `Couldn't open ${rp}.`;
     }
-    // The last lines of a shell or server tab (default 60, at most 4,000 characters),
-    // so a server's errors can be read without running it again.
-    if (action === 'tab.read') {
-      const n = Number(args.tab ?? args.n) - 1;
-      const text = side.read(n, Number(args.lines) || 60);
-      if (text === null) return side.tabs[n] ? `Tab ${n + 1} isn't a shell or server tab.` : `No tab ${n + 1}; there are ${side.tabs.length}.`;
-      const t = side.tabs[n] as ShellTab;
-      return `Tab ${n + 1} · ${side.titleOf(t)} · ${t.state}${t.serve?.url ? ` · ${t.serve.url}` : ''}\n${text || '(no output yet)'}`;
-    }
-    if (action === 'tab.close' || action === 'tab.focus') {
-      const n = Number(args.n ?? args.tab) - 1;
-      if (!side.tabs[n]) return `No tab ${n + 1}; there are ${side.tabs.length}.`;
-      side.go(n);
-      if (action === 'tab.focus') return `Showing tab ${n + 1}.`;
-      if (side.asking() || (side.tabs[n].kind === 'shell' && (side.tabs[n] as { state: string }).state === 'running')) return 'That tab is still running a command; the user closes it with x in the panel.';
-      return side.close(), `Closed tab ${n + 1}.`;
-    }
-    // The browser tab: a web address, or a local file shown as file://. The first
-    // time, the user is asked to turn the plug-in on (a one-time set-up).
-    if (action === 'browser.open') return openPage(args);
-    if (action === 'design.open') return openDesign_(args);
-    if (action === 'panel.show' || action === 'panel.split') return side.tabs.length ? (side.show(true), `The panel is showing. ${tabList()}`) : (side.files(), 'Opened the panel with the files tab.');
-    if (action === 'panel.hide') return side.show(false), (sideFocus = false), 'The panel is hidden; its tabs keep running.';
+    if (/^(browser|design)\./.test(action)) return "There's no browser or design studio in this terminal. Run a server with bash background: true; the user opens its address from the run view.";
     return `Unknown action ${action}. Actions: ${ACTIONS}`;
-  }
-
-  // The browser tab at a web address, or a local file shown as file:// (rime tool
-  // browser.open, or tab.open {kind: browser}). The first time, the user is asked
-  // to turn the plug-in on (a one-time set-up).
-  function openPage(args: Record<string, any>): string | Promise<string> {
-    const raw = String(args.url ?? args.path ?? '').trim();
-    if (!raw) return 'Opening the browser tab needs {url}: a web address or a local HTML file.';
-    const url = pageUrl(raw);
-    if (!cfg.plugins?.browser || !browserInstalled()) return browserCmd(url), "The browser plug-in isn't on yet, so Rime asked the user to turn it on (a one-time set-up); the page opens in a tab when they do.";
-    return browserNow()
-      .then((b) => b.act({ action: 'open', url }))
-      .then((t) => `${t.split('. Use snapshot')[0]}. ${onScreen()}`)
-      .catch((e) => `Couldn't open it: ${(e as Error).message.split('\n')[0]}`);
-  }
-  // What the user sees of the browser tab, so the model describes the screen, not
-  // a guess: its tab number, and when the split can't be drawn (a terminal under
-  // 72 columns with the chat focused), how to get to it.
-  function onScreen(): string {
-    const n = side.tabs.indexOf(browserTab as never) + 1;
-    const L = layout();
-    if (!n) return 'The browser tab is closed.';
-    if (L.px || L.full) return `The user sees it now in tab ${n} of the split view next to the chat. ${tabList()}`;
-    return `It's in tab ${n}, but the terminal is ${W()} columns wide and the split needs 72, so the user sees the panel only with ctrl+g (full screen).`;
-  }
-  const tabList = () => `Tabs: ${side.tabs.map((t, i) => `${i + 1} ${side.titleOf(t)}`).join(' · ')}.`;
-  function openDesign_(args: Record<string, any>) {
-    if (args.url) return designAny(String(args.url)), cfg.plugins?.design && browserInstalled() ? `Capturing ${args.url} into the design studio.` : "The design plug-in isn't on yet, so Rime asked the user to turn it on; the tab opens when they do.";
-    designCmd(args.new ? ['new', String(args.new)] : args.name ? [String(args.name)] : []);
-    return cfg.plugins?.design && browserInstalled() ? 'Opened the design tab.' : "The design plug-in isn't on yet, so Rime asked the user to turn it on; the tab opens when they do.";
   }
 
   // Asks before a command or an edit: Yes · Yes, don't ask again · No, tell Rime
@@ -2594,8 +2259,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         const e = planEdit(cwd, input as { path: string; old: string; new: string });
         if (!('error' in e)) diff = diffOf(e.before, e.at, input.old, input.new, 8);
       } else if (u.name === 'write') diff = textOf(input.content).split('\n').slice(0, 8).map((t, i) => ({ sign: '+' as const, n: i + 1, text: t }));
-      // In split view the change also flashes into the diff tab (focus stays here).
-      if (diff && side.visible) side.diff(`--- ${input.path}\n+++ ${input.path}\n` + diff.map((x) => `${x.sign === ' ' ? ' ' : x.sign}${x.n ? String(x.n).padStart(5) : '     '} ${x.text}`).join('\n'));
       C.approval = { use: u, decision: d, sel: 0, done, diff };
       schedule();
     });
@@ -2722,35 +2385,31 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     };
   }
 
-  // /panel: split view for terminals where ctrl+g never arrives.
+  // /panel [view | hide]: the panel, for terminals where ctrl+g never arrives.
   function panelCmd(a = '') {
-    if (a === 'hide') return void (side.show(false), (sideFocus = false));
-    if (a === 'files') side.files(true, null);
-    else if (a === 'shell') side.shell();
-    else if (a === 'diff') {
-      const cps = checkpointsOf(), cp = cps?.last();
-      if (!cps || !cp) return note('No changes to show: Rime takes a checkpoint before it changes a file.', 'dim');
-      side.diff(cps.diff(cp), true);
-    } else if (a) return note(`/panel ${a}? Try /panel, /panel files, shell, diff or hide.`, 'dim');
-    else if (side.visible) return void (side.show(false), (sideFocus = false));
-    else return otherSide();
-    sideFocus = side.visible;
+    const x = a.trim().toLowerCase();
+    if (x === 'hide' || (!x && pane.visible && sideFocus)) return void (pane.show(false), (sideFocus = false));
+    if (!x) return otherSide();
+    const n = Number(x);
+    const v = n >= 1 && n <= VIEWS.length ? VIEWS[n - 1] : x === 'diff' ? 'review' : x === 'shell' ? 'run' : (VIEWS as readonly string[]).includes(x) ? x : null;
+    if (!v) return note(`/panel ${a}? Views: ${VIEWS.map((v, i) => `${i + 1} ${v}`).join(', ')}, or hide.`, 'dim');
+    if (v === 'review') side.review.refresh();
+    openView(v);
   }
 
-  // ctrl+g: from the chat, the panel gets the keys (showing it first, on the
-  // new-tab chooser when there are no tabs); from the panel, the chat does. The
-  // panel stays as it was, so the next ctrl+g lands back there.
+  // ctrl+g: from the chat, the panel gets the keys (showing it first); from the
+  // panel, the chat does. The panel stays as it was, so the next ctrl+g lands
+  // back there.
   function otherSide() {
-    if (sideFocus && side.visible) return void ((sideFocus = false), side.zoom(false));
-    if (!side.tabs.length) side.choose();
-    else side.show(true);
+    if (sideFocus && pane.visible) return void ((sideFocus = false), pane.zoom(false));
+    pane.show(true);
     sideFocus = true;
   }
 
   // Which of the three answers this question offers (0 yes, 1 don't ask again, 2 no).
   function approvalOptions() {
     const a = S.approval!;
-    const again = a.use.name === 'bash' || a.use.name === 'browser' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/always asks/.test(a.decision.why);
+    const again = a.use.name === 'bash' ? !!a.decision.rule : (a.use.name === 'write' || a.use.name === 'edit') && !/always asks/.test(a.decision.why);
     return again ? [0, 1, 2] : [0, 2];
   }
   // `o`: the option (0 yes, 1 don't ask again, 2 no). On screen they're numbered
@@ -2771,7 +2430,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const i = (u.input ?? {}) as Record<string, any>;
     const dim = (t: string) => ({ t, s: st.dim });
     const rows: BoxRow[] = [];
-    const title = u.name === 'browser' ? 'open a web page?' : u.name === 'bash' ? 'run a command?' : u.name === 'write' ? (fs.existsSync(path.resolve(cwd, String(i.path))) ? 'replace a file?' : 'create a file?') : u.name === 'edit' ? 'edit a file?' : 'read a file?';
+    const title = u.name === 'bash' ? 'run a command?' : u.name === 'write' ? (fs.existsSync(path.resolve(cwd, String(i.path))) ? 'replace a file?' : 'create a file?') : u.name === 'edit' ? 'edit a file?' : 'read a file?';
     if (u.name === 'bash') {
       for (const l of String(i.command ?? '').split('\n').slice(0, 6)) rows.push({ line: [{ t: '$ ', s: st.dim }, { t: l, s: st.titleB }], bg: st.panelBg });
       // The folder only when it isn't the project's own.
@@ -2780,8 +2439,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (where.length || why.length) rows.push({ line: [...where, ...(where.length && why.length ? [dim(' · ')] : []), ...why] });
       if (d.parts && d.parts.length > 1)
         rows.push({ line: d.parts.flatMap((p, j) => [...(j ? [dim(' · ')] : []), { t: `${p.state === 'ok' ? '✓' : p.state === 'guard' ? '✗' : '?'} ${p.text}`, s: p.state === 'ok' ? st.ok : p.state === 'guard' ? st.del : st.warn }, ...(p.why ? [dim(` ${p.why}`)] : [])]) });
-    } else if (u.name === 'browser') rows.push({ line: [{ t: String(i.url ?? ''), s: st.titleB }], bg: st.panelBg });
-    else {
+    } else {
       rows.push({ line: [{ t: rel(cwd, path.resolve(cwd, String(i.path ?? ''))), s: st.titleB }] });
       for (const x of diff ?? []) rows.push({ line: [{ t: x.n ? `${String(x.n).padStart(4)} ` : '     ', s: st.dim }, { t: x.sign === ' ' ? x.text : `${x.sign} ${x.text}`, s: x.sign === '+' ? st.ok : x.sign === '-' ? st.del : st.dim }] });
     }
@@ -2789,7 +2447,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     rows.push({ line: [] });
     const labels = [
       'Yes',
-      u.name === 'browser' ? `Yes, and don't ask again for ${d.label} in this conversation` : u.name === 'bash' ? `Yes, and don't ask again for ${d.label} commands in this conversation` : 'Yes, and allow edits for the rest of this conversation',
+      u.name === 'bash' ? `Yes, and don't ask again for ${d.label} commands in this conversation` : 'Yes, and allow edits for the rest of this conversation',
       'No, and tell Rime what to do instead (esc)',
     ];
     const opts = approvalOptions();
@@ -2812,6 +2470,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (!sessions.includes(x)) sessions.push(x);
     S = x;
+    side.plan.set(x.plan); // the panel shows this conversation's plan
     scrollOff = 0;
     browsing = null;
     blindAsk = false;
@@ -3290,6 +2949,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     settings,
     openModel: () => host.open(createModelPicker(host)),
     openConnect: () => host.open(createSetup(host)),
+    openPermissions: () => host.open(createPermissions()),
     // Renames a connection (e.g. your server) everywhere Rime uses its name.
     rename: (from, to) => {
       if (!/^[\w.-]{1,32}$/.test(to)) return 'Use letters, digits, - _ or . (no spaces or slashes).';
@@ -3372,49 +3032,20 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   const unloaded = () => (model && cfg.providers[model.provider]?.ssh && !conn && !(bg && !bg.run.state.done) ? model.id : '');
 
   function local(text: string, ph: { key: string; value: string }) {
-    if (ph.key === 'tab') {
-      // The test command comes from package.json; without one it's the model's job.
-      let tests = '';
-      try {
-        tests = JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8')).scripts?.test ? 'npm test' : '';
-      } catch {}
-      if (ph.value === 'tests' && !tests) return false;
-      S.items.push({ kind: 'user', text });
-      history.push(text);
-      if (ph.value === 'files') side.files(true, null), tabLine('▤', 'files');
-      else if (ph.value === 'tests') checked(tests, () => (side.shell(tests, true, false), tabLine('Bash', tests)));
-      else {
-        const cps = checkpointsOf(), cp = cps?.last();
-        if (cps && cp) side.diff(cps.diff(cp), true), tabLine('±', 'diff');
-        else note('No change on record to diff yet.', 'dim');
-      }
-      handled();
-      return;
-    }
-    // Split view v2's plain words (docs/split-v2.md §5), with no API call.
+    // The panel's plain words (SPEC §8), with no API call.
     const said = () => (S.items.push({ kind: 'user', text }), history.push(text));
     if (ph.key === 'panel') {
       said();
-      if (ph.value === 'hide') side.show(false), (sideFocus = false), note('Panel hidden. Tabs keep running · ctrl+g shows it.', 'dim');
-      else otherSide(), note('Split open · ctrl+g to the chat', 'dim');
+      if (ph.value === 'hide') pane.show(false), (sideFocus = false);
+      else if (ph.value === 'show') pane.show(true), (sideFocus = true);
+      else panelCmd(ph.value);
       return void handled();
     }
-    if (ph.key === 'open') {
-      const v = ph.value, file = fs.existsSync(path.resolve(cwd, v.replace(/^~(?=\/)/, os.homedir())));
-      if (file ? !/\.html?$/i.test(v) : !addressLike(v)) return false; // a file to read is the model's
+    if (ph.key === 'checks') {
+      if (!detectChecks(project).length) return false; // no checks here: the model finds out how
       said();
-      // Another site asks first; the project's pages (localhost, files) open.
-      if (file || /^(localhost|127\.|file:|\[::1\]|0\.0\.0\.0)/.test(v)) void browse(v, undefined, true);
-      else
-        S.question = {
-          q: `Open ${v}? It is another site.`, options: [{ label: 'Open it' }, { label: 'No' }], sel: 0, tool: false,
-          done: (a) => {
-            S.question = null;
-            if (a === 'Open it') void browse(v, undefined, true);
-            else note('Not opened.', 'dim');
-            schedule();
-          },
-        };
+      openView('checks');
+      side.checks.run();
       return void handled();
     }
     if (ph.key === 'run' || ph.key === 'serve') {
@@ -3423,30 +3054,19 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const cmd = script ? `npm run ${script}` : ph.value;
       said();
       checked(cmd, () => {
-        if (!script) return void (side.shell(cmd, true, false), tabLine('Bash', cmd));
-        const old = side.tabs.findIndex((t) => t.kind === 'shell' && t.serve?.script === script && t.state === 'running');
-        if (old >= 0) return side.go(old), note(`${script} is already running in tab ${old + 1}.`, 'dim');
-        side.serve(cmd, { script, byRime: true, focus: false });
-        tabLine('Bash', cmd, ' · server, stays running');
+        if (!script) return void (side.run.shell(cmd), openView('run'));
+        const old = side.run.procs.find((t) => t.serve?.script === script && t.state === 'running');
+        if (old) return side.run.select(old), openView('run'), note(`${script} is already running.`, 'dim');
+        side.run.serve(cmd, { script, byRime: true });
+        openView('run');
       });
       return void handled();
     }
     if (ph.key === 'search') {
       const [m, q] = [ph.value.slice(0, 4) as 'name' | 'text', ph.value.slice(5)];
       said();
-      side.files(true, { mode: m, q });
-      tabLine('▤', `files, searching ${m === 'name' ? 'names' : 'text'} for "${q}"`);
-      return void handled();
-    }
-    if (ph.key === 'design') {
-      const v = ph.value.trim(), sv = runningServer();
-      // A page by name on the running server, an address, or a design by that name;
-      // anything else is the model's to find.
-      const page = /^(localhost|127\.|https?:|\/)/.test(v) ? v : sv ? `${shortUrl(sv.serve.url)}/${designSlug(v).replace(/^(home|index)$/, '')}` : '';
-      if (!page && !designNames().includes(designSlug(v))) return false;
-      said();
-      if (page) designAny(page);
-      else designCmd([designSlug(v)]);
+      side.files.search(m, q);
+      openView('files');
       return void handled();
     }
     if (ph.key === 'use') {
@@ -3481,10 +3101,6 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const d = p && !conn?.local ? (Math.max(S.task?.lastPrompt ?? 0, 1000) * p.read + 50 * p.out) / 1e6 : 0;
     if (d) S.meter.credit(d);
     return d;
-  }
-  // A chat step saying where a tab went ("● Bash npm test → tab 4").
-  function tabLine(verb: string, rest: string, more = '') {
-    S.items.push({ kind: 'tool', verb, rest, extra: [{ t: ` → tab ${side.tabs.length}${more}`, s: st.accent }] });
   }
   // A command asked for in plain words goes through the bash permission check,
   // like one Rime runs: allowed, asked (yes · don't ask again · no) or refused.
@@ -3567,7 +3183,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (ph && local(v, ph) !== false) return;
       return void send(v, false, [...v].some(isChip) ? blocksFor(v, chips, cwd, see) : v);
     }
-    const [c, ...args] = v.split(/\s+/);
+    // Older names still work: /clear is /new, /diff is /panel review.
+    const [c0, ...rest] = v.split(/\s+/);
+    const [c, ...args] = [...(ALIASES[c0] ?? c0).split(' '), ...rest];
     boxKind = null;
     if (c === '/model' && args[0]) {
       const refs = knownModels().filter((r) => r.toLowerCase().includes(args[0].toLowerCase()));
@@ -3578,8 +3196,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         useRef(ref);
       } else note(`No model matches ${args[0]}. /model lists them.`, 'dim');
     } else if (c === '/model') panel = createModelPicker(host);
+    else if (c === '/setup' && args[0]) panel = createSetup(host, 'connect', args[1], args[0]);
     else if (c === '/setup') panel = bg?.panel && !bg.run.state.done ? bg.panel : createSetup(host);
-    else if (c === '/connect') panel = args[0] ? createSetup(host, 'connect', args[1], args[0]) : createSetup(host);
     else if (c === '/server') {
       // Your own server: the one in use, else one set up over ssh, else any llama.cpp server.
       const own = (n: string) => !!cfg.providers[n]?.ssh || cfg.providers[n]?.preset === 'llamacpp';
@@ -3589,19 +3207,16 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       else note('No llama.cpp server is connected. /setup connects one.', 'dim');
     } else if (c === '/settings') panel = createSettingsPanel(host);
     else if (c === '/permissions') panel = createPermissions();
-    else if (c === '/conversations') openList();
-    else if (c === '/browser') browserCmd(args);
-    else if (c === '/design') designCmd(args);
-    else if (c === '/clear') {
+    else if (c === '/chats') openList();
+    else if (c === '/new') {
       newConversation();
       if (later) host.choose(later);
     } else if (c === '/usage') boxKind = 'usage';
     else if (c === '/exit') quit();
     else if (c === '/update') void updateNow();
     else if (c === '/compact') void compactNow();
-    else if (c === '/diff') showDiff();
     else if (c === '/undo') undo();
-    else if (c === '/panel') panelCmd(args[0]);
+    else if (c === '/panel') panelCmd(args.join(' '));
     else {
       S.items.push({ kind: 'user', text: v });
       S.items.push({ kind: 'reply', text: `Unknown command ${c}. Press / to see the commands.`, done: true });
@@ -3622,7 +3237,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     cur = a;
     anchor = null;
   };
-  // ctrl+c, ctrl+u, ctrl+k and ctrl+w keep what they remove for ctrl+y (readline's yank).
+  // ctrl+c, ctrl+k and ctrl+w keep what they remove for ctrl+y (readline's yank).
   let yank = '';
   const kill = (a: number, b: number) => ((yank = buf.slice(a, b)), cut(a, b));
   const insert = (s: string) => {
@@ -3743,9 +3358,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (id === 'stop') return stopBg();
     if (id === 'mode') return cycleMode();
-    if (id === 'chat') return void ((sideFocus = false), side.zoom(false));
-    if (id.startsWith('side:')) return void ((sideFocus = true), side.click(id), side.visible || (sideFocus = false));
-    if (id === 'panel') return void (side.show(true), (sideFocus = side.visible));
+    if (id === 'chat') return void ((sideFocus = false), pane.zoom(false));
+    if (id === 'panel:show' || id === 'panel:focus' || id === 'panel') return void (pane.show(true), (sideFocus = true));
+    if (id.startsWith('panel:')) return void ((sideFocus = true), pane.click(id), pane.visible || (sideFocus = false));
     if (id === 'update') return void updateNow();
     if (id === 'conversations') return openList();
     if (id.startsWith('conv:') && list) return openRow(listRows()[+id.slice(5)]);
@@ -3801,12 +3416,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       keysPage = 0;
       return;
     }
-    // Split view (docs/split-v2.md §2): ctrl+g moves focus to the other side; only
-    // the focused side takes keys, Rime's questions too.
+    // The panel: ctrl+g moves the keys to the other side; only the side with the
+    // keys takes them, Rime's questions too.
     if (k.ctrl && k.name === 'g' && !panel) return otherSide();
-    if (sideFocus && side.visible && !panel) {
-      const r = side.key(k);
-      if (r === 'blur') (sideFocus = false), side.zoom(false);
+    if (sideFocus && pane.visible && !panel) {
+      const r = pane.key(k);
+      if (r === 'blur') (sideFocus = false), pane.zoom(false);
       return; // one side has the keys: what the panel doesn't use goes nowhere
     }
     // The permission question takes the keys while it's open.
@@ -4039,9 +3654,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         else if (k.name === 'w') r ? kill(...r) : kill(wordLeft(cur), cur);
         else if (k.name === 'y') yank && insert(yank);
         else if (k.name === 'v') void pasteImage();
-        // With text, ctrl+u / ctrl+d edit as in a shell; on an empty prompt they scroll.
-        else if (k.name === 'u') buf ? (r ? kill(...r) : kill(lineStart(), cur)) : (scrollOff += Math.max(1, Math.floor(viewH / 2)));
-        else if (k.name === 'd') buf ? (r ? cut(...r) : cur < buf.length && cut(cur, nextCp(cur))) : (scrollOff -= Math.max(1, Math.floor(viewH / 2)));
+        // One meaning each: ctrl+u / ctrl+d always scroll the chat half a screen.
+        else if (k.name === 'u') scrollOff += Math.max(1, Math.floor(viewH / 2));
+        else if (k.name === 'd') scrollOff = Math.max(0, scrollOff - Math.max(1, Math.floor(viewH / 2)));
     }
     if (buf !== was) blindAsk = false;
   }
@@ -4059,21 +3674,18 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (ev.type === 'mouse') {
       const at = { x: ev.x, y: ev.y };
-      // Split view: the wheel scrolls the pane it's over; a click there gives it focus.
+      // The wheel scrolls the side it's over; a click there gives it the keys.
       const Lo = layout();
       // The divider (the panel's left border) drags to resize the split.
       if (ev.button === 0 && !ev.release && Lo.px > 0 && ev.x === Lo.px && !panel) return void ((dragging = true), schedule());
       if (dragging) {
-        if (ev.button === 32) side.setRatio((W() - ev.x + 1) / W());
+        if (ev.button === 32) pane.setRatio((W() - ev.x + 1) / W());
         if (ev.release) dragging = false;
         return schedule();
       }
       const overSide = Lo.full || (Lo.px > 0 && ev.x >= Lo.px);
-      if (overSide && (ev.button === 64 || ev.button === 65)) return side.wheel(ev.button === 64 ? -3 : 3), schedule();
-      if (ev.button === 0 && !ev.release && side.visible && !panel) {
-        sideFocus = overSide;
-        if (overSide) side.press(ev.x - (Lo.full ? 0 : Lo.px - 1), ev.y - (Lo.full ? 1 : 0));
-      }
+      if (overSide && (ev.button === 64 || ev.button === 65)) return pane.wheel(ev.button === 64 ? -3 : 3), schedule();
+      if (ev.button === 0 && !ev.release && pane.visible && !panel) sideFocus = overSide;
       const onPrompt = !panel?.masked?.() && promptOffset(ev.x, ev.y) !== null;
       if (ev.button === 64 || ev.button === 65 || ev.button === 96 || ev.button === 97) {
         // The wheel scrolls; a transcript selection stays on its text (and grows
@@ -4150,9 +3762,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       }
     } else if (ev.type === 'paste') {
       if (boxKind === 'keys') boxKind = null;
-      // A paste goes where the keys go: with the panel focused, typed into its tab.
-      if (sideFocus && side.visible && !panel) {
-        if (side.typing()) for (const ch of ev.text.replace(/\s+/g, ' ')) side.key(ch === ' ' ? { name: 'space' } : { name: 'char', ch });
+      // A paste goes where the keys go: with the panel focused, typed into its view.
+      if (sideFocus && pane.visible && !panel) {
+        if (pane.typing()) for (const ch of ev.text.replace(/\s+/g, ' ')) pane.key(ch === ' ' ? { name: 'space' } : { name: 'char', ch });
       } else if (!panel) pasteText(ev.text);
       else if (panel.typing?.()) insert(ev.text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, ''));
     } else if (ev.type === 'key') {
@@ -4190,12 +3802,12 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // detached child that finishes on its own and logs to ~/.rime/logs/.
   function quit(into?: string, sure = false) {
     if (quitting) return;
-    // Servers in tabs stop with Rime, so it asks first (docs/split-v2.md §4.4).
-    if (!into && !sure && side.servers()) return void ((quitServers = true), schedule());
+    // Servers in the run view stop with Rime, so it asks first.
+    if (!into && !sure && side.run.servers()) return void ((quitServers = true), schedule());
     quitting = 'bye';
     finishDelete(); // a delete waiting for undo is done now
-    side.killAll(); // commands in tabs stop with Rime
-    closeChrome();
+    side.run.killAll(); // commands in the panel stop with Rime
+    side.checks.stop();
     // Every open conversation: a reply being streamed is kept as interrupted.
     for (const x of sessions) {
       if (x.live && x.convId) save((d) => d.update(x.convId!, x.live!.seq, [{ type: 'text', text: x.live!.text() }], true));
@@ -4268,6 +3880,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     }
     if (!stored.length) return;
     C.continuing = { title: c.title || 'untitled', at: c.updated, cost: resumeCost(stored) };
+    // The plan as the model last set it.
+    const planned = C.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => b.type === 'tool_use' && b.name === 'rime' && (b.input as { action?: string })?.action === 'plan').at(-1);
+    if (planned) C.plan = stepsOf(((planned.input as { args?: { steps?: unknown } }).args ?? {}).steps ?? []) ?? [];
+    if (C === S) side.plan.set(C.plan);
     // Pick up from the last reply: if it offered something, that's the suggestion.
     const lastReply = stored.at(-1)!;
     if (lastReply.role === 'assistant' && !lastReply.interrupted) {

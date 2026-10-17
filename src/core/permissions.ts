@@ -269,32 +269,8 @@ export type Decision = {
 export type Ctx = { mode: Mode; project: string; rules: Rule[]; granted?: (p: string) => boolean };
 
 export function decide(tool: string, input: Record<string, any>, c: Ctx): Decision {
-  // Opening a page through the rime tool is checked like the browser tool's open.
-  const ra = (input.args ?? {}) as Record<string, unknown>;
-  if (tool === 'rime' && (input.action === 'browser.open' || (input.action === 'tab.open' && /^(browser|web|page)$/.test(String(ra.kind))))) return decide('browser', { action: 'open', url: ra.url ?? ra.path }, c);
   if (tool === 'rime') return { verdict: 'allow', why: "Rime's own settings" };
   if (tool === 'search') return { verdict: 'allow', why: 'searching the project' };
-  // The browser plug-in: a page on this computer opens without asking; a site
-  // elsewhere asks (rule fetch(domain:<host>)), except in auto. Plan mode only reads.
-  if (tool === 'browser') {
-    const a = String(input.action ?? '');
-    if (c.mode === 'plan' && /^(click|fill|press)$/.test(a)) return { verdict: 'deny', why: 'plan mode is read-only' };
-    if (a !== 'open') return { verdict: 'allow', why: 'the page Rime has open' };
-    // A path (index.html, ./site/a.html, ~/x.html) is a file on this computer.
-    if (!/^[a-z]+:\/\//i.test(String(input.url ?? '')) && (/^[./~]/.test(String(input.url)) || /\.html?$/i.test(String(input.url)))) return { verdict: 'allow', why: 'a file on this computer' };
-    let host = '';
-    try {
-      const u = new URL(/^[a-z]+:\/\//i.test(String(input.url)) ? String(input.url) : `http://${input.url}`);
-      if (u.protocol === 'file:' || /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\])$/.test(u.hostname)) return { verdict: 'allow', why: 'a page on this computer' };
-      host = u.hostname;
-    } catch {
-      return { verdict: 'deny', why: 'not a web address' };
-    }
-    const r = ruleFor(c.rules, 'fetch', `domain:${host}`);
-    if (r?.kind === 'deny') return { verdict: 'deny', why: `denied by ${r.pattern}` };
-    if (r?.kind === 'allow' || c.mode === 'auto') return { verdict: 'allow', why: r ? `allowed by ${r.pattern}` : 'auto mode' };
-    return { verdict: 'ask', why: `opens ${host}, outside this computer`, rule: `fetch(domain:${host})`, label: host };
-  }
   // God mode runs every command and edit without asking. Your deny rules still hold.
   if (c.mode === 'god') {
     const abs = path.resolve(c.project, String(input.path ?? ''));

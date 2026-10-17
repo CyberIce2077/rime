@@ -81,7 +81,7 @@ test('the ? sheet: two columns at 100, pages of whole groups when the screen is 
   const { keysSheet } = await import('../src/core/app.ts');
   const wide = keysSheet(100, 40, st);
   assert.equal(wide.pages, 1);
-  assert.match(stripAnsi(wide.lines[1]), /Send and edit +Move around/);
+  assert.match(stripAnsi(wide.lines[1]), /Type +Move/);
   assert.ok(wide.lines.length <= 40 - 5);
   const narrow = keysSheet(60, 30, st);
   assert.equal(narrow.pages, 2);

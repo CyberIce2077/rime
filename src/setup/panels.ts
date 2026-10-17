@@ -425,11 +425,11 @@ export function createModelPicker(
 
 // ---- /settings ----
 
-type SettingsHost = Host & { published?: boolean; settings: Settings; current(): Model | undefined; openModel(): void; openSteps(name: string): void; openConnect(): void; rename(from: string, to: string): string | null };
+type SettingsHost = Host & { published?: boolean; settings: Settings; current(): Model | undefined; openModel(): void; openSteps(name: string): void; openConnect(): void; openPermissions?(): void; rename(from: string, to: string): string | null };
 type Row = { group: string; label: string; help: string; kind: 'value' | 'action' | 'undo'; key?: string; go?: () => void; change?: Change; provider?: string };
 
 // Every setting in one box, grouped, changed in place and applied live (SPEC §15).
-// Typing filters; ← → change a value; recent changes are listed with undo.
+// Typing filters; ← → change a value. A change shows in the chat, where a click undoes it.
 export function createSettingsPanel(h: SettingsHost): Panel {
   const { st, settings, cfg } = h;
   const dim = (t: string) => ({ t, s: st.dim });
@@ -438,11 +438,6 @@ export function createSettingsPanel(h: SettingsHost): Panel {
   let renaming: string | null = null; // the provider being renamed (its new name is typed in the prompt)
   let error = '';
   let envOpen = false; // Commands: the hidden variables, one row until enter opens them
-  const ago = (t: number) => {
-    const s = Math.round((Date.now() - t) / 1000);
-    return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : `${Math.floor(s / 3600)} h ago`;
-  };
-
   function rows(): Row[] {
     const defs = settings.list();
     const env = defs.filter((d) => d.group === 'Commands');
@@ -457,7 +452,7 @@ export function createSettingsPanel(h: SettingsHost): Panel {
       ...(envOpen || filter ? env.map((d): Row => ({ group: 'Commands', label: d.label, help: d.help, kind: 'value', key: d.key })) : env.length ? [{ group: 'Commands', label: 'Hidden from commands', help: `${env.length} variable${env.length === 1 ? '' : 's'}${passed ? `, ${passed} passed` : ''} · enter to choose`, kind: 'action', go: () => void (envOpen = true) } as Row] : []),
       // Unpublished, Rime has nowhere to look, so the setting doesn't promise it.
       ...defs.filter((d) => d.group === 'Updates').map((d): Row => (h.published === false ? { group: 'Updates', label: d.label, help: 'off until Rime is published', kind: 'action', go: () => {} } : { group: 'Updates', label: d.label, help: d.help, kind: 'value', key: d.key })),
-      ...settings.recent().slice(0, 5).map((c): Row => ({ group: 'Recent changes', label: `${c.label} ${c.to}`, help: c.undone ? 'undone' : `was ${c.from} · ${ago(c.at)} · enter undoes`, kind: 'undo', change: c })),
+      ...(h.openPermissions ? [{ group: 'Permissions', label: 'Mode and rules', help: 'what runs without asking · enter opens', kind: 'action', go: h.openPermissions } as Row] : []),
     ];
     const f = filter.toLowerCase();
     return f ? out.filter((r) => `${r.group} ${r.label} ${r.help}`.toLowerCase().includes(f)) : out;
@@ -488,7 +483,7 @@ export function createSettingsPanel(h: SettingsHost): Panel {
       if (error) out.push({ line: [{ t: error, s: st.warn }] });
       void width;
       if (renaming) return { legend: [{ t: 'settings', s: st.accent }, dim(' · rename')], rows: out, foot: ['enter', ' rename · ', 'esc', ' keep the name'] };
-      return { legend: [{ t: 'settings', s: st.accent }, dim(' · applied right away')], rows: out, foot: ['↑ ↓', ' choose · ', '← →', ' change · ', 'enter', ' open or undo · ', ...(list[pick]?.provider ? ['r', ' rename · '] : ['', 'type to filter · ']), 'esc', ' close'] };
+      return { legend: [{ t: 'settings', s: st.accent }, dim(' · applied right away')], rows: out, foot: ['↑ ↓', ' choose · ', '← →', ' change · ', 'enter', ' open · ', ...(list[pick]?.provider ? ['r', ' rename · '] : ['', 'type to filter · ']), 'esc', ' close'] };
     },
     placeholder: () => (renaming ? `a new name for ${renaming}` : 'Type to filter settings'),
     typing: () => true,

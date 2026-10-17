@@ -10,7 +10,7 @@ import { listFiles } from './attach.ts';
 
 // What a turn did with its tools; `about`: the files it was about (attached by
 // you, or read by the model).
-export type Did = { wrote: string[]; ran: { cmd: string; ok: boolean; out?: string[] }[]; about?: string[]; dev?: string }; // dev: a local server a command started
+export type Did = { wrote: string[]; ran: { cmd: string; ok: boolean; out?: string[] }[]; about?: string[] };
 
 export const TESTS = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?test\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+test\b|\bvitest\b|\bjest\b|\bnode\s+--test\b|\bmake\s+test\b/;
 
@@ -104,8 +104,6 @@ export function nextStep(reply: string, did: Did, project: string): string {
   const offer = offerOf(reply);
   if (offer) return offer;
   if (offer === '') return ''; // it asked a question only you can answer
-  const page = did.wrote.find((f) => /\.html?$/i.test(f));
-  if (page) return `open ${page} in the browser`;
   if (did.wrote.length && !failed && hasTests(project)) return 'run the tests';
   if ((did.wrote.length || failed?.ok) && changed(project)?.length) return 'commit this';
   if (!did.wrote.length) {

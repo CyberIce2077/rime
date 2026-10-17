@@ -36,7 +36,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'bash',
     description: 'Run a shell command in the project folder. Long output is cut to its start and end.',
-    input_schema: { type: 'object', properties: { command: { type: 'string' }, reason: { type: 'string', description: 'why, in a few words; shown to the user' }, timeout: { type: 'integer', description: 'seconds, default 120' }, background: { type: 'boolean', description: 'for a dev server or watcher that keeps running: it runs in a server tab the user sees, and you get its first lines once it prints an address or after 10 s' } }, required: ['command'] },
+    input_schema: { type: 'object', properties: { command: { type: 'string' }, reason: { type: 'string', description: 'why, in a few words; shown to the user' }, timeout: { type: 'integer', description: 'seconds, default 120' }, background: { type: 'boolean', description: 'for a dev server or watcher that keeps running: it runs in the run view beside the chat, where the user sees it, and you get its first lines once it prints an address or after 10 s' } }, required: ['command'] },
   },
   {
     name: 'ask',
@@ -45,7 +45,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: 'rime',
-    description: "Change Rime itself: settings, boxes, split-view tabs (the files, a file at a line, the diff), the browser tab (a URL or a local HTML file), design tabs, and the latest output of a server tab (tab.read). action 'help' lists every action.",
+    description: "Change Rime itself: settings, boxes, the panel beside the chat (show a view, read a view's text such as failing checks or a server's output, open a file at a line) and your plan for the task. action 'help' lists every action.",
     input_schema: { type: 'object', properties: { action: { type: 'string' }, args: { type: 'object' } }, required: ['action'] },
   },
 ];
