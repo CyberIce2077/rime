@@ -1,8 +1,9 @@
-// The panel beside the chat (split view): eight fixed views, always in the same
-// order, so a number always means the same thing. ctrl+g moves the keys between
-// the chat and the panel. In the panel: 1-8 or tab pick a view, ↑ ↓ and enter
-// work inside it, esc steps back (and finally to the chat), z zooms, ? lists the
-// keys. Each view adds at most a few letters of its own, shown in the footer.
+// The panel beside the chat (split view): eight views in an order that only
+// changes when you drag a tab, so a number always means the same thing. ctrl+g
+// moves the keys between the chat and the panel. In the panel: ← → or tab move
+// between views, 1-8 jump to one, ↑ ↓ and enter work inside it, esc steps back
+// (and finally to the chat), z zooms, ? lists the keys. Each view adds at most a
+// few letters of its own, shown in the footer.
 
 import { type Key, type Line, fit, lineWidth } from '../../core/term.ts';
 import { type Hint, type Styles, hintLines, str } from '../../core/view.ts';
@@ -10,7 +11,13 @@ import { type View, char } from './kit.ts';
 
 export type Hit = { row: number; x0: number; x1: number; id: string };
 
-export function createPanel(st: Styles, views: View[], redraw: () => void) {
+export function createPanel(st: Styles, all: View[], redraw: () => void, o: { order?: string[]; reordered?(ids: string[]): void } = {}) {
+  // Your order first (views it doesn't name keep theirs, after it).
+  const views = [...all].sort((a, b) => rank(a.id) - rank(b.id));
+  function rank(id: string) {
+    const i = o.order?.indexOf(id) ?? -1;
+    return i < 0 ? 100 + all.findIndex((v) => v.id === id) : i;
+  }
   let active = 0;
   let visible = false;
   let zoomed = false;
@@ -60,7 +67,8 @@ export function createPanel(st: Styles, views: View[], redraw: () => void) {
   // The ? sheet: this view's keys, then the panel's.
   const PANEL_KEYS: [string, string][] = [
     ['ctrl+g', 'back to the chat'],
-    ['1-8  tab', 'pick a view (shift+tab back)'],
+    ['← →  tab', 'the next view, the one before'],
+    ['1-8', 'jump to a view (drag a tab to reorder)'],
     ['↑ ↓  enter', 'move, open'],
     ['ctrl+u ctrl+d', 'page up, down'],
     ['esc', 'back one step, then the chat'],
@@ -107,7 +115,8 @@ export function createPanel(st: Styles, views: View[], redraw: () => void) {
     if (!v.typing?.()) {
       const c = char(k);
       if (/^[1-9]$/.test(c) && views[+c - 1]) return api.go(+c - 1), true;
-      if (k.name === 'tab') return api.go((active + (k.shift ? views.length - 1 : 1)) % views.length), true;
+      const back = k.name === 'left' || (k.name === 'tab' && k.shift);
+      if (k.name === 'tab' || k.name === 'left' || k.name === 'right') return api.go((active + (back ? views.length - 1 : 1)) % views.length), true;
       if (c === 'z') return (zoomed = !zoomed), redraw(), true;
       if (c === '?') return (sheet = true), redraw(), true;
     }
@@ -160,6 +169,15 @@ export function createPanel(st: Styles, views: View[], redraw: () => void) {
       views[n].shown?.();
       redraw();
       return true;
+    },
+    // Dragging a tab onto another: it takes that place; the numbers follow.
+    move(from: number, to: number) {
+      if (from === to || !views[from] || !views[to]) return;
+      const cur = views[active];
+      views.splice(to, 0, ...views.splice(from, 1));
+      active = views.indexOf(cur);
+      o.reordered?.(views.map((v) => v.id));
+      redraw();
     },
     toast(msg: string) {
       toastMsg = msg;

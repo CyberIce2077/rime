@@ -69,7 +69,36 @@ test('unfocused, the footer says only ctrl+g focus; ? lists the keys', () => {
   keys('?');
   const out = screen().join('\n');
   assert.match(out, /ctrl\+g\s+back to the chat/);
-  assert.match(out, /1-8  tab\s+pick a view/);
+  assert.match(out, /← →  tab\s+the next view/);
+  assert.match(out, /1-8\s+jump to a view/);
+});
+
+test('← → move between views, around the ends; a view typing keeps them', () => {
+  const { s, keys } = side();
+  s.panel.go('review');
+  keys('right');
+  assert.equal(s.panel.active, 'plan');
+  keys('left', 'left');
+  assert.equal(s.panel.active, 'log', 'wraps around');
+  s.panel.go('plan');
+  keys('a'); // the plan's add-a-step line takes the typing
+  keys('left');
+  assert.equal(s.panel.active, 'plan', 'the arrow moved in the text instead');
+});
+
+test('a dragged tab takes the new place; numbers and the saved order follow', () => {
+  let saved: string[] = [];
+  const { s, keys } = side([], { reordered: (ids) => void (saved = ids) });
+  s.panel.go('checks');
+  s.panel.move(2, 0); // checks to the front
+  assert.deepEqual(saved.slice(0, 3), ['checks', 'review', 'plan']);
+  assert.equal(s.panel.active, 'checks', 'the view you were on stays');
+  keys('2');
+  assert.equal(s.panel.active, 'review');
+  const again = side([], { order: saved });
+  assert.deepEqual(again.s.panel.views.map((v) => v.id), saved, 'the order comes back next time');
+  const partial = side([], { order: ['log'] });
+  assert.deepEqual(partial.s.panel.views.map((v) => v.id), ['log', 'review', 'plan', 'checks', 'run', 'git', 'files', 'context']);
 });
 
 test("run: Rime's commands stream in and show how they ended", () => {
@@ -154,7 +183,7 @@ test('review: y keeps a hunk, u undoes one in the file', () => {
   s.panel.go('review');
   assert.equal(s.review.pending, 1);
   s.panel.key(char('y')); // the file row: keeps its first hunk
-  s.panel.key({ name: 'down' });
+  s.panel.key(char('n')); // the next hunk
   s.panel.key(char('u'));
   const after = fs.readFileSync(path.join(root, 'a.txt'), 'utf8');
   assert.match(after, /CHANGED 2/, 'the kept hunk stays');

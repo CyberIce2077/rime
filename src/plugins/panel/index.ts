@@ -1,5 +1,6 @@
 // The panel and its eight views, built from one host (the app). The order is
-// fixed: 1 review, 2 plan, 3 checks, 4 run, 5 git, 6 files, 7 context, 8 log.
+// 1 review, 2 plan, 3 checks, 4 run, 5 git, 6 files, 7 context, 8 log until you
+// drag a tab somewhere else.
 
 import type { Styles } from '../../core/view.ts';
 import { checksView } from './checks.ts';
@@ -38,6 +39,9 @@ export type SideHost = {
   drop(at: [number, number]): void;
   // log
   entries(): Entry[];
+  // the tab order you dragged, kept in the config
+  order?: string[];
+  reordered?(ids: string[]): void;
 };
 
 export const VIEWS = ['review', 'plan', 'checks', 'run', 'git', 'files', 'context', 'log'] as const;
@@ -62,7 +66,7 @@ export function createSide(h: SideHost) {
   const files = filesView({ ...kit, files: h.files, recent: h.recent });
   const context = contextView({ ...kit, pieces: h.pieces, window: h.window, sent: h.sent, drop: h.drop });
   const log = logView({ ...kit, entries: h.entries });
-  panel = createPanel(h.st, [review, plan, checks, run, git, files, context, log], h.redraw);
+  panel = createPanel(h.st, [review, plan, checks, run, git, files, context, log], h.redraw, { order: h.order, reordered: h.reordered });
   return { panel, review, plan, checks, run, git, files, context, log };
 }
 export type Side = ReturnType<typeof createSide>;

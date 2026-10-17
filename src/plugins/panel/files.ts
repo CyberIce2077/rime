@@ -136,7 +136,7 @@ export function filesView(kit: Kit & { files(): string[]; recent?(): string[] })
       if (viewer) return [['↑ ↓', ' scroll · '], ['/', ' find · '], ['@', ' to the chat · '], ['esc', ' back']];
       if (search?.editing) return [['tab', search.mode === 'text' ? ' names · ' : ' text in files · '], ['↑ ↓', ' choose · '], ['enter', ' open · '], ['esc', ' clear']];
       if (search?.input.value) return [['↑ ↓', ' choose · '], ['enter', ' open · '], ['@', ' to the chat · '], ['/', ' edit · '], ['esc', ' clear']];
-      return [['↑ ↓', ' move · '], ['enter', ' open · '], ['← →', ' fold · '], ['/', ' search · '], ['@', ' to the chat']];
+      return [['↑ ↓', ' move · '], ['enter', ' open or fold · '], ['/', ' search · '], ['@', ' to the chat']];
     },
     key(k: Key) {
       const c = char(k);
@@ -184,16 +184,6 @@ export function filesView(kit: Kit & { files(): string[]; recent?(): string[] })
       if (tree.move(k, rs.length, Math.max(1, rows - 2))) return true;
       if (!r) return true;
       if (c === '@') return kit.mention(r.dir ? r.path + '/' : r.path), true;
-      if (k.name === 'right' && r.dir) return open.add(r.path), true;
-      if (k.name === 'left') {
-        if (r.dir && open.has(r.path)) open.delete(r.path);
-        else if (r.path.includes('/')) {
-          const up = r.path.slice(0, r.path.lastIndexOf('/'));
-          open.delete(up);
-          tree.at = treeRows().findIndex((x) => x.path === up);
-        }
-        return true;
-      }
       if (k.name === 'enter') {
         if (r.dir) open.has(r.path) ? open.delete(r.path) : open.add(r.path);
         else api.openFile(r.path);

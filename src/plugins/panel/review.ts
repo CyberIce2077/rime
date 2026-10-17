@@ -122,15 +122,15 @@ export function reviewView(kit: Kit & { diff(): string; git(): boolean; undone(f
     },
     foot(): Hint[] {
       if (!rows.length) return [];
-      return [['y', ' keep · '], ['u', ' undo · '], ['enter', ' ask about this line · '], ['← →', ' hunks · '], ['a', ' keep all']];
+      return [['y', ' keep · '], ['u', ' undo · '], ['enter', ' ask about this line · '], ['n p', ' next, previous hunk · '], ['a', ' keep all']];
     },
     key(k: Key) {
       const ch = char(k);
       if (k.name === 'escape') return 'back';
       if (c.move(k, rows.length, Math.max(1, shownRows - 2))) return true;
-      if (k.name === 'right') return jump(1), true;
-      if (k.name === 'left') return jump(-1), true;
       const r = here();
+      if (ch === 'n') return jump(1), true;
+      if (ch === 'p') return jump(-1), true;
       if (!r) return true;
       if (ch === 'y' && r.hunk) {
         kept.add(r.hunk.key);

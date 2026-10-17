@@ -109,21 +109,22 @@ prompts complete in dim text. `tab` takes any of them.
 ### The panel
 
 `ctrl+g` opens the panel beside the chat and moves the keys to it; `ctrl+g` again goes
-back. The views are always in the same order, so a number always means the same thing:
+back. Each view has a number; drag a tab in the tab bar to put the views in your own
+order (Rime remembers it), and the numbers follow:
 
 | | View | What it shows | Its keys |
 |---|---|---|---|
-| 1 | review | Rime's changes this session, hunk by hunk | `y` keep · `u` undo the hunk · `a` keep all · `enter` ask about a line · `← →` hunks |
+| 1 | review | Rime's changes this session, hunk by hunk | `y` keep · `u` undo the hunk · `a` keep all · `enter` ask about a line · `n` `p` next, previous hunk |
 | 2 | plan | Rime's steps for a longer task | `enter` done · `a` add · `x` drop · `k` `j` move |
 | 3 | checks | your type check, lint and tests, with problems as file:line | `r` run · `w` watch · `enter` open |
 | 4 | run | every command Rime runs, your shells, and dev servers | `n` new shell · `r` rerun · `x` stop · `o` open the address |
 | 5 | git | branch, staged and changed files, recent commits | `s` stage · `enter` diff · `c` commit (empty: Rime writes the message) |
-| 6 | files | the project tree, name and text search, a viewer | `/` search · `enter` open · `@` attach |
+| 6 | files | the project tree, name and text search, a viewer | `/` search · `enter` open or fold · `@` attach |
 | 7 | context | what the model sees and what it costs | `enter` show · `x` drop a big result · `s` biggest first |
 | 8 | log | each tool call and exactly what came back | `enter` show it in full |
 
-In the panel, `1`-`8` or `tab` pick a view, `↑ ↓` and `enter` work inside it, `esc`
-steps back and finally to the chat, `z` zooms the panel to the full screen, and `?`
+In the panel, `← →` (or `tab`) go to the next or previous view, `1`-`8` jump straight
+to one, `↑ ↓` and `enter` work inside it, `esc` steps back and finally to the chat, `z` zooms the panel to the full screen, and `?`
 lists the keys. You can also say it: "show the diff", "run the tests", "start the dev
 server", "search the files for validate".
 

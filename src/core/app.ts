@@ -96,7 +96,7 @@ const KEY_GROUPS: [string, [string, string][]][] = [
   ]],
   ['Panel', [
     ['ctrl+g', 'to the panel and back'],
-    ['1-8  tab', 'pick a view'],
+    ['← →  1-8', 'pick a view (in the panel)'],
     ['↑ ↓  enter', 'move, open'],
     ['esc', 'back, then the chat'],
   ]],
@@ -271,11 +271,16 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       else if (blk?.type === 'text') blk.text = DROPPED;
     },
     entries: () => entriesOf(S.messages),
+    order: cfg.panelOrder,
+    reordered: (ids) => void ((cfg.panelOrder = ids), settings.save()),
   });
   const pane = side.panel;
+  // The views by number, as the tab bar shows them (you can drag tabs around).
+  const viewIds = () => pane.views.map((v) => v.id);
   const edited: string[] = []; // files Rime changed this session, first in name search
   let quitServers = false; // quitting with servers running asks first
   let sideFocus = false, dragging = false; // dragging: the divider, with the mouse
+  let tabDrag: number | null = null; // a tab being dragged in the panel's tab bar
   // A view in the panel, shown and with the keys.
   const openView = (id: string) => void (pane.show(true), pane.go(id), (sideFocus = true));
   // The chat's width and where the panel starts (0: no panel). Under 72 columns
@@ -706,7 +711,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         ...footRows(['↑ ↓', ' choose · ', 'enter', ' use it · ', 'esc', ' close'], st),
       ], width, st, st.accent, 'key:esc');
     }
-    if (/^\/panel\s+$/.test(buf)) return box('/panel', [{ line: [{ t: VIEWS.map((v, i) => `${i + 1} ${v}`).join('  '), s: st.title }] }, { line: [dim('a view by name or number, or hide')] }], width, st);
+    if (/^\/panel\s+$/.test(buf)) return box('/panel', [{ line: [{ t: viewIds().map((v, i) => `${i + 1} ${v}`).join('  '), s: st.title }] }, { line: [dim('a view by name or number, or hide')] }], width, st);
     if (/^\/(connect|setup)\s+$/.test(buf)) return box(buf.trim(), [{ line: [{ t: '<url> [name]', s: st.title }, dim('  a llama.cpp, Ollama, LM Studio or OpenAI-compatible server')] }], width, st);
     return null;
   }
@@ -2197,7 +2202,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const viewOf = (v: unknown) => {
       const x = String(v ?? '').toLowerCase();
       const n = Number(x);
-      return n >= 1 && n <= VIEWS.length ? VIEWS[n - 1] : (VIEWS as readonly string[]).includes(x) ? x : { diff: 'review', changes: 'review', tests: 'checks', shell: 'run', server: 'run', servers: 'run', tab: 'run', tools: 'log' }[x];
+      return n >= 1 && n <= VIEWS.length ? viewIds()[n - 1] : (VIEWS as readonly string[]).includes(x) ? x : { diff: 'review', changes: 'review', tests: 'checks', shell: 'run', server: 'run', servers: 'run', tab: 'run', tools: 'log' }[x];
     };
     if (action === 'panel.show' || action === 'panel.split' || action === 'tab.focus') {
       const v = viewOf(args.view ?? args.tab ?? args.n) ?? (args.view || args.tab || args.n ? null : pane.active);
@@ -2391,8 +2396,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (x === 'hide' || (!x && pane.visible && sideFocus)) return void (pane.show(false), (sideFocus = false));
     if (!x) return otherSide();
     const n = Number(x);
-    const v = n >= 1 && n <= VIEWS.length ? VIEWS[n - 1] : x === 'diff' ? 'review' : x === 'shell' ? 'run' : (VIEWS as readonly string[]).includes(x) ? x : null;
-    if (!v) return note(`/panel ${a}? Views: ${VIEWS.map((v, i) => `${i + 1} ${v}`).join(', ')}, or hide.`, 'dim');
+    const v = n >= 1 && n <= VIEWS.length ? viewIds()[n - 1] : x === 'diff' ? 'review' : x === 'shell' ? 'run' : (VIEWS as readonly string[]).includes(x) ? x : null;
+    if (!v) return note(`/panel ${a}? Views: ${viewIds().map((v, i) => `${i + 1} ${v}`).join(', ')}, or hide.`, 'dim');
     if (v === 'review') side.review.refresh();
     openView(v);
   }
@@ -3681,6 +3686,18 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       if (dragging) {
         if (ev.button === 32) pane.setRatio((W() - ev.x + 1) / W());
         if (ev.release) dragging = false;
+        return schedule();
+      }
+      // A tab dragged onto another in the panel's tab bar takes its place.
+      const tabAt = () => /^panel:view:(\d+)$/.exec(hits.find((h) => h.row === ev.y && ev.x >= h.x0 && ev.x <= h.x1)?.id ?? '')?.[1];
+      if (ev.button === 0 && !ev.release && tabAt() !== undefined && !panel) return void ((tabDrag = +tabAt()!), (sideFocus = true), schedule());
+      if (tabDrag !== null) {
+        if (ev.release) {
+          const to = tabAt();
+          if (to !== undefined && +to !== tabDrag) pane.move(tabDrag, +to);
+          else act(`panel:view:${tabDrag}`); // a plain click picks the view
+          tabDrag = null;
+        }
         return schedule();
       }
       const overSide = Lo.full || (Lo.px > 0 && ev.x >= Lo.px);
