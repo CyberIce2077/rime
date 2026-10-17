@@ -155,11 +155,24 @@ conversation, or **no, and tell Rime what to do instead**. Read-only commands li
 `shift+tab` cycles ask, auto-edit and plan. Auto and god mode are chosen in
 `/permissions`, which also lists the allow / ask / deny rules and recent decisions.
 
+Rules (`bash(npm test *)`, `edit(src/**)`) and the project's shared
+`.rime/permissions.json` are covered in [the permissions guide](guide/permissions.md).
+
 ## Privacy and keys
 
 Rime uses API keys only, read from the provider's environment variable or from
 `~/.rime/config`. It never uses consumer logins (claude.ai, ChatGPT) and never
 reads another app's tokens. A local server needs no key.
+
+## Documentation
+
+- [Providers and models](guide/providers.md): every preset and its key variable,
+  `rime connect`, effort and reasoning.
+- [Your own server](guide/own-server.md): a llama.cpp machine over ssh, its start
+  steps, and what happens when you quit.
+- [Permissions](guide/permissions.md): modes, the always-ask list, and rules.
+- [How Rime works](guide/how-it-works.md): the prompt cache, tools, conversations,
+  the files Rime keeps, plug-ins and environment variables.
 
 ## Development
 
@@ -176,8 +189,9 @@ src/
   core/            full-screen app, tools, permissions, prompt, conversations (rime.db)
   providers/       Anthropic and OpenAI wire formats, presets, llama.cpp, probe
   setup/           /setup, /server, ssh, tunnel, Wake-on-LAN, the loader
-  plugins/         token meter (more plug-ins to come)
+  plugins/         code-index, diff-undo, panel, token-kit, updater
 test/              node:test suites, a mock llama.cpp server and a fake ssh
+guide/             user documentation
 ```
 
 ## License
