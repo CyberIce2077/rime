@@ -349,7 +349,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   let press: { x: number; y: number; hit?: string; prompt?: boolean } | null = null;
   // A selection in the transcript (`log`) is anchored to transcript lines, so it
   // stays on its text while you scroll; elsewhere it is in screen cells.
-  let selection: { a: { x: number; y: number }; b: { x: number; y: number }; log: boolean } | null = null;
+  // clip: only these cells (the conversations window's preview).
+  let selection: { a: { x: number; y: number }; b: { x: number; y: number }; log: boolean; clip?: { x0: number; x1: number; y0: number; y1: number } } | null = null;
   let pointer = { x: 0, y: 0 }; // where the mouse is during a drag
   let hoverRow = 0; // the screen row under the mouse: a message's ◆ shows only there (or once pinned)
   let edgeScroll: NodeJS.Timeout | null = null; // dragging past the top or bottom scrolls
@@ -904,7 +905,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const v = frameList(full, height);
       hits = v.rowHits;
       rows = v.lines.map((l) => truncAnsi(l, full));
-      return paint(rows.map((l) => [l, '']), full, v.cursor);
+      const marks = rows.map(() => '');
+      for (const { y, x0, x1 } of selectionSpans(full)) marks[y - 1] += `\x1b[${y};${x0}H${st.selection}${sliceCols(rows[y - 1], x0, x1).padEnd(x1 - x0 + 1)}${st.reset}`;
+      return paint(rows.map((l, i) => [l, marks[i]]), full, v.cursor);
     }
     const L = layout();
     // Narrow or zoomed, with the panel focused: the panel is the screen, under
@@ -1005,9 +1008,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const spans: { y: number; x0: number; x1: number; text: string }[] = [];
     for (let y = a.y; y <= b.y; y++) {
       // Header lines: transcript lines 1–3, or their rows on screen.
-      const onHeader = hasHeader && (selection.log ? y >= 1 && y <= 3 : y >= headerRow && y < headerRow + 3);
-      const x0 = Math.max(y === a.y ? a.x : 1, onHeader ? infoCol : 1);
-      const x1 = y === b.y ? b.x : width;
+      const onHeader = hasHeader && !selection.clip && (selection.log ? y >= 1 && y <= 3 : y >= headerRow && y < headerRow + 3);
+      const c = selection.clip;
+      const x0 = Math.max(y === a.y ? a.x : (c?.x0 ?? 1), onHeader && !c ? infoCol : 1);
+      const x1 = y === b.y ? b.x : (c?.x1 ?? width);
       if (onHeader && sliceCols(textOf(y), infoCol, width).trim() === '') continue; // mascot-only line
       if (x0 <= x1) spans.push({ y, x0, x1, text: textOf(y) });
     }
@@ -2496,11 +2500,13 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // ← on an empty prompt (or /conversations, or a click on "← conversations")
   // fills the screen with your conversations: a dot on the ones working (blue,
   // pulsing), waiting for you (yellow) or open in another Rime window (dim), and
-  // the highlighted one's timeline. Typing searches (describe it, src/core/rank.ts),
-  // so the actions are ctrl keys that work while you type: ctrl+r rename, ctrl+x
-  // delete (asks; ctrl+u undoes it for 10 s), ctrl+p keep on top, ctrl+f fork,
-  // ctrl+e export, ctrl+o sort (not ctrl+s: flow control; not ctrl+d: it scrolls in the chat). With the search empty, space selects, n starts a
-  // new conversation and a shows all projects.
+  // the highlighted one's timeline and transcript (the wheel over it, or ctrl+u
+  // ctrl+d, scroll it; drag to select and copy). Typing searches (describe it,
+  // src/core/rank.ts), so the actions are ctrl keys that work while you type:
+  // ctrl+r rename, ctrl+x delete (asks; ctrl+z undoes it for 10 s), ctrl+p keep on
+  // top, ctrl+f fork, ctrl+e export, ctrl+o sort (not ctrl+s: flow control). With
+  // the search empty, space selects, n starts a new conversation and a shows all
+  // projects.
   type ListRow = { id: number | null; title: string; project: string; updated: number; created: number; model: string | null; n: number; tokens: number; pinned: boolean; last: string | null; other: boolean; session?: Session };
   // `on`: the highlighted conversation, so the highlight stays on it when the list reorders.
   // `edit`: the new title being typed (`fresh`: still the old one, selected, so
@@ -2508,6 +2514,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   // `why`: why each search result matched; `picked`: rows selected with space.
   let list: {
     pick: number; on: number | Session | null; filter: string; all: boolean; rows: ListRow[]; at: number; sort: number; picked: Set<number>;
+    scroll: number; scrollFor?: number | Session | null; // the preview, in lines up from its end (for the conversation it was scrolled on)
     found?: { q: string; at: number; ids: number[]; why: Map<number, { reason: string; hits: number[] }> }; edit?: string; fresh?: boolean; confirm?: ListRow[];
   } | null = null;
   // Deleted, but `u` brings them back for 10 s; then they're gone for good.
@@ -2525,7 +2532,8 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   };
 
   function openList() {
-    list = { pick: 0, on: S.convId ?? S, filter: '', all: false, rows: [], at: 0, sort: 0, picked: new Set() };
+    list = { pick: 0, on: S.convId ?? S, filter: '', all: false, rows: [], at: 0, sort: 0, picked: new Set(), scroll: 0 };
+    selection = null;
     listRows();
     schedule();
   }
@@ -2619,6 +2627,10 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     L.filter = L.filter.replace(/\S*$/, s) + (s.endsWith(':') ? '' : ' ');
   }
 
+  // Where the preview is on screen (1-based cells), for the wheel and selecting.
+  let previewArea = { x0: 0, x1: -1, y0: 0, y1: -1 };
+  const inPreview = (x: number, y: number) => x >= previewArea.x0 && x <= previewArea.x1 && y >= previewArea.y0 && y <= previewArea.y1;
+
   function frameList(width: number, height: number) {
     const L = list!;
     const rows = listRows();
@@ -2657,19 +2669,17 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     const parts: [string, string, string?][] =
       L.edit !== undefined ? [['enter', ' save · '], ['esc', ' cancel'], ['', '   type the new title']]
       : confirm.length ? [['', `delete ${confirm.length > 1 ? `${confirm.length} conversations` : `"${confirm[0].title}"`}? Its messages and timeline go too. `, 'warn'], ['enter', ' delete · '], ['esc', ' keep it']]
-      : undoDelete ? [['', `deleted ${undoDelete.rows.length > 1 ? `${undoDelete.rows.length} conversations` : `"${undoDelete.rows[0].title}"`} · `, 'warn'], ['ctrl+u', ` undo (${undoDelete.left} s) · `], ['↑ ↓', ' choose · '], ['enter', ' open · '], ['esc', ' back']]
-      : searching ? [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ...(sugg.length ? [['tab', ' suggestion · '] as [string, string]] : []), ['ctrl+r', ' rename · '], ['ctrl+x', ' delete · '], ['esc', ' clear']]
-      : [['↑ ↓', ' choose · '], ['→', ' or '], ['enter', ' open · '], ['ctrl+r', ' rename · '], ['ctrl+x', ' delete · '], ['ctrl+p', sel?.pinned ? ' unpin · ' : ' keep on top · '], ['ctrl+f', ' fork · '], ['ctrl+e', ' export · '], ['ctrl+o', ' sort · '], ['space', ' select · '], ['n', ' new · '], ['a', L.all ? ' this project · ' : ' all projects · '], ['esc', ' back']];
+      : undoDelete ? [['', `deleted ${undoDelete.rows.length > 1 ? `${undoDelete.rows.length} conversations` : `"${undoDelete.rows[0].title}"`} · `, 'warn'], ['ctrl+z', ` undo (${undoDelete.left} s) · `], ['↑ ↓', ' choose · '], ['enter', ' open · '], ['esc', ' back']]
+      : L.picked.size ? [['', `${L.picked.size} selected · `, 'ok'], ['space', ' select · '], ['ctrl+x', ' delete · '], ['ctrl+e', ' export · '], ['esc', ' unselect all']]
+      : searching ? [['↑ ↓', ' choose · '], ['enter', ' open · '], ...(sugg.length ? [['tab', ' suggestion · '] as [string, string]] : []), ['ctrl+r', ' rename · '], ['ctrl+x', ' delete · '], ['esc', ' clear']]
+      : [['↑ ↓', ' choose · '], ['enter', ' open · '], ['space', ' select · '], ['n', ' new · '], ['ctrl+u ctrl+d', ' scroll the preview · '], ['ctrl+r', ' rename · '], ['ctrl+x', ' delete · '], ['ctrl+p', sel?.pinned ? ' unpin · ' : ' keep on top · '], ['ctrl+f', ' fork · '], ['ctrl+e', ' export · '], ['ctrl+o', ' sort · '], ['a', L.all ? ' this project · ' : ' all projects · '], ['esc', ' back']];
     // Keys wrap onto more lines when narrow, never cut off; the dot legend comes
     // last and only when it fits on the last line.
-    const fh = hintLines(parts.map(([k, label, tone]): Hint => [k, label, tone === 'warn' ? st.warn : undefined]), width - 2, st);
+    const fh = hintLines(parts.map(([k, label, tone]): Hint => [k, label, tone === 'warn' ? st.warn : tone === 'ok' ? st.ok : undefined]), width - 2, st);
     const legend: Line = [dim(' · '), { t: '● ', s: st.accentB }, dim('working '), { t: '● ', s: st.warn }, dim('needs you '), { t: '● ', s: st.dim }, dim('another window')];
     if (L.edit === undefined && !confirm.length && lineWidth(fh.lines.at(-1)!) + lineWidth(legend) <= width - 2) fh.lines.at(-1)!.push(...legend);
     const foot: Line[] = [[{ t: '─'.repeat(width), s: st.line }], ...fh.lines.map((l): Line => [{ t: ' ', s: '' }, ...l])];
     const bodyH = Math.max(1, height - top.length - foot.length);
-    // Narrow: the preview goes under the list.
-    const listH = wide ? bodyH : Math.max(3, Math.ceil(bodyH * 0.55));
-    const pvH = wide ? bodyH : Math.max(0, bodyH - listH - 1);
     // The list, grouped by day (kept-on-top first), scrolled to keep the highlight in view.
     const left: { line: Line; i?: number }[] = [];
     let g = '';
@@ -2694,6 +2704,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       left.push({ line: [...head, ...meta], i });
     });
     if (!rows.length) left.push({ line: [dim(L.filter ? ' No conversation matches. Try fewer words, or a file name.' : ' No conversations yet. n starts one.')] });
+    // Narrow: the preview goes under the list, which takes only the rows it needs.
+    const listH = wide ? bodyH : Math.max(3, Math.min(left.length, Math.ceil(bodyH * 0.55)));
+    const pvH = wide ? bodyH : Math.max(0, bodyH - listH - 1);
     const selAt = left.findIndex((l) => l.i === L.pick);
     const from = Math.max(0, Math.min(selAt - Math.floor(listH / 2), left.length - listH));
     const shown = left.slice(from, from + listH);
@@ -2711,9 +2724,23 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       const tl = r.id !== null ? timelineOf(r.id, r.updated) : [];
       const tlRows = tl.map((e, k) => str(fit([dim(`${hhmm(e.at)} `), { t: `${markOf(e.kind)} `, s: e.kind === 'error' ? st.warn : e.kind === 'pin' ? st.warn : st.accent }, { t: e.text, s: hits.has(k) ? st.accentB : st.fg }], pw), st));
       const shownTl = tlRows.slice(-Math.max(0, Math.min(tlRows.length, Math.floor((pvH - head.length) / 2))));
-      const body = previewItems(r).flatMap((it, k, all) => [...(spaced(all[k - 1], it) ? [''] : []), ...render(it, pw)]);
-      const rest = pvH - head.length - shownTl.length - (shownTl.length ? 1 : 0);
-      right = [...head, ...shownTl, ...(shownTl.length ? [str([dim('─'.repeat(Math.min(pw, 24)))], st)] : []), ...body.slice(-Math.max(0, rest))];
+      // A message's ◆ (click to pin) means nothing here; a pinned one keeps its mark.
+      const unpin = (it: Item, ls: string[]) => (it.kind === 'user' && !it.pinned ? [...ls.slice(0, -1), ls.at(-1)!.replace(/ ◆((?:\x1b\[[0-9;]*m)*)$/, '$1')] : ls);
+      const body = previewItems(r).flatMap((it, k, all) => [...(spaced(all[k - 1], it) ? [''] : []), ...unpin(it, render(it, pw))]);
+      const rule = (t = '') => str([dim(t ? `── ${t} ` : '─'.repeat(Math.min(pw, 24)))], st);
+      // Not scrolled: the latest timeline entries and the end of the transcript.
+      // Scrolled: the whole timeline then the whole transcript, under the title.
+      if (L.scrollFor !== L.on) (L.scroll = 0), (L.scrollFor = L.on);
+      const room = pvH - head.length;
+      if (L.scroll === 0) {
+        const rest = room - shownTl.length - (shownTl.length ? 1 : 0);
+        right = [...head, ...shownTl, ...(shownTl.length ? [rule()] : []), ...body.slice(-Math.max(0, rest))];
+      } else {
+        const doc = [...tlRows, ...(tlRows.length ? [rule()] : []), ...body];
+        L.scroll = Math.min(L.scroll, Math.max(0, doc.length - room));
+        const end = doc.length - L.scroll;
+        right = [...head.slice(0, 2), rule(`${L.scroll} lines below`), ...doc.slice(Math.max(0, end - room), end)];
+      }
       if (!wide) right = right.slice(0, pvH);
     }
     const lines: string[] = [];
@@ -2725,6 +2752,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       lines.push(str(fit(l?.line ?? [], lw), st) + (wide ? str([{ t: ' │ ', s: st.line }], st) + truncAnsi(right[k] ?? '', pw) : ''));
       if (l?.i !== undefined) rowHits.push({ row: top.length + k + 1, x0: 1, x1: lw, id: `conv:${l.i}` });
     }
+    previewArea = wide ? { x0: lw + 4, x1: width, y0: top.length + 1, y1: top.length + listH } : { x0: 2, x1: width, y0: top.length + listH + 2, y1: top.length + listH + 1 + pvH };
     if (!wide && pvH > 0) {
       lines.push(str([{ t: '─'.repeat(width), s: st.line }], st));
       for (let k = 0; k < pvH; k++) lines.push(' ' + truncAnsi(right[k] ?? '', pw));
@@ -2762,6 +2790,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       return;
     }
     if (k.name === 'escape' || (k.ctrl && k.name === 'c')) {
+      if (selection && k.name === 'escape') return void (selection = null);
       if (L.filter && k.name === 'escape') return void (L.filter = '');
       if (L.picked.size && k.name === 'escape') return void L.picked.clear();
       return void (list = null);
@@ -2799,7 +2828,9 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
       return void (s && takeSuggestion(s));
     }
     if (k.name === 'backspace') return void (L.filter = L.filter.slice(0, -1));
-    if (k.ctrl && k.name === 'u') return void (undoDelete ? undoDeleteNow() : (L.filter = ''));
+    if (k.ctrl && k.name === 'z') return void (undoDelete && undoDeleteNow());
+    // As in the chat, ctrl+u / ctrl+d scroll: here the preview, half of it at a time.
+    if (k.ctrl && (k.name === 'u' || k.name === 'd')) return void (L.scroll = Math.max(0, L.scroll + (k.name === 'u' ? 1 : -1) * Math.max(1, Math.floor((previewArea.y1 - previewArea.y0) / 2))));
     if (k.ctrl && k.name === 'o') return void (L.sort = (L.sort + 1) % SORTS.length);
     if (k.ctrl && k.name === 'p' && r?.id != null) {
       save((d) => d.pin(r.id!, !r.pinned));
@@ -2818,9 +2849,15 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
     if (!L.filter) {
       if (k.name === 'char' && k.ch === 'n' && !k.ctrl) return void ((list = null), newConversation());
       if (k.name === 'char' && k.ch === 'a' && !k.ctrl) return void ((L.all = !L.all), (L.at = 0));
-      if (k.name === 'space') return void (r?.id != null && (L.picked.has(r.id) ? L.picked.delete(r.id) : L.picked.add(r.id), go(L.pick + 1)));
+      if (k.name === 'space') {
+        if (r?.id == null) return say(r ? 'send a message first; then it can be selected' : '');
+        L.picked.has(r.id) ? L.picked.delete(r.id) : L.picked.add(r.id);
+        return go(L.pick + 1);
+      }
     }
-    if ((k.name === 'char' && k.ch && !k.ctrl) || k.name === 'space') return void (L.filter += k.ch ?? ' ');
+    // Space selects while anything is selected, also with a search typed.
+    if (k.name === 'space' && L.picked.size && r?.id != null) return void (L.picked.has(r.id) ? L.picked.delete(r.id) : L.picked.add(r.id), go(L.pick + 1));
+    if ((k.name === 'char' && k.ch && !k.ctrl) || (k.name === 'space' && L.filter)) return void (L.filter += k.ch ?? ' ');
   }
 
   function renameRow(r: ListRow | undefined, title: string) {
@@ -3671,11 +3708,25 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
   function onEvent(ev: InputEvent) {
     const before = buf;
     if (ev.type === 'mouse' && list) {
-      // In the conversations window: the wheel moves the highlight, a click opens.
-      if (ev.button === 64 || ev.button === 65) return listKey({ name: ev.button === 64 ? 'up' : 'down' }), schedule();
-      else if (ev.button === 0 && ev.release) {
-        const h = hits.find((x) => x.row === ev.y && ev.x >= x.x0 && ev.x <= x.x1);
-        if (h) act(h.id);
+      // In the conversations window: the wheel scrolls the preview when it's over
+      // it and moves the highlight elsewhere; a drag in the preview selects its
+      // text and copies it; a click opens.
+      const L = list;
+      if (ev.button === 64 || ev.button === 65) {
+        if (inPreview(ev.x, ev.y)) L.scroll = Math.max(0, L.scroll + (ev.button === 64 ? 3 : -3));
+        else listKey({ name: ev.button === 64 ? 'up' : 'down' });
+      } else if (ev.button === 0 && !ev.release) {
+        selection = null;
+        press = { x: ev.x, y: ev.y, hit: hits.find((x) => x.row === ev.y && ev.x >= x.x0 && ev.x <= x.x1)?.id };
+      } else if (ev.button === 32 && press && inPreview(press.x, press.y)) {
+        const clip = previewArea;
+        const at = { x: Math.max(clip.x0, Math.min(clip.x1, ev.x)), y: Math.max(clip.y0, Math.min(clip.y1, ev.y)) };
+        selection ??= { a: { x: press.x, y: press.y }, b: at, log: false, clip };
+        selection.b = at;
+      } else if (ev.button === 0 && ev.release && press) {
+        if (selection) copySelection();
+        else if (press.hit) act(press.hit);
+        press = null;
       }
       return schedule();
     }

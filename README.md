@@ -77,7 +77,7 @@ Every key has one meaning, and only keys every keyboard has are used. `?` shows 
 | `ctrl+r` | search your earlier prompts |
 | `ctrl+u` `ctrl+d` | scroll the conversation up / down |
 | `ctrl+o` | show the model's thinking |
-| `←` | your conversations (on an empty prompt) |
+| `←` | your conversations (on an empty prompt): type to search, `space` selects, the wheel or `ctrl+u` `ctrl+d` scroll the preview, drag in it to copy |
 | `esc` | stop the reply, or close what is open |
 | `ctrl+g` | to the panel and back |
 | `ctrl+c` twice | quit |

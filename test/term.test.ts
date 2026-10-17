@@ -38,6 +38,13 @@ test('parser decodes keys, modified enter, mouse, paste and cursor reports', () 
   assert.deepEqual(p('two\x1b[201~x'), [{ type: 'paste', text: 'one\r\ntwo' }, { type: 'key', name: 'char', ch: 'x' }]);
 });
 
+test('space is one key however the terminal sends it', () => {
+  const p = createParser();
+  const space = { type: 'key', name: 'space', ch: ' ' };
+  assert.deepEqual(p(' '), [space]);
+  assert.deepEqual(p('\x1b[32u'), [{ ...space, shift: false, alt: false, ctrl: false }]);
+});
+
 test('sliceCols cuts plain text by screen column', () => {
   assert.equal(sliceCols('\x1b[1mhello\x1b[0m world', 2, 4), 'ell');
   assert.equal(sliceCols('日本語', 3, 4), '本');

@@ -115,7 +115,7 @@ const mods = (m: number) => ({ shift: !!((m - 1) & 1), alt: !!((m - 1) & 2), ctr
 function codeKey(code: number, m: number): InputEvent {
   const md = mods(m);
   const name = CODE_NAMES[code];
-  if (name) return { type: 'key', name, ...md };
+  if (name) return { type: 'key', name, ...(code === 32 ? { ch: ' ' } : {}), ...md };
   const ch = String.fromCodePoint(code);
   if (md.ctrl) return { type: 'key', name: ch.toLowerCase(), ...md };
   return { type: 'key', name: 'char', ch: md.shift ? ch.toUpperCase() : ch, ...md };
@@ -182,6 +182,7 @@ export function createParser() {
       else if (c === '\n') out.push({ type: 'key', name: 'j', ctrl: true }); // ctrl+j
       else if (c === '\t') out.push({ type: 'key', name: 'tab' });
       else if (c === '\x7f' || c === '\b') out.push({ type: 'key', name: 'backspace' });
+      else if (c === ' ') out.push({ type: 'key', name: 'space', ch: ' ' }); // one name for space, however the terminal sends it
       else if (c < ' ') out.push({ type: 'key', name: String.fromCharCode(c.charCodeAt(0) + 96), ctrl: true });
       else {
         const cp = data.codePointAt(i)!;
