@@ -99,6 +99,7 @@ const KEY_GROUPS: [string, [string, string][]][] = [
     ['← →  1-8', 'pick a view (in the panel)'],
     ['↑ ↓  enter', 'move, open'],
     ['esc', 'back, then the chat'],
+    ['q', 'close the panel'],
   ]],
 ];
 
@@ -863,6 +864,7 @@ export async function runApp(cfg: Config, version: string, pkgName = 'rime-cli',
         // The panel: what's waiting there (changes to review, failing checks, servers).
         const rv = side.review.badge();
         const b = [rv && { ...rv, t: ` ±${rv.t.trim()}` }, side.checks.badge(), side.run.badge()].filter((x) => x).map((x) => x!);
+        parts.push({ line: [key('←'), dim(' conversations')], id: 'conversations' });
         parts.push({ line: [key('ctrl+g'), dim(' panel'), ...b], id: 'panel:show' });
         parts.push({ line: [key('?'), dim(' keys')], id: '?' });
       }

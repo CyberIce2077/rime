@@ -124,9 +124,10 @@ order (Rime remembers it), and the numbers follow:
 | 8 | log | each tool call and exactly what came back | `enter` show it in full |
 
 In the panel, `← →` (or `tab`) go to the next or previous view, `1`-`8` jump straight
-to one, `↑ ↓` and `enter` work inside it, `esc` steps back and finally to the chat, `z` zooms the panel to the full screen, and `?`
-lists the keys. You can also say it: "show the diff", "run the tests", "start the dev
-server", "search the files for validate".
+to one, `↑ ↓` and `enter` work inside it, `esc` steps back and finally to the chat,
+`z` zooms the panel to the full screen, `q` closes it, and `?` lists the keys. You can
+also say it: "show the diff", "run the tests", "start the dev server", "search the files
+for validate".
 
 Drag a file, folder, screenshot or video onto the terminal, or paste a long log, and it
 becomes a chip in the prompt. Put the cursor on a chip or point at it to see exactly what

@@ -54,6 +54,18 @@ test('eight views in a fixed order; numbers and tab pick them, esc gives the key
   assert.equal(s.panel.key({ name: 'escape' }), 'blur');
 });
 
+test('q closes the panel and gives the keys back; ctrl+g opens it again', () => {
+  const { s, screen } = side();
+  s.panel.go('run');
+  assert.match(screen().join('\n'), /q close/);
+  assert.equal(s.panel.key(char('q')), 'blur');
+  assert.equal(s.panel.visible, false);
+  s.panel.go('plan');
+  s.panel.key(char('a')); // typing a step: q is a letter
+  s.panel.key(char('q'));
+  assert.equal(s.panel.visible, true);
+});
+
 test('the tab bar shortens titles but keeps the active one whole', () => {
   const { s, screen } = side();
   s.panel.go('context');

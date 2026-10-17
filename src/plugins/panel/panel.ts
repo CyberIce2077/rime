@@ -2,7 +2,7 @@
 // changes when you drag a tab, so a number always means the same thing. ctrl+g
 // moves the keys between the chat and the panel. In the panel: ← → or tab move
 // between views, 1-8 jump to one, ↑ ↓ and enter work inside it, esc steps back
-// (and finally to the chat), z zooms, ? lists the keys. Each view adds at most a
+// (and finally to the chat), z zooms, q closes, ? lists the keys. Each view adds at most a
 // few letters of its own, shown in the footer.
 
 import { type Key, type Line, fit, lineWidth } from '../../core/term.ts';
@@ -73,6 +73,7 @@ export function createPanel(st: Styles, all: View[], redraw: () => void, o: { or
     ['ctrl+u ctrl+d', 'page up, down'],
     ['esc', 'back one step, then the chat'],
     ['z', 'zoom the panel'],
+    ['q', 'close the panel (ctrl+g opens it again)'],
     ['?', 'these keys'],
   ];
   function sheetLines(): Line[] {
@@ -91,7 +92,7 @@ export function createPanel(st: Styles, all: View[], redraw: () => void, o: { or
     const v = cur();
     const bar = tabBar(w, border, hits, lead);
     const say: Hint[] = toastMsg ? [['', `${toastMsg} · `, st.ok]] : [];
-    const foot: Hint[] = !focused ? [...say, ['ctrl+g', ' focus']] : sheet ? [['', 'any key closes this']] : v.typing?.() ? [...say, ...v.foot(), ['ctrl+g', ' chat']] : [...say, ...end(v.foot()), ['?', ' keys']];
+    const foot: Hint[] = !focused ? [...say, ['ctrl+g', ' focus']] : sheet ? [['', 'any key closes this']] : v.typing?.() ? [...say, ...v.foot(), ['ctrl+g', ' chat']] : [...say, ...end(v.foot()), ['?', ' keys · '], ['q', ' close']];
     const fh = hintLines(foot, w, st);
     const rows = Math.max(1, height - 3 - fh.lines.length);
     shown = { rows, top: 3 };
@@ -118,6 +119,7 @@ export function createPanel(st: Styles, all: View[], redraw: () => void, o: { or
       const back = k.name === 'left' || (k.name === 'tab' && k.shift);
       if (k.name === 'tab' || k.name === 'left' || k.name === 'right') return api.go((active + (back ? views.length - 1 : 1)) % views.length), true;
       if (c === 'z') return (zoomed = !zoomed), redraw(), true;
+      if (c === 'q') return api.show(false), 'blur';
       if (c === '?') return (sheet = true), redraw(), true;
     }
     const r = v.key(k);
